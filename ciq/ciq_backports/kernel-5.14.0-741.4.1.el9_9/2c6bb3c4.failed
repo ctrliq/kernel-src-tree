@@ -1,0 +1,200 @@
+NFSv4/flexfiles: reject zero filehandle version count
+
+jira KERNEL-1869
+cve CVE-2026-53392
+Rebuild_History Non-Buildable kernel-5.14.0-741.4.1.el9_9
+commit-author Michael Bommarito <michael.bommarito@gmail.com>
+commit 2c6bb3c40bc24f6aa8dfbe6fe98c3ad6389203f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.4.1.el9_9/2c6bb3c4.failed
+
+ff_layout_alloc_lseg() decodes the filehandle-version array count
+from the flexfiles layout body. The value is used as the count for
+kzalloc_objs(), and the current code only rejects NULL.
+
+A zero count yields ZERO_SIZE_PTR, which can be stored in
+dss_info->fh_versions even though later flexfiles paths assume that at
+least one filehandle version exists.
+
+Reject fh_count == 0 before the allocation, matching the existing zero
+version_count validation in the flexfiles GETDEVICEINFO parser.
+
+A QEMU/KASAN run with a malformed flexfiles layout hit:
+
+  KASAN: null-ptr-deref in range [0x0000000000000010-0x0000000000000017]
+  RIP: 0010:ff_layout_encode_ff_layoutupdate.isra.0+0x15f/0x750
+  ff_layout_encode_layoutreturn+0x683/0x970
+  nfs4_xdr_enc_layoutreturn+0x278/0x3a0
+  Kernel panic - not syncing: Fatal exception
+
+The patched kernel rejects the malformed layout without KASAN/oops/panic,
+and a valid fh_count=1 regression still opens, reads, and unmounts cleanly.
+
+	Cc: stable@vger.kernel.org
+Fixes: d67ae825a59d ("pnfs/flexfiles: Add the FlexFile Layout Driver")
+Assisted-by: Claude:claude-opus-4-7
+	Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+	Signed-off-by: Anna Schumaker <anna.schumaker@hammerspace.com>
+(cherry picked from commit 2c6bb3c40bc24f6aa8dfbe6fe98c3ad6389203f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/flexfilelayout/flexfilelayout.c
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.c
+index 1f1e5ce41b4a,99caa8d28c25..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@@ -435,81 -524,88 +435,94 @@@ ff_layout_alloc_lseg(struct pnfs_layout
+  			goto out_err_free;
+  		}
+  
+ -		for (dss_id = 0; dss_id < dss_count; dss_id++) {
+ -			dss_info = &fls->mirror_array[i]->dss[dss_id];
+ -			dss_info->mirror = fls->mirror_array[i];
+ +		fls->mirror_array[i]->ds_count = ds_count;
+  
+ -			/* deviceid */
+ -			rc = decode_deviceid(&stream, &dss_info->devid);
+ -			if (rc)
+ -				goto out_err_free;
+ +		/* deviceid */
+ +		rc = decode_deviceid(&stream, &fls->mirror_array[i]->devid);
+ +		if (rc)
+ +			goto out_err_free;
+  
+ -			/* efficiency */
+ -			rc = -EIO;
+ -			p = xdr_inline_decode(&stream, 4);
+ -			if (!p)
+ -				goto out_err_free;
+ -			dss_info->efficiency = be32_to_cpup(p);
+ +		/* efficiency */
+ +		rc = -EIO;
+ +		p = xdr_inline_decode(&stream, 4);
+ +		if (!p)
+ +			goto out_err_free;
+ +		fls->mirror_array[i]->efficiency = be32_to_cpup(p);
+  
+ -			/* stateid */
+ -			rc = decode_pnfs_stateid(&stream, &dss_info->stateid);
+ -			if (rc)
+ -				goto out_err_free;
+ +		/* stateid */
+ +		rc = decode_pnfs_stateid(&stream, &fls->mirror_array[i]->stateid);
+ +		if (rc)
+ +			goto out_err_free;
+  
+++<<<<<<< HEAD
+ +		/* fh */
+ +		rc = -EIO;
+ +		p = xdr_inline_decode(&stream, 4);
+ +		if (!p)
+ +			goto out_err_free;
+ +		fh_count = be32_to_cpup(p);
+++=======
++ 			/* fh */
++ 			rc = -EIO;
++ 			p = xdr_inline_decode(&stream, 4);
++ 			if (!p)
++ 				goto out_err_free;
++ 			fh_count = be32_to_cpup(p);
++ 			if (fh_count == 0) {
++ 				rc = -EINVAL;
++ 				goto out_err_free;
++ 			}
+++>>>>>>> 2c6bb3c40bc2 (NFSv4/flexfiles: reject zero filehandle version count)
+  
+ -			dss_info->fh_versions =
+ -			    kzalloc_objs(struct nfs_fh, fh_count, gfp_flags);
+ -			if (dss_info->fh_versions == NULL) {
+ -				rc = -ENOMEM;
+ -				goto out_err_free;
+ -			}
+ -
+ -			for (j = 0; j < fh_count; j++) {
+ -				rc = decode_nfs_fh(&stream,
+ -						   &dss_info->fh_versions[j]);
+ -				if (rc)
+ -					goto out_err_free;
+ -			}
+ -
+ -			dss_info->fh_versions_cnt = fh_count;
+ +		fls->mirror_array[i]->fh_versions =
+ +			kcalloc(fh_count, sizeof(struct nfs_fh),
+ +				gfp_flags);
+ +		if (fls->mirror_array[i]->fh_versions == NULL) {
+ +			rc = -ENOMEM;
+ +			goto out_err_free;
+ +		}
+  
+ -			/* user */
+ -			rc = decode_name(&stream, &id);
+ +		for (j = 0; j < fh_count; j++) {
+ +			rc = decode_nfs_fh(&stream,
+ +					   &fls->mirror_array[i]->fh_versions[j]);
+  			if (rc)
+  				goto out_err_free;
+ +		}
+  
+ -			uid = make_kuid(&init_user_ns, id);
+ +		fls->mirror_array[i]->fh_versions_cnt = fh_count;
+  
+ -			/* group */
+ -			rc = decode_name(&stream, &id);
+ -			if (rc)
+ -				goto out_err_free;
+ +		/* user */
+ +		rc = decode_name(&stream, &id);
+ +		if (rc)
+ +			goto out_err_free;
+  
+ -			gid = make_kgid(&init_user_ns, id);
+ +		uid = make_kuid(&init_user_ns, id);
+  
+ -			if (gfp_flags & __GFP_FS)
+ -				kcred = prepare_kernel_cred(&init_task);
+ -			else {
+ -				unsigned int nofs_flags = memalloc_nofs_save();
+ +		/* group */
+ +		rc = decode_name(&stream, &id);
+ +		if (rc)
+ +			goto out_err_free;
+  
+ -				kcred = prepare_kernel_cred(&init_task);
+ -				memalloc_nofs_restore(nofs_flags);
+ -			}
+ -			rc = -ENOMEM;
+ -			if (!kcred)
+ -				goto out_err_free;
+ -			kcred->fsuid = uid;
+ -			kcred->fsgid = gid;
+ -			cred = RCU_INITIALIZER(kcred);
+ +		gid = make_kgid(&init_user_ns, id);
+  
+ -			if (lgr->range.iomode == IOMODE_READ)
+ -				rcu_assign_pointer(dss_info->ro_cred, cred);
+ -			else
+ -				rcu_assign_pointer(dss_info->rw_cred, cred);
+ +		if (gfp_flags & __GFP_FS)
+ +			kcred = prepare_kernel_cred(NULL);
+ +		else {
+ +			unsigned int nofs_flags = memalloc_nofs_save();
+ +			kcred = prepare_kernel_cred(NULL);
+ +			memalloc_nofs_restore(nofs_flags);
+  		}
+ +		rc = -ENOMEM;
+ +		if (!kcred)
+ +			goto out_err_free;
+ +		kcred->fsuid = uid;
+ +		kcred->fsgid = gid;
+ +		cred = RCU_INITIALIZER(kcred);
+ +
+ +		if (lgr->range.iomode == IOMODE_READ)
+ +			rcu_assign_pointer(fls->mirror_array[i]->ro_cred, cred);
+ +		else
+ +			rcu_assign_pointer(fls->mirror_array[i]->rw_cred, cred);
+  
+  		mirror = ff_layout_add_mirror(lh, fls->mirror_array[i]);
+  		if (mirror != fls->mirror_array[i]) {
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.c
