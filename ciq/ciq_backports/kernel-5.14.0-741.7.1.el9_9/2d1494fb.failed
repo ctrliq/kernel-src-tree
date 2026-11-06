@@ -1,0 +1,128 @@
+s390/mm: make virt_to_pfn() a static inline
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 2d1494fb31405df0dfb6006fdb2b24e7880258cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/2d1494fb.failed
+
+Making virt_to_pfn() a static inline taking a strongly typed
+(const void *) makes the contract of a passing a pointer of that
+type to the function explicit and exposes any misuse of the
+macro virt_to_pfn() acting polymorphic and accepting many types
+such as (void *), (unitptr_t) or (unsigned long) as arguments
+without warnings.
+
+For symmetry do the same with pfn_to_virt() reflecting the
+current layout in asm-generic/page.h.
+
+Doing this reveals a number of offenders in the arch code and
+the S390-specific drivers, so just bite the bullet and fix up
+all of those as well.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Reviewed-by: Alexander Gordeev <agordeev@linux.ibm.com>
+Link: https://lore.kernel.org/r/20230812-virt-to-phys-s390-v2-1-6c40f31fe36f@linaro.org
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 2d1494fb31405df0dfb6006fdb2b24e7880258cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/page.h
+diff --cc arch/s390/include/asm/page.h
+index 6d237e54ec53,cfec0743314e..000000000000
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@@ -251,8 -188,19 +251,24 @@@ static inline unsigned long __phys_addr
+  #define phys_to_pfn(phys)	((phys) >> PAGE_SHIFT)
+  #define pfn_to_phys(pfn)	((pfn) << PAGE_SHIFT)
+  
+++<<<<<<< HEAD
+ +#define pfn_to_virt(pfn)	__va(pfn_to_phys(pfn))
+ +#define virt_to_pfn(kaddr)	(phys_to_pfn(__pa(kaddr)))
+++=======
++ #define phys_to_page(phys)	pfn_to_page(phys_to_pfn(phys))
++ #define page_to_phys(page)	pfn_to_phys(page_to_pfn(page))
++ 
++ static inline void *pfn_to_virt(unsigned long pfn)
++ {
++ 	return __va(pfn_to_phys(pfn));
++ }
++ 
++ static inline unsigned long virt_to_pfn(const void *kaddr)
++ {
++ 	return phys_to_pfn(__pa(kaddr));
++ }
++ 
+++>>>>>>> 2d1494fb3140 (s390/mm: make virt_to_pfn() a static inline)
+  #define pfn_to_kaddr(pfn)	pfn_to_virt(pfn)
+  
+  #define virt_to_page(kaddr)	pfn_to_page(virt_to_pfn(kaddr))
+diff --git a/arch/s390/include/asm/kfence.h b/arch/s390/include/asm/kfence.h
+index 7b44a41453fd..e95e35eb8a3f 100644
+--- a/arch/s390/include/asm/kfence.h
++++ b/arch/s390/include/asm/kfence.h
+@@ -24,7 +24,7 @@ static __always_inline bool arch_kfence_init_pool(void)
+ 
+ static inline bool kfence_protect_page(unsigned long addr, bool protect)
+ {
+-	__kernel_map_pages(virt_to_page(addr), 1, !protect);
++	__kernel_map_pages(virt_to_page((void *)addr), 1, !protect);
+ 	return true;
+ }
+ 
+* Unmerged path arch/s390/include/asm/page.h
+diff --git a/arch/s390/mm/cmm.c b/arch/s390/mm/cmm.c
+index f23bdca27438..9af4d8296494 100644
+--- a/arch/s390/mm/cmm.c
++++ b/arch/s390/mm/cmm.c
+@@ -90,7 +90,7 @@ static long cmm_alloc_pages(long nr, long *counter,
+ 			} else
+ 				free_page((unsigned long) npa);
+ 		}
+-		diag10_range(virt_to_pfn(addr), 1);
++		diag10_range(virt_to_pfn((void *)addr), 1);
+ 		pa->pages[pa->index++] = addr;
+ 		(*counter)++;
+ 		spin_unlock(&cmm_lock);
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index e1010e574bba..41c714e21292 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -44,7 +44,7 @@ static void vmem_free_pages(unsigned long addr, int order, struct vmem_altmap *a
+ 	}
+ 	/* We don't expect boot memory to be removed ever. */
+ 	if (!slab_is_available() ||
+-	    WARN_ON_ONCE(PageReserved(virt_to_page(addr))))
++	    WARN_ON_ONCE(PageReserved(virt_to_page((void *)addr))))
+ 		return;
+ 	free_pages(addr, order);
+ }
+diff --git a/drivers/s390/block/scm_blk.c b/drivers/s390/block/scm_blk.c
+index c7dab87a8926..91bbe9d2e5ac 100644
+--- a/drivers/s390/block/scm_blk.c
++++ b/drivers/s390/block/scm_blk.c
+@@ -135,7 +135,7 @@ static void scm_request_done(struct scm_request *scmrq)
+ 
+ 		if ((msb->flags & MSB_FLAG_IDA) && aidaw &&
+ 		    IS_ALIGNED(aidaw, PAGE_SIZE))
+-			mempool_free(virt_to_page(aidaw), aidaw_pool);
++			mempool_free(virt_to_page((void *)aidaw), aidaw_pool);
+ 	}
+ 
+ 	spin_lock_irqsave(&list_lock, flags);
+diff --git a/drivers/s390/char/vmcp.c b/drivers/s390/char/vmcp.c
+index 4e3aedc8c930..fa345f724067 100644
+--- a/drivers/s390/char/vmcp.c
++++ b/drivers/s390/char/vmcp.c
+@@ -88,7 +88,7 @@ static void vmcp_response_free(struct vmcp_session *session)
+ 	order = get_order(session->bufsize);
+ 	nr_pages = ALIGN(session->bufsize, PAGE_SIZE) >> PAGE_SHIFT;
+ 	if (session->cma_alloc) {
+-		page = virt_to_page((unsigned long)session->response);
++		page = virt_to_page(session->response);
+ 		cma_release(vmcp_cma, page, nr_pages);
+ 		session->cma_alloc = 0;
+ 	} else {
