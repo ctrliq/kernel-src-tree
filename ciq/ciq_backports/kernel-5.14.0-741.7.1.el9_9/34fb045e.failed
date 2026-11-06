@@ -1,0 +1,148 @@
+s390/kvm: Mask extra bits from program interrupt code
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Claudio Imbrenda <imbrenda@linux.ibm.com>
+commit 34fb045eddd300a2d1c0d7de7e83113215c422e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/34fb045e.failed
+
+The program interrupt code has some extra bits that are sometimes set
+by hardware for various reasons; those bits should be ignored when the
+program interrupt number is needed for interrupt handling.
+
+Fixes: 05066cafa925 ("s390/mm/fault: Handle guest-related program interrupts in KVM")
+	Reported-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Tested-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Link: https://lore.kernel.org/r/20241031120316.25462-1-imbrenda@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 34fb045eddd300a2d1c0d7de7e83113215c422e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 5266ea6b98ef,06e55f681a39..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -4800,6 -4727,101 +4800,104 @@@ static int vcpu_post_run_fault_in_sie(s
+  	return kvm_s390_inject_prog_irq(vcpu, &pgm_info);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vcpu_post_run_handle_fault(struct kvm_vcpu *vcpu)
++ {
++ 	unsigned int flags = 0;
++ 	unsigned long gaddr;
++ 	int rc = 0;
++ 
++ 	gaddr = current->thread.gmap_teid.addr * PAGE_SIZE;
++ 	if (kvm_s390_cur_gmap_fault_is_write())
++ 		flags = FAULT_FLAG_WRITE;
++ 
++ 	switch (current->thread.gmap_int_code & PGM_INT_CODE_MASK) {
++ 	case 0:
++ 		vcpu->stat.exit_null++;
++ 		break;
++ 	case PGM_NON_SECURE_STORAGE_ACCESS:
++ 		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++ 			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++ 			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++ 		/*
++ 		 * This is normal operation; a page belonging to a protected
++ 		 * guest has not been imported yet. Try to import the page into
++ 		 * the protected guest.
++ 		 */
++ 		if (gmap_convert_to_secure(vcpu->arch.gmap, gaddr) == -EINVAL)
++ 			send_sig(SIGSEGV, current, 0);
++ 		break;
++ 	case PGM_SECURE_STORAGE_ACCESS:
++ 	case PGM_SECURE_STORAGE_VIOLATION:
++ 		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++ 			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++ 			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++ 		/*
++ 		 * This can happen after a reboot with asynchronous teardown;
++ 		 * the new guest (normal or protected) will run on top of the
++ 		 * previous protected guest. The old pages need to be destroyed
++ 		 * so the new guest can use them.
++ 		 */
++ 		if (gmap_destroy_page(vcpu->arch.gmap, gaddr)) {
++ 			/*
++ 			 * Either KVM messed up the secure guest mapping or the
++ 			 * same page is mapped into multiple secure guests.
++ 			 *
++ 			 * This exception is only triggered when a guest 2 is
++ 			 * running and can therefore never occur in kernel
++ 			 * context.
++ 			 */
++ 			pr_warn_ratelimited("Secure storage violation (%x) in task: %s, pid %d\n",
++ 					    current->thread.gmap_int_code, current->comm,
++ 					    current->pid);
++ 			send_sig(SIGSEGV, current, 0);
++ 		}
++ 		break;
++ 	case PGM_PROTECTION:
++ 	case PGM_SEGMENT_TRANSLATION:
++ 	case PGM_PAGE_TRANSLATION:
++ 	case PGM_ASCE_TYPE:
++ 	case PGM_REGION_FIRST_TRANS:
++ 	case PGM_REGION_SECOND_TRANS:
++ 	case PGM_REGION_THIRD_TRANS:
++ 		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++ 			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++ 			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++ 		if (vcpu->arch.gmap->pfault_enabled) {
++ 			rc = gmap_fault(vcpu->arch.gmap, gaddr, flags | FAULT_FLAG_RETRY_NOWAIT);
++ 			if (rc == -EFAULT)
++ 				return vcpu_post_run_addressing_exception(vcpu);
++ 			if (rc == -EAGAIN) {
++ 				trace_kvm_s390_major_guest_pfault(vcpu);
++ 				if (kvm_arch_setup_async_pf(vcpu))
++ 					return 0;
++ 				vcpu->stat.pfault_sync++;
++ 			} else {
++ 				return rc;
++ 			}
++ 		}
++ 		rc = gmap_fault(vcpu->arch.gmap, gaddr, flags);
++ 		if (rc == -EFAULT) {
++ 			if (kvm_is_ucontrol(vcpu->kvm)) {
++ 				vcpu->run->exit_reason = KVM_EXIT_S390_UCONTROL;
++ 				vcpu->run->s390_ucontrol.trans_exc_code = gaddr;
++ 				vcpu->run->s390_ucontrol.pgm_code = 0x10;
++ 				return -EREMOTE;
++ 			}
++ 			return vcpu_post_run_addressing_exception(vcpu);
++ 		}
++ 		break;
++ 	default:
++ 		KVM_BUG(1, vcpu->kvm, "Unexpected program interrupt 0x%x, TEID 0x%016lx",
++ 			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++ 		send_sig(SIGSEGV, current, 0);
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
+++>>>>>>> 34fb045eddd3 (s390/kvm: Mask extra bits from program interrupt code)
+  static int vcpu_post_run(struct kvm_vcpu *vcpu, int exit_reason)
+  {
+  	struct mcck_volatile_info *mcck_info;
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/arch/s390/kvm/vsie.c b/arch/s390/kvm/vsie.c
+index e80c94261590..665fce18b740 100644
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -957,7 +957,7 @@ static int handle_fault(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ {
+ 	int rc;
+ 
+-	if (current->thread.gmap_int_code == PGM_PROTECTION)
++	if ((current->thread.gmap_int_code & PGM_INT_CODE_MASK) == PGM_PROTECTION)
+ 		/* we can directly forward all protection exceptions */
+ 		return inject_fault(vcpu, PGM_PROTECTION,
+ 				    current->thread.gmap_addr, 1);
