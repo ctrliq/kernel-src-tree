@@ -1,0 +1,359 @@
+cxl: Fix CXL_HEADERLOG_SIZE to match RAS Capability size
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Terry Bowman <terry.bowman@amd.com>
+commit c268f949e219f9e179558e836f457f6c5fbec416
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/c268f949.failed
+
+The CXL r4.0 8.2.4.17.7 RAS Capability Structure has total length 0x58
+bytes (CXL_RAS_CAPABILITY_LENGTH); the Header Log occupies the trailing
+64 bytes at offset 0x18.  CXL_HEADERLOG_SIZE was defined as SZ_512,
+eight times the actual on-device size.
+
+header_log_copy() reads CXL_HEADERLOG_SIZE_U32 (128) dwords from the
+RAS capability iomap, overrunning the 88-byte mapping by 448 bytes.
+The cxl_aer_uncorrectable_error trace event memcpy()s CXL_HEADERLOG_SIZE
+(512) bytes from its source.  For the CPER caller the source is
+struct cxl_ras_capability_regs::header_log[16] (64 bytes) embedded in a
+stack-local cxl_cper_prot_err_work_data, so the memcpy reads 448 bytes
+of kernel stack into the trace event ring buffer where userspace can
+read it via tracefs.
+
+Set CXL_HEADERLOG_SIZE to 64 and derive CXL_HEADERLOG_SIZE_U32 from it,
+bringing all iomap readers into agreement on 16 dwords.  Userspace tools
+such as rasdaemon have grown a dependency on the buggy 512-byte (128 u32)
+header_log layout in the cxl_aer_uncorrectable_error trace event.  Add
+CXL_HEADERLOG_TRACE_SIZE_U32 = 128 and use it for the trace event
+__array and its memcpy to preserve that ABI.  Both callers now pass a
+zero-filled u32[CXL_HEADERLOG_TRACE_SIZE_U32] staging buffer with only
+the first CXL_HEADERLOG_SIZE_U32 (16) entries populated from hardware;
+the remaining 112 u32s are zero-padded, keeping the 512-byte trace ring
+buffer layout intact.
+
+[ dj: Replaced 64 with SZ_64 per RichardC ]
+
+Fixes: 36f257e3b0ba ("acpi/ghes, cxl/pci: Process CXL CPER Protocol Errors")
+Fixes: 2905cb5236cb ("cxl/pci: Add (hopeful) error handling support")
+	Cc: stable@vger.kernel.org
+	Reported-by: Sashiko
+	Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+	Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+	Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Ben Cheatham <benjamin.cheatham@amd.com>
+	Reviewed-by: Richard Cheng <icheng@nvidia.com>
+Link: https://patch.msgid.link/20260605180610.2249458-1-terry.bowman@amd.com
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit c268f949e219f9e179558e836f457f6c5fbec416)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cxl/core/ras.c
+diff --cc drivers/cxl/core/ras.c
+index 2731ba3a0799,99fb00949c2f..000000000000
+--- a/drivers/cxl/core/ras.c
++++ b/drivers/cxl/core/ras.c
+@@@ -5,8 -5,13 +5,12 @@@
+  #include <linux/aer.h>
+  #include <cxl/event.h>
+  #include <cxlmem.h>
+ -#include <cxlpci.h>
+  #include "trace.h"
+  
++ /* Check that UCE header definition is maintained to keep ABI intact  */
++ static_assert(CXL_HEADERLOG_TRACE_SIZE_U32 == 128,
++ 	      "rasdaemon ABI requires exactly 128 u32s");
++ 
+  static void cxl_cper_trace_corr_port_prot_err(struct pci_dev *pdev,
+  					      struct cxl_ras_capability_regs ras_cap)
+  {
+@@@ -124,3 -139,200 +137,203 @@@ void cxl_ras_exit(void
+  	cxl_cper_unregister_prot_err_work(&cxl_cper_prot_err_work);
+  	cancel_work_sync(&cxl_cper_prot_err_work);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void cxl_dport_map_ras(struct cxl_dport *dport)
++ {
++ 	struct cxl_register_map *map = &dport->reg_map;
++ 	struct device *dev = dport->dport_dev;
++ 
++ 	if (!map->component_map.ras.valid)
++ 		dev_dbg(dev, "RAS registers not found\n");
++ 	else if (cxl_map_component_regs(map, &dport->regs.component,
++ 					BIT(CXL_CM_CAP_CAP_ID_RAS)))
++ 		dev_dbg(dev, "Failed to map RAS capability.\n");
++ }
++ 
++ /**
++  * devm_cxl_dport_ras_setup - Setup CXL RAS report on this dport
++  * @dport: the cxl_dport that needs to be initialized
++  */
++ void devm_cxl_dport_ras_setup(struct cxl_dport *dport)
++ {
++ 	dport->reg_map.host = dport_to_host(dport);
++ 	cxl_dport_map_ras(dport);
++ }
++ 
++ void devm_cxl_dport_rch_ras_setup(struct cxl_dport *dport)
++ {
++ 	struct pci_host_bridge *host_bridge;
++ 
++ 	if (!dev_is_pci(dport->dport_dev))
++ 		return;
++ 
++ 	devm_cxl_dport_ras_setup(dport);
++ 
++ 	host_bridge = to_pci_host_bridge(dport->dport_dev);
++ 	if (!host_bridge->native_aer)
++ 		return;
++ 
++ 	cxl_dport_map_rch_aer(dport);
++ 	cxl_disable_rch_root_ints(dport);
++ }
++ EXPORT_SYMBOL_NS_GPL(devm_cxl_dport_rch_ras_setup, "CXL");
++ 
++ void devm_cxl_port_ras_setup(struct cxl_port *port)
++ {
++ 	struct cxl_register_map *map = &port->reg_map;
++ 
++ 	if (!map->component_map.ras.valid) {
++ 		dev_dbg(&port->dev, "RAS registers not found\n");
++ 		return;
++ 	}
++ 
++ 	map->host = &port->dev;
++ 	if (cxl_map_component_regs(map, &port->regs,
++ 				   BIT(CXL_CM_CAP_CAP_ID_RAS)))
++ 		dev_dbg(&port->dev, "Failed to map RAS capability\n");
++ }
++ EXPORT_SYMBOL_NS_GPL(devm_cxl_port_ras_setup, "CXL");
++ 
++ void cxl_handle_cor_ras(struct device *dev, void __iomem *ras_base)
++ {
++ 	void __iomem *addr;
++ 	u32 status;
++ 
++ 	if (!ras_base)
++ 		return;
++ 
++ 	addr = ras_base + CXL_RAS_CORRECTABLE_STATUS_OFFSET;
++ 	status = readl(addr);
++ 	if (status & CXL_RAS_CORRECTABLE_STATUS_MASK) {
++ 		writel(status & CXL_RAS_CORRECTABLE_STATUS_MASK, addr);
++ 		trace_cxl_aer_correctable_error(to_cxl_memdev(dev), status);
++ 	}
++ }
++ 
++ /* CXL spec rev3.0 8.2.4.16.1 */
++ static void header_log_copy(void __iomem *ras_base, u32 *log)
++ {
++ 	void __iomem *addr;
++ 	u32 *log_addr;
++ 	int i;
++ 
++ 	addr = ras_base + CXL_RAS_HEADER_LOG_OFFSET;
++ 	log_addr = log;
++ 
++ 	for (i = 0; i < CXL_HEADERLOG_SIZE_U32; i++) {
++ 		*log_addr = readl(addr);
++ 		log_addr++;
++ 		addr += sizeof(u32);
++ 	}
++ }
++ 
++ /*
++  * Log the state of the RAS status registers and prepare them to log the
++  * next error status. Return 1 if reset needed.
++  */
++ bool cxl_handle_ras(struct device *dev, void __iomem *ras_base)
++ {
++ 	u32 hl[CXL_HEADERLOG_TRACE_SIZE_U32] = {};
++ 	void __iomem *addr;
++ 	u32 status;
++ 	u32 fe;
++ 
++ 	if (!ras_base)
++ 		return false;
++ 
++ 	addr = ras_base + CXL_RAS_UNCORRECTABLE_STATUS_OFFSET;
++ 	status = readl(addr);
++ 	if (!(status & CXL_RAS_UNCORRECTABLE_STATUS_MASK))
++ 		return false;
++ 
++ 	/* If multiple errors, log header points to first error from ctrl reg */
++ 	if (hweight32(status) > 1) {
++ 		void __iomem *rcc_addr =
++ 			ras_base + CXL_RAS_CAP_CONTROL_OFFSET;
++ 
++ 		fe = BIT(FIELD_GET(CXL_RAS_CAP_CONTROL_FE_MASK,
++ 				   readl(rcc_addr)));
++ 	} else {
++ 		fe = status;
++ 	}
++ 
++ 	header_log_copy(ras_base, hl);
++ 	trace_cxl_aer_uncorrectable_error(to_cxl_memdev(dev), status, fe, hl);
++ 	writel(status & CXL_RAS_UNCORRECTABLE_STATUS_MASK, addr);
++ 
++ 	return true;
++ }
++ 
++ void cxl_cor_error_detected(struct pci_dev *pdev)
++ {
++ 	struct cxl_dev_state *cxlds = pci_get_drvdata(pdev);
++ 	struct cxl_memdev *cxlmd = cxlds->cxlmd;
++ 	struct device *dev = &cxlds->cxlmd->dev;
++ 
++ 	scoped_guard(device, dev) {
++ 		if (!dev->driver) {
++ 			dev_warn(&pdev->dev,
++ 				 "%s: memdev disabled, abort error handling\n",
++ 				 dev_name(dev));
++ 			return;
++ 		}
++ 
++ 		if (cxlds->rcd)
++ 			cxl_handle_rdport_errors(cxlds);
++ 
++ 		cxl_handle_cor_ras(&cxlds->cxlmd->dev, cxlmd->endpoint->regs.ras);
++ 	}
++ }
++ EXPORT_SYMBOL_NS_GPL(cxl_cor_error_detected, "CXL");
++ 
++ pci_ers_result_t cxl_error_detected(struct pci_dev *pdev,
++ 				    pci_channel_state_t state)
++ {
++ 	struct cxl_dev_state *cxlds = pci_get_drvdata(pdev);
++ 	struct cxl_memdev *cxlmd = cxlds->cxlmd;
++ 	struct device *dev = &cxlmd->dev;
++ 	bool ue;
++ 
++ 	scoped_guard(device, dev) {
++ 		if (!dev->driver) {
++ 			dev_warn(&pdev->dev,
++ 				 "%s: memdev disabled, abort error handling\n",
++ 				 dev_name(dev));
++ 			return PCI_ERS_RESULT_DISCONNECT;
++ 		}
++ 
++ 		if (cxlds->rcd)
++ 			cxl_handle_rdport_errors(cxlds);
++ 		/*
++ 		 * A frozen channel indicates an impending reset which is fatal to
++ 		 * CXL.mem operation, and will likely crash the system. On the off
++ 		 * chance the situation is recoverable dump the status of the RAS
++ 		 * capability registers and bounce the active state of the memdev.
++ 		 */
++ 		ue = cxl_handle_ras(&cxlds->cxlmd->dev, cxlmd->endpoint->regs.ras);
++ 	}
++ 
++ 	switch (state) {
++ 	case pci_channel_io_normal:
++ 		if (ue) {
++ 			device_release_driver(dev);
++ 			return PCI_ERS_RESULT_NEED_RESET;
++ 		}
++ 		return PCI_ERS_RESULT_CAN_RECOVER;
++ 	case pci_channel_io_frozen:
++ 		dev_warn(&pdev->dev,
++ 			 "%s: frozen state error detected, disable CXL.mem\n",
++ 			 dev_name(dev));
++ 		device_release_driver(dev);
++ 		return PCI_ERS_RESULT_NEED_RESET;
++ 	case pci_channel_io_perm_failure:
++ 		dev_warn(&pdev->dev,
++ 			 "failure state error detected, request disconnect\n");
++ 		return PCI_ERS_RESULT_DISCONNECT;
++ 	}
++ 	return PCI_ERS_RESULT_NEED_RESET;
++ }
++ EXPORT_SYMBOL_NS_GPL(cxl_error_detected, "CXL");
+++>>>>>>> c268f949e219 (cxl: Fix CXL_HEADERLOG_SIZE to match RAS Capability size)
+* Unmerged path drivers/cxl/core/ras.c
+diff --git a/drivers/cxl/core/trace.h b/drivers/cxl/core/trace.h
+index 4ef3333ee7b6..4a93ac7a0f19 100644
+--- a/drivers/cxl/core/trace.h
++++ b/drivers/cxl/core/trace.h
+@@ -56,7 +56,7 @@ TRACE_EVENT(cxl_port_aer_uncorrectable_error,
+ 		__string(host, dev_name(dev->parent))
+ 		__field(u32, status)
+ 		__field(u32, first_error)
+-		__array(u32, header_log, CXL_HEADERLOG_SIZE_U32)
++		__array(u32, header_log, CXL_HEADERLOG_TRACE_SIZE_U32)
+ 	),
+ 	TP_fast_assign(
+ 		__assign_str(device);
+@@ -64,10 +64,14 @@ TRACE_EVENT(cxl_port_aer_uncorrectable_error,
+ 		__entry->status = status;
+ 		__entry->first_error = fe;
+ 		/*
+-		 * Embed the 512B headerlog data for user app retrieval and
+-		 * parsing, but no need to print this in the trace buffer.
++		 * Embed headerlog data for user app retrieval and parsing,
++		 * but no need to print in the trace buffer. Only
++		 * CXL_HEADERLOG_SIZE_U32 (16) dwords are hardware data;
++		 * the remaining entries preserve the 512-byte ABI layout
++		 * rasdaemon depends on and are zero-filled by the caller.
+ 		 */
+-		memcpy(__entry->header_log, hl, CXL_HEADERLOG_SIZE);
++		memcpy(__entry->header_log, hl,
++			CXL_HEADERLOG_TRACE_SIZE_U32 * sizeof(u32));
+ 	),
+ 	TP_printk("device=%s host=%s status: '%s' first_error: '%s'",
+ 		  __get_str(device), __get_str(host),
+@@ -85,7 +89,7 @@ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 		__field(u64, serial)
+ 		__field(u32, status)
+ 		__field(u32, first_error)
+-		__array(u32, header_log, CXL_HEADERLOG_SIZE_U32)
++		__array(u32, header_log, CXL_HEADERLOG_TRACE_SIZE_U32)
+ 	),
+ 	TP_fast_assign(
+ 		__assign_str(memdev, dev_name(&cxlmd->dev));
+@@ -94,10 +98,14 @@ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 		__entry->status = status;
+ 		__entry->first_error = fe;
+ 		/*
+-		 * Embed the 512B headerlog data for user app retrieval and
+-		 * parsing, but no need to print this in the trace buffer.
++		 * Embed headerlog data for user app retrieval and parsing,
++		 * but no need to print in the trace buffer. Only
++		 * CXL_HEADERLOG_SIZE_U32 (16) dwords are hardware data;
++		 * the remaining entries preserve the 512-byte ABI layout
++		 * rasdaemon depends on and are zero-filled by the caller.
+ 		 */
+-		memcpy(__entry->header_log, hl, CXL_HEADERLOG_SIZE);
++		memcpy(__entry->header_log, hl,
++			CXL_HEADERLOG_TRACE_SIZE_U32 * sizeof(u32));
+ 	),
+ 	TP_printk("memdev=%s host=%s serial=%lld: status: '%s' first_error: '%s'",
+ 		  __get_str(memdev), __get_str(host), __entry->serial,
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index b054909a60f2..2d363cbaba0d 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -147,8 +147,18 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define CXL_RAS_CAP_CONTROL_FE_MASK GENMASK(5, 0)
+ #define CXL_RAS_HEADER_LOG_OFFSET 0x18
+ #define CXL_RAS_CAPABILITY_LENGTH 0x58
+-#define CXL_HEADERLOG_SIZE SZ_512
+-#define CXL_HEADERLOG_SIZE_U32 SZ_512 / sizeof(u32)
++#define CXL_HEADERLOG_SIZE SZ_64
++#define CXL_HEADERLOG_SIZE_U32 (CXL_HEADERLOG_SIZE / sizeof(u32))
++
++/*
++ * The RAS UCE trace event header array was originally sized at SZ_512/sizeof(u32)
++ * = 128 u32s due to a bug. Userspace tools (rasdaemon) have grown a dependency
++ * on that 512-byte layout. Keep the trace array at 128 u32s to preserve the
++ * ABI; only CXL_HEADERLOG_SIZE_U32 (16) dwords are valid hardware data, the
++ * remainder are zero-filled.
++ */
++#define CXL_HEADERLOG_TRACE_SIZE SZ_512
++#define CXL_HEADERLOG_TRACE_SIZE_U32 (CXL_HEADERLOG_TRACE_SIZE / sizeof(u32))
+ 
+ /* CXL 2.0 8.2.8.1 Device Capabilities Array Register */
+ #define CXLDEV_CAP_ARRAY_OFFSET 0x0
