@@ -1,0 +1,399 @@
+s390: Add infrastructure to patch lowcore accesses
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit 5ade5be4edf855245955108860d2016af3065a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/5ade5be4.failed
+
+The s390 architecture defines two special per-CPU data pages
+called the "prefix area". In s390-linux terminology this is usually
+called "lowcore". This memory area contains system configuration
+data like old/new PSW's for system call/interrupt/machine check
+handlers and lots of other data. It is normally mapped to logical
+address 0. This area can only be accessed when in supervisor mode.
+
+This means that kernel code can dereference NULL pointers, because
+accesses to address 0 are allowed. Parts of lowcore can be write
+protected, but read accesses and write accesses outside of the write
+protected areas are not caught.
+
+To remove this limitation for debugging and testing, remap lowcore to
+another address and define a function get_lowcore() which simply
+returns the address where lowcore is mapped at. This would normally
+introduce a pointer dereference (=memory read). As lowcore is used
+for several very often used variables, add code to patch this function
+during runtime, so we avoid the memory reads.
+
+For C code get_lowcore() has to be used, for assembly code it is
+the GET_LC macro. When using this macro/function a reference is added
+to alternative patching. All these locations will be patched to the
+actual lowcore location when the kernel is booted or a module is loaded.
+
+To make debugging/bisecting problems easier, this patch adds all the
+infrastructure but the lowcore address is still hardwired to 0. This
+way the code can be converted on a per function basis, and the
+functionality is enabled in a patch after all the functions have
+been converted.
+
+Note that this requires at least z16 because the old lpsw instruction
+only allowed a 12 bit displacement. z16 introduced lpswey which allows
+20 bits (signed), so the lowcore can effectively be mapped from
+address 0 - 0x7e000. To use 0x7e000 as address, a 6 byte lgfi
+instruction would have to be used in the alternative. To save two
+bytes, llilh can be used, but this only allows to set bits 16-31 of
+the address. In order to use the llilh instruction, use 0x70000 as
+alternative lowcore address. This is still large enough to catch
+NULL pointer dereferences into large arrays.
+
+	Reviewed-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 5ade5be4edf855245955108860d2016af3065a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/alternative.h
+#	arch/s390/kernel/alternative.c
+diff --cc arch/s390/include/asm/alternative.h
+index 16de33750d6c,de980c938a3e..000000000000
+--- a/arch/s390/include/asm/alternative.h
++++ b/arch/s390/include/asm/alternative.h
+@@@ -2,6 -2,58 +2,61 @@@
+  #ifndef _ASM_S390_ALTERNATIVE_H
+  #define _ASM_S390_ALTERNATIVE_H
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Each alternative comes with a 32 bit feature field:
++  *	union {
++  *		u32 feature;
++  *		struct {
++  *			u32 ctx	 : 4;
++  *			u32 type : 8;
++  *			u32 data : 20;
++  *		};
++  *	}
++  *
++  * @ctx is a bitfield, where only one bit must be set. Each bit defines
++  * in which context an alternative is supposed to be applied to the
++  * kernel image:
++  *
++  * - from the decompressor before the kernel itself is executed
++  * - from early kernel code from within the kernel
++  *
++  * @type is a number which defines the type and with that the type
++  * specific alternative patching.
++  *
++  * @data is additional type specific information which defines if an
++  * alternative should be applied.
++  */
++ 
++ #define ALT_CTX_EARLY		1
++ #define ALT_CTX_LATE		2
++ #define ALT_CTX_ALL		(ALT_CTX_EARLY | ALT_CTX_LATE)
++ 
++ #define ALT_TYPE_FACILITY	0
++ #define ALT_TYPE_SPEC		1
++ #define ALT_TYPE_LOWCORE	2
++ 
++ #define ALT_DATA_SHIFT		0
++ #define ALT_TYPE_SHIFT		20
++ #define ALT_CTX_SHIFT		28
++ 
++ #define ALT_FACILITY_EARLY(facility)	(ALT_CTX_EARLY << ALT_CTX_SHIFT		| \
++ 					 ALT_TYPE_FACILITY << ALT_TYPE_SHIFT	| \
++ 					 (facility) << ALT_DATA_SHIFT)
++ 
++ #define ALT_FACILITY(facility)		(ALT_CTX_LATE << ALT_CTX_SHIFT		| \
++ 					 ALT_TYPE_FACILITY << ALT_TYPE_SHIFT	| \
++ 					 (facility) << ALT_DATA_SHIFT)
++ 
++ #define ALT_SPEC(facility)		(ALT_CTX_LATE << ALT_CTX_SHIFT		| \
++ 					 ALT_TYPE_SPEC << ALT_TYPE_SHIFT	| \
++ 					 (facility) << ALT_DATA_SHIFT)
++ 
++ #define ALT_LOWCORE			(ALT_CTX_EARLY << ALT_CTX_SHIFT		| \
++ 					 ALT_TYPE_LOWCORE << ALT_TYPE_SHIFT)
++ 
+++>>>>>>> 5ade5be4edf8 (s390: Add infrastructure to patch lowcore accesses)
+  #ifndef __ASSEMBLY__
+  
+  #include <linux/types.h>
+diff --cc arch/s390/kernel/alternative.c
+index a21c8800070f,8d5d0de35de0..000000000000
+--- a/arch/s390/kernel/alternative.c
++++ b/arch/s390/kernel/alternative.c
+@@@ -1,35 -1,41 +1,62 @@@
+  // SPDX-License-Identifier: GPL-2.0
+++<<<<<<< HEAD
+ +#include <linux/module.h>
+++=======
++ 
++ #include <linux/uaccess.h>
++ #include <asm/nospec-branch.h>
++ #include <asm/abs_lowcore.h>
+++>>>>>>> 5ade5be4edf8 (s390: Add infrastructure to patch lowcore accesses)
+  #include <asm/alternative.h>
+  #include <asm/facility.h>
+ +#include <asm/nospec-branch.h>
+ +
+ +static int __initdata_or_module alt_instr_disabled;
+  
+ -void __apply_alternatives(struct alt_instr *start, struct alt_instr *end, unsigned int ctx)
+ +static int __init disable_alternative_instructions(char *str)
+ +{
+ +	alt_instr_disabled = 1;
+ +	return 0;
+ +}
+ +
+ +early_param("noaltinstr", disable_alternative_instructions);
+ +
+ +static void __init_or_module __apply_alternatives(struct alt_instr *start,
+ +						  struct alt_instr *end)
+  {
+ -	u8 *instr, *replacement;
+  	struct alt_instr *a;
+ -	bool replace;
+ +	u8 *instr, *replacement;
+  
+  	/*
+  	 * The scan order should be from start to end. A later scanned
+  	 * alternative code can overwrite previously scanned alternative code.
+  	 */
+  	for (a = start; a < end; a++) {
+++<<<<<<< HEAD
+++=======
++ 		if (!(a->ctx & ctx))
++ 			continue;
++ 		switch (a->type) {
++ 		case ALT_TYPE_FACILITY:
++ 			replace = test_facility(a->data);
++ 			break;
++ 		case ALT_TYPE_SPEC:
++ 			replace = nobp_enabled();
++ 			break;
++ 		case ALT_TYPE_LOWCORE:
++ 			replace = have_relocated_lowcore();
++ 			break;
++ 		default:
++ 			replace = false;
++ 		}
++ 		if (!replace)
++ 			continue;
+++>>>>>>> 5ade5be4edf8 (s390: Add infrastructure to patch lowcore accesses)
+  		instr = (u8 *)&a->instr_offset + a->instr_offset;
+  		replacement = (u8 *)&a->repl_offset + a->repl_offset;
+ +
+ +		if (!__test_facility(a->feature, alt_stfle_fac_list))
+ +			continue;
+  		s390_kernel_write(instr, replacement, a->instrlen);
+  	}
+  }
+diff --git a/arch/s390/boot/boot.h b/arch/s390/boot/boot.h
+index 18027fdc92b0..17024ee81d69 100644
+--- a/arch/s390/boot/boot.h
++++ b/arch/s390/boot/boot.h
+@@ -89,8 +89,10 @@ extern char _end[], _decompressor_end[];
+ extern unsigned char _compressed_start[];
+ extern unsigned char _compressed_end[];
+ extern struct vmlinux_info _vmlinux_info;
++
+ #define vmlinux _vmlinux_info
+ 
++#define __lowcore_pa(x)		((unsigned long)(x) % sizeof(struct lowcore))
+ #define __abs_lowcore_pa(x)	(((unsigned long)(x) - __abs_lowcore) % sizeof(struct lowcore))
+ #define __kernel_va(x)		((void *)((unsigned long)(x) - __kaslr_offset_phys + __kaslr_offset))
+ #define __kernel_pa(x)		((unsigned long)(x) - __kaslr_offset + __kaslr_offset_phys)
+diff --git a/arch/s390/boot/ipl_parm.c b/arch/s390/boot/ipl_parm.c
+index a21f301acd29..337c14931ccb 100644
+--- a/arch/s390/boot/ipl_parm.c
++++ b/arch/s390/boot/ipl_parm.c
+@@ -3,6 +3,7 @@
+ #include <linux/init.h>
+ #include <linux/ctype.h>
+ #include <linux/pgtable.h>
++#include <asm/abs_lowcore.h>
+ #include <asm/page-states.h>
+ #include <asm/ebcdic.h>
+ #include <asm/sclp.h>
+diff --git a/arch/s390/boot/startup.c b/arch/s390/boot/startup.c
+index e9b9d980cc19..bbcc48edfa3a 100644
+--- a/arch/s390/boot/startup.c
++++ b/arch/s390/boot/startup.c
+@@ -30,6 +30,7 @@ unsigned long __bootdata_preserved(vmemmap_size);
+ unsigned long __bootdata_preserved(MODULES_VADDR);
+ unsigned long __bootdata_preserved(MODULES_END);
+ unsigned long __bootdata_preserved(max_mappable);
++int __bootdata_preserved(relocate_lowcore);
+ 
+ u64 __bootdata_preserved(stfle_fac_list[16]);
+ struct oldmem_data __bootdata_preserved(oldmem_data);
+diff --git a/arch/s390/boot/vmem.c b/arch/s390/boot/vmem.c
+index 7c6194383fc0..41f0159339db 100644
+--- a/arch/s390/boot/vmem.c
++++ b/arch/s390/boot/vmem.c
+@@ -27,6 +27,7 @@ atomic_long_t __bootdata_preserved(direct_pages_count[PG_DIRECT_MAP_MAX]);
+ enum populate_mode {
+ 	POPULATE_NONE,
+ 	POPULATE_DIRECT,
++	POPULATE_LOWCORE,
+ 	POPULATE_ABS_LOWCORE,
+ 	POPULATE_IDENTITY,
+ 	POPULATE_KERNEL,
+@@ -244,6 +245,8 @@ static unsigned long resolve_pa_may_alloc(unsigned long addr, unsigned long size
+ 		return INVALID_PHYS_ADDR;
+ 	case POPULATE_DIRECT:
+ 		return addr;
++	case POPULATE_LOWCORE:
++		return __lowcore_pa(addr);
+ 	case POPULATE_ABS_LOWCORE:
+ 		return __abs_lowcore_pa(addr);
+ 	case POPULATE_KERNEL:
+@@ -444,6 +447,7 @@ static void pgtable_populate(unsigned long addr, unsigned long end, enum populat
+ 
+ void setup_vmem(unsigned long kernel_start, unsigned long kernel_end, unsigned long asce_limit)
+ {
++	unsigned long lowcore_address = 0;
+ 	unsigned long start, end;
+ 	unsigned long asce_type;
+ 	unsigned long asce_bits;
+@@ -481,12 +485,17 @@ void setup_vmem(unsigned long kernel_start, unsigned long kernel_end, unsigned l
+ 	__arch_set_page_dat((void *)swapper_pg_dir, 1UL << CRST_ALLOC_ORDER);
+ 	__arch_set_page_dat((void *)invalid_pg_dir, 1UL << CRST_ALLOC_ORDER);
+ 
++	if (relocate_lowcore)
++		lowcore_address = LOWCORE_ALT_ADDRESS;
++
+ 	/*
+ 	 * To allow prefixing the lowcore must be mapped with 4KB pages.
+ 	 * To prevent creation of a large page at address 0 first map
+ 	 * the lowcore and create the identity mapping only afterwards.
+ 	 */
+-	pgtable_populate(0, sizeof(struct lowcore), POPULATE_DIRECT);
++	pgtable_populate(lowcore_address,
++			 lowcore_address + sizeof(struct lowcore),
++			 POPULATE_LOWCORE);
+ 	for_each_physmem_usable_range(i, &start, &end) {
+ 		pgtable_populate((unsigned long)__identity_va(start),
+ 				 (unsigned long)__identity_va(end),
+diff --git a/arch/s390/include/asm/abs_lowcore.h b/arch/s390/include/asm/abs_lowcore.h
+index 6f264b79e377..d20df8c923fc 100644
+--- a/arch/s390/include/asm/abs_lowcore.h
++++ b/arch/s390/include/asm/abs_lowcore.h
+@@ -2,6 +2,7 @@
+ #ifndef _ASM_S390_ABS_LOWCORE_H
+ #define _ASM_S390_ABS_LOWCORE_H
+ 
++#include <asm/sections.h>
+ #include <asm/lowcore.h>
+ 
+ #define ABS_LOWCORE_MAP_SIZE	(NR_CPUS * sizeof(struct lowcore))
+@@ -24,4 +25,11 @@ static inline void put_abs_lowcore(struct lowcore *lc)
+ 	put_cpu();
+ }
+ 
++extern int __bootdata_preserved(relocate_lowcore);
++
++static inline int have_relocated_lowcore(void)
++{
++	return relocate_lowcore;
++}
++
+ #endif /* _ASM_S390_ABS_LOWCORE_H */
+* Unmerged path arch/s390/include/asm/alternative.h
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index 94f954250ae0..1708bbf99bcc 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -14,10 +14,15 @@
+ #include <asm/ctlreg.h>
+ #include <asm/cpu.h>
+ #include <asm/types.h>
++#include <asm/alternative.h>
+ 
+ #define LC_ORDER 1
+ #define LC_PAGES 2
+ 
++#define LOWCORE_ALT_ADDRESS	_AC(0x70000, UL)
++
++#ifndef __ASSEMBLY__
++
+ struct pgm_tdb {
+ 	u64 data[32];
+ };
+@@ -217,7 +222,14 @@ struct lowcore {
+ 
+ static __always_inline struct lowcore *get_lowcore(void)
+ {
+-	return NULL;
++	struct lowcore *lc;
++
++	if (__is_defined(__DECOMPRESSOR))
++		return NULL;
++	asm(ALTERNATIVE("llilh %[lc],0", "llilh %[lc],%[alt]", ALT_LOWCORE)
++	    : [lc] "=d" (lc)
++	    : [alt] "i" (LOWCORE_ALT_ADDRESS >> 16));
++	return lc;
+ }
+ 
+ extern struct lowcore *lowcore_ptr[];
+@@ -227,4 +239,13 @@ static inline void set_prefix(__u32 address)
+ 	asm volatile("spx %0" : : "Q" (address) : "memory");
+ }
+ 
++#else /* __ASSEMBLY__ */
++
++.macro GET_LC reg
++	ALTERNATIVE "llilh	\reg,0",					\
++		__stringify(llilh	\reg, LOWCORE_ALT_ADDRESS >> 16),	\
++		ALT_LOWCORE
++.endm
++
++#endif /* __ASSEMBLY__ */
+ #endif /* _ASM_S390_LOWCORE_H */
+diff --git a/arch/s390/kernel/abs_lowcore.c b/arch/s390/kernel/abs_lowcore.c
+index f9efc54ec4b7..09cd24cbe74e 100644
+--- a/arch/s390/kernel/abs_lowcore.c
++++ b/arch/s390/kernel/abs_lowcore.c
+@@ -4,6 +4,7 @@
+ #include <asm/abs_lowcore.h>
+ 
+ unsigned long __bootdata_preserved(__abs_lowcore);
++int __bootdata_preserved(relocate_lowcore);
+ 
+ int abs_lowcore_map(int cpu, struct lowcore *lc, bool alloc)
+ {
+* Unmerged path arch/s390/kernel/alternative.c
+diff --git a/arch/s390/kernel/alternative.h b/arch/s390/kernel/alternative.h
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index 435472036f38..d44c0db786d3 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -49,6 +49,7 @@ decompressor_handled_param(noexec);
+ decompressor_handled_param(facilities);
+ decompressor_handled_param(nokaslr);
+ decompressor_handled_param(cmma);
++decompressor_handled_param(relocate_lowcore);
+ #if IS_ENABLED(CONFIG_KVM)
+ decompressor_handled_param(prot_virt);
+ #endif
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 093b2031f600..f8c31faace69 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -906,6 +906,9 @@ void __init setup_arch(char **cmdline_p)
+ 	else
+ 		pr_info("Linux is running as a guest in 64-bit mode\n");
+ 
++	if (have_relocated_lowcore())
++		pr_info("Lowcore relocated to 0x%px\n", get_lowcore());
++
+ 	log_component_list();
+ 
+ 	/* Initialize the lockdown LSM */
