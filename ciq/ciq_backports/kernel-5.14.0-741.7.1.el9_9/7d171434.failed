@@ -1,0 +1,170 @@
+s390/uv: Convert uv_convert_owned_from_secure() to uv_convert_from_secure_(folio|pte)()
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author David Hildenbrand <david@redhat.com>
+commit 7d17143469879409692dc6279794e71be4bb1196
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/7d171434.failed
+
+Let's do the same as we did for uv_destroy_(folio|pte)() and
+have the following variants:
+
+(1) uv_convert_from_secure(): "low level" helper that operates on paddr
+and does not mess with folios.
+
+(2) uv_convert_from_secure_folio(): Consumes a folio to which we hold a
+reference.
+
+(3) uv_convert_from_secure_pte(): Consumes a PTE that holds a reference
+through the mapping.
+
+Unfortunately we need uv_convert_from_secure_pte(), because pfn_folio()
+and friends are not available in pgtable.h.
+
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20240508182955.358628-9-david@redhat.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 7d17143469879409692dc6279794e71be4bb1196)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/uv.h
+#	arch/s390/kernel/uv.c
+diff --cc arch/s390/include/asm/uv.h
+index 354d8eb2acb5,0679445cac0b..000000000000
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@@ -630,11 -483,35 +630,44 @@@ static inline int is_prot_virt_host(voi
+  int uv_pin_shared(unsigned long paddr);
+  int gmap_make_secure(struct gmap *gmap, unsigned long gaddr, void *uvcb);
+  int gmap_destroy_page(struct gmap *gmap, unsigned long gaddr);
+++<<<<<<< HEAD
+ +int uv_destroy_owned_page(unsigned long paddr);
+ +int uv_convert_from_secure(unsigned long paddr);
+ +int uv_convert_owned_from_secure(unsigned long paddr);
+ +int gmap_convert_to_secure(struct gmap *gmap, unsigned long gaddr);
+ +
+ +void setup_uv(void);
+++=======
++ int uv_destroy_folio(struct folio *folio);
++ int uv_destroy_pte(pte_t pte);
++ int uv_convert_from_secure_pte(pte_t pte);
++ int gmap_convert_to_secure(struct gmap *gmap, unsigned long gaddr);
++ 
++ void setup_uv(void);
++ #else
++ #define is_prot_virt_host() 0
++ static inline void setup_uv(void) {}
++ 
++ static inline int uv_pin_shared(unsigned long paddr)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_destroy_folio(struct folio *folio)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_destroy_pte(pte_t pte)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_convert_from_secure_pte(pte_t pte)
++ {
++ 	return 0;
++ }
++ #endif
+++>>>>>>> 7d1714346987 (s390/uv: Convert uv_convert_owned_from_secure() to uv_convert_from_secure_(folio|pte)())
+  
+  #endif /* _ASM_S390_UV_H */
+diff --cc arch/s390/kernel/uv.c
+index acbb4ffb87e4,b456066d72da..000000000000
+--- a/arch/s390/kernel/uv.c
++++ b/arch/s390/kernel/uv.c
+@@@ -176,18 -178,21 +176,29 @@@ int uv_convert_from_secure(unsigned lon
+  }
+  
+  /*
+-  * The caller must already hold a reference to the page
++  * The caller must already hold a reference to the folio.
+   */
+- int uv_convert_owned_from_secure(unsigned long paddr)
++ static int uv_convert_from_secure_folio(struct folio *folio)
+  {
+++<<<<<<< HEAD
+ +	struct page *page = phys_to_page(paddr);
+ +	int rc;
+ +
+ +	get_page(page);
+ +	rc = uv_convert_from_secure(paddr);
+++=======
++ 	int rc;
++ 
++ 	/* See gmap_make_secure(): large folios cannot be secure */
++ 	if (unlikely(folio_test_large(folio)))
++ 		return 0;
++ 
++ 	folio_get(folio);
++ 	rc = uv_convert_from_secure(folio_to_phys(folio));
+++>>>>>>> 7d1714346987 (s390/uv: Convert uv_convert_owned_from_secure() to uv_convert_from_secure_(folio|pte)())
+  	if (!rc)
+ -		clear_bit(PG_arch_1, &folio->flags);
+ -	folio_put(folio);
+ +		clear_bit(PG_arch_1, &page->flags);
+ +	put_page(page);
+  	return rc;
+  }
+  
+@@@ -473,8 -489,8 +493,13 @@@ int gmap_destroy_page(struct gmap *gmap
+  	 * we instead try to export the page.
+  	 */
+  	if (rc)
+++<<<<<<< HEAD
+ +		rc = uv_convert_owned_from_secure(page_to_phys(page));
+ +	put_page(page);
+++=======
++ 		rc = uv_convert_from_secure_folio(folio);
++ 	folio_put(folio);
+++>>>>>>> 7d1714346987 (s390/uv: Convert uv_convert_owned_from_secure() to uv_convert_from_secure_(folio|pte)())
+  out:
+  	mmap_read_unlock(gmap->mm);
+  	return rc;
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index d3f0fcb1decf..eb6ee0c97c19 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -1194,7 +1194,7 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
+ 	res = ptep_xchg_lazy(mm, addr, ptep, __pte(_PAGE_INVALID));
+ 	/* At this point the reference through the mapping is still present */
+ 	if (mm_is_protected(mm) && pte_present(res))
+-		uv_convert_owned_from_secure(pte_val(res) & PAGE_MASK);
++		uv_convert_from_secure_pte(res);
+ 	return res;
+ }
+ 
+@@ -1212,7 +1212,7 @@ static inline pte_t ptep_clear_flush(struct vm_area_struct *vma,
+ 	res = ptep_xchg_direct(vma->vm_mm, addr, ptep, __pte(_PAGE_INVALID));
+ 	/* At this point the reference through the mapping is still present */
+ 	if (mm_is_protected(vma->vm_mm) && pte_present(res))
+-		uv_convert_owned_from_secure(pte_val(res) & PAGE_MASK);
++		uv_convert_from_secure_pte(res);
+ 	return res;
+ }
+ 
+@@ -1251,7 +1251,7 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
+ 	 * if this is not a mm teardown, the slower export is used as
+ 	 * fallback instead.
+ 	 */
+-	uv_convert_owned_from_secure(pte_val(res) & PAGE_MASK);
++	uv_convert_from_secure_pte(res);
+ 	return res;
+ }
+ 
+* Unmerged path arch/s390/include/asm/uv.h
+* Unmerged path arch/s390/kernel/uv.c
