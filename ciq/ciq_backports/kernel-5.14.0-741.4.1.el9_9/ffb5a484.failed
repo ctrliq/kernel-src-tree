@@ -1,0 +1,78 @@
+ipv6: fix data race in fib6_metric_set() using cmpxchg
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.4.1.el9_9
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit ffb5a4843c5bde702ed17cbcdbda98b37f7a6dad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.4.1.el9_9/ffb5a484.failed
+
+fib6_metric_set() may be called concurrently from softirq context without
+holding the FIB table lock. A typical path is:
+
+  ndisc_router_discovery()
+    spin_unlock_bh(&table->tb6_lock)        <- lock released
+    fib6_metric_set(rt, RTAX_HOPLIMIT, ...) <- lockless call
+
+When two CPUs process Router Advertisement packets for the same router
+simultaneously, they can both arrive at fib6_metric_set() with the same
+fib6_info pointer whose fib6_metrics still points to dst_default_metrics.
+
+  if (f6i->fib6_metrics == &dst_default_metrics) {   /* both CPUs: true */
+      struct dst_metrics *p = kzalloc_obj(*p, GFP_ATOMIC);
+      refcount_set(&p->refcnt, 1);
+      f6i->fib6_metrics = p;   /* CPU1 overwrites CPU0's p -> p0 leaked */
+  }
+
+The dst_metrics allocated by the losing CPU has refcnt=1 but no pointer
+to it anywhere in memory, producing a kmemleak report:
+
+  unreferenced object 0xff1100025aca1400 (size 96):
+    comm "softirq", pid 0, jiffies 4299271239
+    backtrace:
+      kmalloc_trace+0x28a/0x380
+      fib6_metric_set+0xcd/0x180
+      ndisc_router_discovery+0x12dc/0x24b0
+      icmpv6_rcv+0xc16/0x1360
+
+Fix this by:
+ - Set val for p->metrics before published via cmpxchg() so the metrics
+   value is ready before the pointer becomes visible to other CPUs.
+ - Replace the plain pointer store with cmpxchg() and free the allocation
+   safely when competition failed.
+ - Add READ_ONCE()/WRITE_ONCE() for metrics[] setting in the non-default
+   metrics path to prevent compiler-based data races.
+
+Fixes: d4ead6b34b67 ("net/ipv6: move metrics from dst to rt6_info")
+	Reported-by: Fei Liu <feliu@redhat.com>
+	Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20260331-b4-fib6_metric_set-kmemleak-v3-1-88d27f4d8825@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ffb5a4843c5bde702ed17cbcdbda98b37f7a6dad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_fib.c
+diff --cc net/ipv6/ip6_fib.c
+index 413c9c3d056d,45ef4d65dcbc..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -722,8 -732,9 +724,14 @@@ void fib6_metric_set(struct fib6_info *
+  	if (!f6i)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (f6i->fib6_metrics == &dst_default_metrics) {
+ +		struct dst_metrics *p = kzalloc(sizeof(*p), GFP_ATOMIC);
+++=======
++ 	if (READ_ONCE(f6i->fib6_metrics) == &dst_default_metrics) {
++ 		struct dst_metrics *dflt = (struct dst_metrics *)&dst_default_metrics;
++ 		struct dst_metrics *p = kzalloc_obj(*p, GFP_ATOMIC);
+++>>>>>>> ffb5a4843c5b (ipv6: fix data race in fib6_metric_set() using cmpxchg)
+  
+  		if (!p)
+  			return;
+* Unmerged path net/ipv6/ip6_fib.c
