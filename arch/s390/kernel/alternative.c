@@ -31,7 +31,7 @@ static void __init_or_module __apply_alternatives(struct alt_instr *start,
 		instr = (u8 *)&a->instr_offset + a->instr_offset;
 		replacement = (u8 *)&a->repl_offset + a->repl_offset;
 
-		if (!__test_facility(a->facility, alt_stfle_fac_list))
+		if (!__test_facility(a->feature, alt_stfle_fac_list))
 			continue;
 		s390_kernel_write(instr, replacement, a->instrlen);
 	}
