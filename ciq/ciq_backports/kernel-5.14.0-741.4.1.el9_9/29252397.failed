@@ -1,0 +1,472 @@
+inet: annotate data-races around isk->inet_num
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.4.1.el9_9
+commit-author Eric Dumazet <edumazet@google.com>
+commit 29252397bcc1e0a1f85e5c3bee59c325f5c26341
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.4.1.el9_9/29252397.failed
+
+UDP/TCP lookups are using RCU, thus isk->inet_num accesses
+should use READ_ONCE() and WRITE_ONCE() where needed.
+
+Fixes: 3ab5aee7fe84 ("net: Convert TCP & DCCP hash tables to use RCU / hlist_nulls")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20260225203545.1512417-1-edumazet@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 29252397bcc1e0a1f85e5c3bee59c325f5c26341)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/inet_hashtables.c
+#	net/ipv4/tcp_diag.c
+diff --cc net/ipv4/inet_hashtables.c
+index 9d9ffd2daa9d,9bfccc283fa6..000000000000
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@@ -93,11 -176,34 +93,15 @@@ void inet_bind_bucket_destroy(struct km
+  }
+  
+  void inet_bind_hash(struct sock *sk, struct inet_bind_bucket *tb,
+ -		    struct inet_bind2_bucket *tb2, unsigned short port)
+ +		    const unsigned short snum)
+  {
+++<<<<<<< HEAD
+ +	inet_sk(sk)->inet_num = snum;
+ +	sk_add_bind_node(sk, &tb->owners);
+++=======
++ 	WRITE_ONCE(inet_sk(sk)->inet_num, port);
+++>>>>>>> 29252397bcc1 (inet: annotate data-races around isk->inet_num)
+  	inet_csk(sk)->icsk_bind_hash = tb;
+ -	inet_csk(sk)->icsk_bind2_hash = tb2;
+ -	sk_add_bind_node(sk, &tb2->owners);
+  }
+  
+  /*
+@@@ -113,10 -218,26 +117,27 @@@ static void __inet_put_port(struct soc
+  
+  	spin_lock(&head->lock);
+  	tb = inet_csk(sk)->icsk_bind_hash;
+ +	__sk_del_bind_node(sk);
+  	inet_csk(sk)->icsk_bind_hash = NULL;
+++<<<<<<< HEAD
+ +	inet_sk(sk)->inet_num = 0;
+ +	inet_bind_bucket_destroy(hashinfo->bind_bucket_cachep, tb);
+++=======
++ 	WRITE_ONCE(inet_sk(sk)->inet_num, 0);
++ 	sk->sk_userlocks &= ~SOCK_CONNECT_BIND;
++ 
++ 	spin_lock(&head2->lock);
++ 	if (inet_csk(sk)->icsk_bind2_hash) {
++ 		struct inet_bind2_bucket *tb2 = inet_csk(sk)->icsk_bind2_hash;
++ 
++ 		__sk_del_bind_node(sk);
++ 		inet_csk(sk)->icsk_bind2_hash = NULL;
++ 		inet_bind2_bucket_destroy(hashinfo->bind2_bucket_cachep, tb2);
++ 	}
++ 	spin_unlock(&head2->lock);
++ 
++ 	inet_bind_bucket_destroy(tb);
+++>>>>>>> 29252397bcc1 (inet: annotate data-races around isk->inet_num)
+  	spin_unlock(&head->lock);
+  }
+  
+@@@ -810,6 -1193,36 +831,39 @@@ ok
+  		inet_twsk_deschedule_put(tw);
+  	local_bh_enable();
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ error:
++ 	if (sk_hashed(sk)) {
++ 		spinlock_t *lock = inet_ehash_lockp(hinfo, sk->sk_hash);
++ 
++ 		sock_prot_inuse_add(net, sk->sk_prot, -1);
++ 
++ 		spin_lock(lock);
++ 		__sk_nulls_del_node_init_rcu(sk);
++ 		spin_unlock(lock);
++ 
++ 		sk->sk_hash = 0;
++ 		inet_sk(sk)->inet_sport = 0;
++ 		WRITE_ONCE(inet_sk(sk)->inet_num, 0);
++ 
++ 		if (tw)
++ 			inet_twsk_bind_unhash(tw, hinfo);
++ 	}
++ 
++ 	spin_unlock(&head2->lock);
++ 	if (tb_created)
++ 		inet_bind_bucket_destroy(tb);
++ 	spin_unlock(&head->lock);
++ 
++ 	if (tw)
++ 		inet_twsk_deschedule_put(tw);
++ 
++ 	local_bh_enable();
++ 
++ 	return -ENOMEM;
+++>>>>>>> 29252397bcc1 (inet: annotate data-races around isk->inet_num)
+  }
+  
+  /*
+diff --cc net/ipv4/tcp_diag.c
+index 01b50fa79189,7935702e394b..000000000000
+--- a/net/ipv4/tcp_diag.c
++++ b/net/ipv4/tcp_diag.c
+@@@ -181,11 -314,291 +181,285 @@@ static size_t tcp_diag_get_aux_size(str
+  static void tcp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
+  			  const struct inet_diag_req_v2 *r)
+  {
+ -	bool net_admin = netlink_net_capable(cb->skb, CAP_NET_ADMIN);
+ -	struct inet_diag_dump_data *cb_data = cb->data;
+ -	struct net *net = sock_net(skb->sk);
+ -	u32 idiag_states = r->idiag_states;
+ -	struct inet_hashinfo *hashinfo;
+ -	int i, num, s_i, s_num;
+ -	struct sock *sk;
+ +	struct inet_hashinfo *hinfo;
+  
+ -	hashinfo = net->ipv4.tcp_death_row.hashinfo;
+ -	if (idiag_states & TCPF_SYN_RECV)
+ -		idiag_states |= TCPF_NEW_SYN_RECV;
+ -	s_i = cb->args[1];
+ -	s_num = num = cb->args[2];
+ +	hinfo = sock_net(cb->skb->sk)->ipv4.tcp_death_row.hashinfo;
+  
+++<<<<<<< HEAD
+ +	inet_diag_dump_icsk(hinfo, skb, cb, r);
+++=======
++ 	if (cb->args[0] == 0) {
++ 		if (!(idiag_states & TCPF_LISTEN) || r->id.idiag_dport)
++ 			goto skip_listen_ht;
++ 
++ 		for (i = s_i; i <= hashinfo->lhash2_mask; i++) {
++ 			struct inet_listen_hashbucket *ilb;
++ 			struct hlist_nulls_node *node;
++ 
++ 			num = 0;
++ 			ilb = &hashinfo->lhash2[i];
++ 
++ 			if (hlist_nulls_empty(&ilb->nulls_head)) {
++ 				s_num = 0;
++ 				continue;
++ 			}
++ 			spin_lock(&ilb->lock);
++ 			sk_nulls_for_each(sk, node, &ilb->nulls_head) {
++ 				struct inet_sock *inet = inet_sk(sk);
++ 
++ 				if (!net_eq(sock_net(sk), net))
++ 					continue;
++ 
++ 				if (num < s_num) {
++ 					num++;
++ 					continue;
++ 				}
++ 
++ 				if (r->sdiag_family != AF_UNSPEC &&
++ 				    sk->sk_family != r->sdiag_family)
++ 					goto next_listen;
++ 
++ 				if (r->id.idiag_sport != inet->inet_sport &&
++ 				    r->id.idiag_sport)
++ 					goto next_listen;
++ 
++ 				if (!inet_diag_bc_sk(cb_data, sk))
++ 					goto next_listen;
++ 
++ 				if (inet_sk_diag_fill(sk, inet_csk(sk), skb,
++ 						      cb, r, NLM_F_MULTI,
++ 						      net_admin) < 0) {
++ 					spin_unlock(&ilb->lock);
++ 					goto done;
++ 				}
++ 
++ next_listen:
++ 				++num;
++ 			}
++ 			spin_unlock(&ilb->lock);
++ 
++ 			s_num = 0;
++ 		}
++ skip_listen_ht:
++ 		cb->args[0] = 1;
++ 		s_i = num = s_num = 0;
++ 	}
++ 
++ /* Process a maximum of SKARR_SZ sockets at a time when walking hash buckets
++  * with bh disabled.
++  */
++ #define SKARR_SZ 16
++ 
++ 	/* Dump bound but inactive (not listening, connecting, etc.) sockets */
++ 	if (cb->args[0] == 1) {
++ 		if (!(idiag_states & TCPF_BOUND_INACTIVE))
++ 			goto skip_bind_ht;
++ 
++ 		for (i = s_i; i < hashinfo->bhash_size; i++) {
++ 			struct inet_bind_hashbucket *ibb;
++ 			struct inet_bind2_bucket *tb2;
++ 			struct sock *sk_arr[SKARR_SZ];
++ 			int num_arr[SKARR_SZ];
++ 			int idx, accum, res;
++ 
++ resume_bind_walk:
++ 			num = 0;
++ 			accum = 0;
++ 			ibb = &hashinfo->bhash2[i];
++ 
++ 			if (hlist_empty(&ibb->chain)) {
++ 				s_num = 0;
++ 				continue;
++ 			}
++ 			spin_lock_bh(&ibb->lock);
++ 			inet_bind_bucket_for_each(tb2, &ibb->chain) {
++ 				if (!net_eq(ib2_net(tb2), net))
++ 					continue;
++ 
++ 				sk_for_each_bound(sk, &tb2->owners) {
++ 					struct inet_sock *inet = inet_sk(sk);
++ 
++ 					if (num < s_num)
++ 						goto next_bind;
++ 
++ 					if (sk->sk_state != TCP_CLOSE ||
++ 					    !inet->inet_num)
++ 						goto next_bind;
++ 
++ 					if (r->sdiag_family != AF_UNSPEC &&
++ 					    r->sdiag_family != sk->sk_family)
++ 						goto next_bind;
++ 
++ 					if (!inet_diag_bc_sk(cb_data, sk))
++ 						goto next_bind;
++ 
++ 					sock_hold(sk);
++ 					num_arr[accum] = num;
++ 					sk_arr[accum] = sk;
++ 					if (++accum == SKARR_SZ)
++ 						goto pause_bind_walk;
++ next_bind:
++ 					num++;
++ 				}
++ 			}
++ pause_bind_walk:
++ 			spin_unlock_bh(&ibb->lock);
++ 
++ 			res = 0;
++ 			for (idx = 0; idx < accum; idx++) {
++ 				if (res >= 0) {
++ 					res = inet_sk_diag_fill(sk_arr[idx],
++ 								NULL, skb, cb,
++ 								r, NLM_F_MULTI,
++ 								net_admin);
++ 					if (res < 0)
++ 						num = num_arr[idx];
++ 				}
++ 				sock_put(sk_arr[idx]);
++ 			}
++ 			if (res < 0)
++ 				goto done;
++ 
++ 			cond_resched();
++ 
++ 			if (accum == SKARR_SZ) {
++ 				s_num = num + 1;
++ 				goto resume_bind_walk;
++ 			}
++ 
++ 			s_num = 0;
++ 		}
++ skip_bind_ht:
++ 		cb->args[0] = 2;
++ 		s_i = num = s_num = 0;
++ 	}
++ 
++ 	if (!(idiag_states & ~TCPF_LISTEN))
++ 		goto out;
++ 
++ 	for (i = s_i; i <= hashinfo->ehash_mask; i++) {
++ 		struct inet_ehash_bucket *head = &hashinfo->ehash[i];
++ 		spinlock_t *lock = inet_ehash_lockp(hashinfo, i);
++ 		struct hlist_nulls_node *node;
++ 		struct sock *sk_arr[SKARR_SZ];
++ 		int num_arr[SKARR_SZ];
++ 		int idx, accum, res;
++ 
++ 		if (hlist_nulls_empty(&head->chain))
++ 			continue;
++ 
++ 		if (i > s_i)
++ 			s_num = 0;
++ 
++ next_chunk:
++ 		num = 0;
++ 		accum = 0;
++ 		spin_lock_bh(lock);
++ 		sk_nulls_for_each(sk, node, &head->chain) {
++ 			int state;
++ 
++ 			if (!net_eq(sock_net(sk), net))
++ 				continue;
++ 			if (num < s_num)
++ 				goto next_normal;
++ 			state = (sk->sk_state == TCP_TIME_WAIT) ?
++ 				READ_ONCE(inet_twsk(sk)->tw_substate) : sk->sk_state;
++ 			if (!(idiag_states & (1 << state)))
++ 				goto next_normal;
++ 			if (r->sdiag_family != AF_UNSPEC &&
++ 			    sk->sk_family != r->sdiag_family)
++ 				goto next_normal;
++ 			if (r->id.idiag_sport != htons(READ_ONCE(sk->sk_num)) &&
++ 			    r->id.idiag_sport)
++ 				goto next_normal;
++ 			if (r->id.idiag_dport != sk->sk_dport &&
++ 			    r->id.idiag_dport)
++ 				goto next_normal;
++ 			twsk_build_assert();
++ 
++ 			if (!inet_diag_bc_sk(cb_data, sk))
++ 				goto next_normal;
++ 
++ 			if (!refcount_inc_not_zero(&sk->sk_refcnt))
++ 				goto next_normal;
++ 
++ 			num_arr[accum] = num;
++ 			sk_arr[accum] = sk;
++ 			if (++accum == SKARR_SZ)
++ 				break;
++ next_normal:
++ 			++num;
++ 		}
++ 		spin_unlock_bh(lock);
++ 
++ 		res = 0;
++ 		for (idx = 0; idx < accum; idx++) {
++ 			if (res >= 0) {
++ 				res = sk_diag_fill(sk_arr[idx], skb, cb, r,
++ 						   NLM_F_MULTI, net_admin);
++ 				if (res < 0)
++ 					num = num_arr[idx];
++ 			}
++ 			sock_gen_put(sk_arr[idx]);
++ 		}
++ 		if (res < 0)
++ 			break;
++ 
++ 		cond_resched();
++ 
++ 		if (accum == SKARR_SZ) {
++ 			s_num = num + 1;
++ 			goto next_chunk;
++ 		}
++ 	}
++ 
++ done:
++ 	cb->args[1] = i;
++ 	cb->args[2] = num;
++ out:
++ 	;
++ }
++ 
++ static struct sock *tcp_diag_find_one_icsk(struct net *net,
++ 					   const struct inet_diag_req_v2 *req)
++ {
++ 	struct sock *sk;
++ 
++ 	rcu_read_lock();
++ 	if (req->sdiag_family == AF_INET) {
++ 		sk = inet_lookup(net, NULL, 0, req->id.idiag_dst[0],
++ 				 req->id.idiag_dport, req->id.idiag_src[0],
++ 				 req->id.idiag_sport, req->id.idiag_if);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else if (req->sdiag_family == AF_INET6) {
++ 		if (ipv6_addr_v4mapped((struct in6_addr *)req->id.idiag_dst) &&
++ 		    ipv6_addr_v4mapped((struct in6_addr *)req->id.idiag_src))
++ 			sk = inet_lookup(net, NULL, 0, req->id.idiag_dst[3],
++ 					 req->id.idiag_dport, req->id.idiag_src[3],
++ 					 req->id.idiag_sport, req->id.idiag_if);
++ 		else
++ 			sk = inet6_lookup(net, NULL, 0,
++ 					  (struct in6_addr *)req->id.idiag_dst,
++ 					  req->id.idiag_dport,
++ 					  (struct in6_addr *)req->id.idiag_src,
++ 					  req->id.idiag_sport,
++ 					  req->id.idiag_if);
++ #endif
++ 	} else {
++ 		rcu_read_unlock();
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 	rcu_read_unlock();
++ 	if (!sk)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	if (sock_diag_check_cookie(sk, req->id.idiag_cookie)) {
++ 		sock_gen_put(sk);
++ 		return ERR_PTR(-ENOENT);
++ 	}
++ 
++ 	return sk;
+++>>>>>>> 29252397bcc1 (inet: annotate data-races around isk->inet_num)
+  }
+  
+  static int tcp_diag_dump_one(struct netlink_callback *cb,
+diff --git a/include/net/inet6_hashtables.h b/include/net/inet6_hashtables.h
+index f259e1ae14ba..d8f80cb584c7 100644
+--- a/include/net/inet6_hashtables.h
++++ b/include/net/inet6_hashtables.h
+@@ -114,7 +114,7 @@ static inline bool inet6_match(struct net *net, const struct sock *sk,
+ 
+ 	if (!net_eq(sock_net(sk), net) ||
+ 	    sk->sk_family != AF_INET6 ||
+-	    sk->sk_portpair != ports ||
++	    READ_ONCE(sk->sk_portpair) != ports ||
+ 	    !ipv6_addr_equal(&sk->sk_v6_daddr, saddr) ||
+ 	    !ipv6_addr_equal(&sk->sk_v6_rcv_saddr, daddr))
+ 		return false;
+diff --git a/include/net/inet_hashtables.h b/include/net/inet_hashtables.h
+index fd6b510d114b..8ae2332ad858 100644
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -274,7 +274,7 @@ static inline bool inet_match(struct net *net, const struct sock *sk,
+ 	int bound_dev_if;
+ 
+ 	if (!net_eq(sock_net(sk), net) ||
+-	    sk->sk_portpair != ports ||
++	    READ_ONCE(sk->sk_portpair) != ports ||
+ 	    sk->sk_addrpair != cookie)
+ 	        return false;
+ 
+diff --git a/include/net/ip.h b/include/net/ip.h
+index ab6e5263e0e4..0c2ea72d6f4b 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -96,7 +96,7 @@ static inline void ipcm_init_sk(struct ipcm_cookie *ipcm,
+ 	ipcm->sockc.tsflags = inet->sk.sk_tsflags;
+ 	ipcm->oif = READ_ONCE(inet->sk.sk_bound_dev_if);
+ 	ipcm->addr = inet->inet_saddr;
+-	ipcm->protocol = inet->inet_num;
++	ipcm->protocol = READ_ONCE(inet->inet_num);
+ }
+ 
+ #define IPCB(skb) ((struct inet_skb_parm*)((skb)->cb))
+* Unmerged path net/ipv4/inet_hashtables.c
+* Unmerged path net/ipv4/tcp_diag.c
+diff --git a/net/ipv6/inet6_hashtables.c b/net/ipv6/inet6_hashtables.c
+index b64b49012655..cc4557ae96d6 100644
+--- a/net/ipv6/inet6_hashtables.c
++++ b/net/ipv6/inet6_hashtables.c
+@@ -96,7 +96,8 @@ static inline int compute_score(struct sock *sk, struct net *net,
+ {
+ 	int score = -1;
+ 
+-	if (net_eq(sock_net(sk), net) && inet_sk(sk)->inet_num == hnum &&
++	if (net_eq(sock_net(sk), net) &&
++	    READ_ONCE(inet_sk(sk)->inet_num) == hnum &&
+ 	    sk->sk_family == PF_INET6) {
+ 		if (!ipv6_addr_equal(&sk->sk_v6_rcv_saddr, daddr))
+ 			return -1;
