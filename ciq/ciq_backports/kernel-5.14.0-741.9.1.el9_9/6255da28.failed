@@ -1,0 +1,118 @@
+proc: protect ptrace_may_access() with exec_update_lock (FD links)
+
+jira KERNEL-1869
+cve CVE-2026-64375
+Rebuild_History Non-Buildable kernel-5.14.0-741.9.1.el9_9
+commit-author Jann Horn <jannh@google.com>
+commit 6255da28d4bb5349fe18e84cb043ccd394eba75d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.9.1.el9_9/6255da28.failed
+
+proc_pid_get_link() and proc_pid_readlink() currently look up the task from
+the pid once, then do the ptrace access check on that task, then look up
+the task from the pid a second time to do the actual access.
+That's racy in several ways.
+
+To fix it, pass the task to the ->proc_get_link() handler, and instead of
+proc_fd_access_allowed(), introduce a new helper call_proc_get_link() that
+looks up and locks the task, does the access check, and calls
+->proc_get_link().
+
+Fixes: 778c1144771f ("[PATCH] proc: Use sane permission checks on the /proc/<pid>/fd/ symlinks")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Jann Horn <jannh@google.com>
+Link: https://patch.msgid.link/20260518-procfs-lockfix-part1-v1-2-5c3d20e0ac33@google.com
+	Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+(cherry picked from commit 6255da28d4bb5349fe18e84cb043ccd394eba75d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/base.c
+diff --cc fs/proc/base.c
+index cb79b5f1d459,5042f14d24f3..000000000000
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@@ -670,24 -701,7 +661,28 @@@ static int proc_pid_syscall(struct seq_
+  /*                       Here the fs part begins                        */
+  /************************************************************************/
+  
+++<<<<<<< HEAD
+ +/* permission checks */
+ +static int proc_fd_access_allowed(struct inode *inode)
+ +{
+ +	struct task_struct *task;
+ +	int allowed = 0;
+ +	/* Allow access to a task's file descriptors if it is us or we
+ +	 * may use ptrace attach to the process and find out that
+ +	 * information.
+ +	 */
+ +	task = get_proc_task(inode);
+ +	if (task) {
+ +		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+ +		put_task_struct(task);
+ +	}
+ +	return allowed;
+ +}
+ +
+ +int proc_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+++=======
++ int proc_nochmod_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+++>>>>>>> 6255da28d4bb (proc: protect ptrace_may_access() with exec_update_lock (FD links))
+  		 struct iattr *attr)
+  {
+  	int error;
+* Unmerged path fs/proc/base.c
+diff --git a/fs/proc/fd.c b/fs/proc/fd.c
+index 6eddfce732e4..9c468d6a5379 100644
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -156,24 +156,19 @@ static const struct dentry_operations tid_fd_dentry_operations = {
+ 	.d_delete	= pid_delete_dentry,
+ };
+ 
+-static int proc_fd_link(struct dentry *dentry, struct path *path)
++static int proc_fd_link(struct dentry *dentry, struct path *path,
++			struct task_struct *task)
+ {
+-	struct task_struct *task;
+ 	int ret = -ENOENT;
+-
+-	task = get_proc_task(d_inode(dentry));
+-	if (task) {
+-		unsigned int fd = proc_fd(d_inode(dentry));
+-		struct file *fd_file;
+-
+-		fd_file = fget_task(task, fd);
+-		if (fd_file) {
+-			*path = fd_file->f_path;
+-			path_get(&fd_file->f_path);
+-			ret = 0;
+-			fput(fd_file);
+-		}
+-		put_task_struct(task);
++	unsigned int fd = proc_fd(d_inode(dentry));
++	struct file *fd_file;
++
++	fd_file = fget_task(task, fd);
++	if (fd_file) {
++		*path = fd_file->f_path;
++		path_get(&fd_file->f_path);
++		ret = 0;
++		fput(fd_file);
+ 	}
+ 
+ 	return ret;
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+index e85c531ec161..2dbb37cd58f9 100644
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -102,7 +102,7 @@ extern struct kmem_cache *proc_dir_entry_cache;
+ void pde_free(struct proc_dir_entry *pde);
+ 
+ union proc_op {
+-	int (*proc_get_link)(struct dentry *, struct path *);
++	int (*proc_get_link)(struct dentry *, struct path *, struct task_struct *);
+ 	int (*proc_show)(struct seq_file *m,
+ 		struct pid_namespace *ns, struct pid *pid,
+ 		struct task_struct *task);
