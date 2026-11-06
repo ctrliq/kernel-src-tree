@@ -1,0 +1,158 @@
+dcache.c: more idiomatic "positives are not allowed" sanity checks
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.4.1.el9_9
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 5408c22b816f7012cc5ba80469389a088ab13663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.4.1.el9_9/5408c22b.failed
+
+Several functions have BUG_ON/WARN_ON sanity checks that want to verify
+that dentry is not positive and instead of looking at ->d_inode (as we
+do in all other places that check that) they look at ->d_alias.
+Just use the normal helpers instead - that way we no longer even look
+at ->d_alias for negative dentries
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5408c22b816f7012cc5ba80469389a088ab13663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index e7916b6186f0,616a445ec720..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -374,11 -428,11 +374,15 @@@ static inline void __d_clear_type_and_i
+  
+  static void dentry_free(struct dentry *dentry)
+  {
+++<<<<<<< HEAD
+ +	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
+++=======
++ 	WARN_ON(d_really_is_positive(dentry));
+++>>>>>>> 5408c22b816f (dcache.c: more idiomatic "positives are not allowed" sanity checks)
+  	if (unlikely(dname_external(dentry))) {
+  		struct external_name *p = external_name(dentry);
+ -		if (likely(atomic_dec_and_test(&p->count))) {
+ -			call_rcu(&dentry->d_rcu, __d_free_external);
+ +		if (likely(atomic_dec_and_test(&p->u.count))) {
+ +			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
+  			return;
+  		}
+  	}
+@@@ -1889,7 -2004,7 +1893,11 @@@ static void __d_instantiate(struct dent
+   
+  void d_instantiate(struct dentry *entry, struct inode * inode)
+  {
+++<<<<<<< HEAD
+ +	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+++=======
++ 	BUG_ON(d_really_is_positive(entry));
+++>>>>>>> 5408c22b816f (dcache.c: more idiomatic "positives are not allowed" sanity checks)
+  	if (inode) {
+  		security_d_instantiate(entry, inode);
+  		spin_lock(&inode->i_lock);
+@@@ -1907,7 -2024,7 +1915,11 @@@ EXPORT_SYMBOL(d_instantiate)
+   */
+  void d_instantiate_new(struct dentry *entry, struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+++=======
++ 	BUG_ON(d_really_is_positive(entry));
+++>>>>>>> 5408c22b816f (dcache.c: more idiomatic "positives are not allowed" sanity checks)
+  	BUG_ON(!inode);
+  	lockdep_annotate_inode_mutex_key(inode);
+  	security_d_instantiate(entry, inode);
+@@@ -2658,6 -2793,24 +2670,27 @@@ void d_add(struct dentry *entry, struc
+  }
+  EXPORT_SYMBOL(d_add);
+  
+++<<<<<<< HEAD
+++=======
++ struct dentry *d_make_persistent(struct dentry *dentry, struct inode *inode)
++ {
++ 	WARN_ON(d_really_is_positive(dentry));
++ 	WARN_ON(!inode);
++ 	security_d_instantiate(dentry, inode);
++ 	spin_lock(&inode->i_lock);
++ 	spin_lock(&dentry->d_lock);
++ 	__d_instantiate(dentry, inode);
++ 	dentry->d_flags |= DCACHE_PERSISTENT;
++ 	dget_dlock(dentry);
++ 	if (d_unhashed(dentry))
++ 		__d_rehash(dentry);
++ 	spin_unlock(&dentry->d_lock);
++ 	spin_unlock(&inode->i_lock);
++ 	return dentry;
++ }
++ EXPORT_SYMBOL(d_make_persistent);
++ 
+++>>>>>>> 5408c22b816f (dcache.c: more idiomatic "positives are not allowed" sanity checks)
+  static void swap_names(struct dentry *dentry, struct dentry *target)
+  {
+  	if (unlikely(dname_external(target))) {
+@@@ -3024,50 -3180,21 +3057,56 @@@ bool is_subdir(struct dentry *new_dentr
+  }
+  EXPORT_SYMBOL(is_subdir);
+  
+ -void d_mark_tmpfile(struct file *file, struct inode *inode)
+ +static enum d_walk_ret d_genocide_kill(void *data, struct dentry *dentry)
+ +{
+ +	struct dentry *root = data;
+ +	if (dentry != root) {
+ +		if (d_unhashed(dentry) || !dentry->d_inode)
+ +			return D_WALK_SKIP;
+ +
+ +		if (!(dentry->d_flags & DCACHE_GENOCIDE)) {
+ +			dentry->d_flags |= DCACHE_GENOCIDE;
+ +			dentry->d_lockref.count--;
+ +		}
+ +	}
+ +	return D_WALK_CONTINUE;
+ +}
+ +
+ +void d_genocide(struct dentry *parent)
+ +{
+ +	d_walk(parent, parent, d_genocide_kill);
+ +}
+ +
+ +EXPORT_SYMBOL(d_genocide);
+ +
+ +int d_mark_tmpfile_name(struct file *file, const struct qstr *name)
+  {
+  	struct dentry *dentry = file->f_path.dentry;
+ +	char *dname = dentry->d_iname;
+ +
+ +	if (unlikely(dname_external(dentry) ||
+ +		     d_really_is_positive(dentry) ||
+ +		     !d_unlinked(dentry)))
+ +		return -EINVAL;
+ +	if (unlikely(name->len > DNAME_INLINE_LEN - 1))
+ +		return -ENAMETOOLONG;
+  
+++<<<<<<< HEAD
+++=======
++ 	BUG_ON(dname_external(dentry) ||
++ 		d_really_is_positive(dentry) ||
++ 		!d_unlinked(dentry));
+++>>>>>>> 5408c22b816f (dcache.c: more idiomatic "positives are not allowed" sanity checks)
+  	spin_lock(&dentry->d_parent->d_lock);
+  	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ -	dentry->__d_name.len = sprintf(dentry->d_shortname.string, "#%llu",
+ -				(unsigned long long)inode->i_ino);
+ +	dentry->d_name.len = name->len;
+ +	memcpy(dname, name->name, name->len);
+ +	dname[name->len] = '\0';
+  	spin_unlock(&dentry->d_lock);
+  	spin_unlock(&dentry->d_parent->d_lock);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(d_mark_tmpfile);
+ +EXPORT_SYMBOL(d_mark_tmpfile_name);
+  
+  void d_tmpfile(struct file *file, struct inode *inode)
+  {
+* Unmerged path fs/dcache.c
