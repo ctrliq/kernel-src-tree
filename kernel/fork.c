@@ -680,6 +680,7 @@ void __mmdrop(struct mm_struct *mm)
 	cleanup_lazy_tlbs(mm);
 
 	WARN_ON_ONCE(mm == current->active_mm);
+	mm_destroy_sched(mm);
 	mm_free_pgd(mm);
 	mm_free_id(mm);
 	destroy_context(mm);
@@ -1083,6 +1084,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (mm_alloc_cid(mm, p))
 		goto fail_cid;
 
+	if (mm_alloc_sched(mm))
+		goto fail_sched;
+
 	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
 				     NR_MM_COUNTERS))
 		goto fail_pcpu;
@@ -1092,6 +1096,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	return mm;
 
 fail_pcpu:
+	mm_destroy_sched(mm);
+fail_sched:
 	mm_destroy_cid(mm);
 fail_cid:
 	destroy_context(mm);
@@ -1532,6 +1538,7 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 	tsk->mm = mm;
 	tsk->active_mm = mm;
 	sched_mm_cid_fork(tsk);
+	sched_cache_fork(tsk);
 	return 0;
 }
 
@@ -2445,6 +2452,7 @@ bad_fork_cleanup_io:
 bad_fork_cleanup_namespaces:
 	exit_task_namespaces(p);
 bad_fork_cleanup_mm:
+	sched_cache_fork_cleanup(p);
 	if (p->mm) {
 		mm_clear_owner(p->mm, p);
 		mmput(p->mm);

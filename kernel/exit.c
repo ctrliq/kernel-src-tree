@@ -555,6 +555,9 @@ static void exit_mm(void)
 	exit_mm_release(current, mm);
 	if (!mm)
 		return;
+
+	sched_cache_exit_mm(current);
+
 	mmap_read_lock(mm);
 	mmgrab_lazy_tlb(mm);
 	BUG_ON(mm != current->active_mm);

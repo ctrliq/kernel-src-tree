@@ -1030,6 +1030,9 @@ struct mm_struct {
 		 */
 		raw_spinlock_t cpus_allowed_lock;
 #endif
+
+		/* sched_cache related statistics */
+		struct sched_cache_group *sched_cache_grp;
 #ifdef CONFIG_MMU
 		atomic_long_t pgtables_bytes;	/* size of all page tables */
 #endif
@@ -1481,6 +1484,31 @@ static inline unsigned int mm_cid_size(void)
 }
 static inline void mm_set_cpus_allowed(struct mm_struct *mm, const struct cpumask *cpumask) { }
 #endif /* CONFIG_SCHED_MM_CID */
+
+#ifdef CONFIG_SCHED_CACHE
+int mm_init_sched(struct mm_struct *mm,
+		  struct sched_cache_time __percpu *pcpu_sched);
+void mm_destroy_sched(struct mm_struct *mm);
+
+static inline int mm_alloc_sched_noprof(struct mm_struct *mm)
+{
+	struct sched_cache_time __percpu *pcpu_sched =
+		alloc_percpu_noprof(struct sched_cache_time);
+
+	if (!pcpu_sched)
+		return -ENOMEM;
+
+	return mm_init_sched(mm, pcpu_sched);
+}
+
+#define mm_alloc_sched(...)	alloc_hooks(mm_alloc_sched_noprof(__VA_ARGS__))
+
+#else /* !CONFIG_SCHED_CACHE */
+
+static inline int mm_alloc_sched(struct mm_struct *mm) { return 0; }
+static inline void mm_destroy_sched(struct mm_struct *mm) { }
+
+#endif /* CONFIG_SCHED_CACHE */
 
 struct mmu_gather;
 extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);

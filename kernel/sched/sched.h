@@ -1182,6 +1182,12 @@ struct rq {
 	struct scx_rq		scx;
 	struct sched_dl_entity	ext_server;
 #endif
+#ifdef CONFIG_SCHED_CACHE
+	raw_spinlock_t		cpu_epoch_lock ____cacheline_aligned;
+	u64			cpu_runtime;
+	unsigned long		cpu_epoch;
+	unsigned long		cpu_epoch_next;
+#endif
 
 	struct sched_dl_entity	fair_server;
 
@@ -1194,6 +1200,12 @@ struct rq {
 #ifdef CONFIG_NUMA_BALANCING
 	unsigned int		numa_migrate_on;
 #endif
+
+#ifdef CONFIG_SCHED_CACHE
+	unsigned int		nr_pref_llc_running;
+	unsigned int		nr_llc_running;
+#endif
+
 	/*
 	 * This is part of a global counter where only the total sum
 	 * over all CPUs matters. A task can increase this counter on
@@ -1535,6 +1547,14 @@ extern void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags);
 extern void sched_core_get(void);
 extern void sched_core_put(void);
 
+static inline bool task_has_sched_core(struct task_struct *p)
+{
+	if (sched_core_disabled())
+		return false;
+
+	return !!p->core_cookie;
+}
+
 #else /* !CONFIG_SCHED_CORE: */
 
 static inline bool sched_core_enabled(struct rq *rq)
@@ -1572,6 +1592,11 @@ static inline bool sched_group_cookie_match(struct rq *rq,
 					    struct sched_group *group)
 {
 	return true;
+}
+
+static inline bool task_has_sched_core(struct task_struct *p)
+{
+	return false;
 }
 
 #endif /* !CONFIG_SCHED_CORE */
@@ -2040,6 +2065,8 @@ init_numa_balancing(u64 clone_flags, struct task_struct *p)
 }
 
 #endif /* !CONFIG_NUMA_BALANCING */
+
+int task_llc(const struct task_struct *p);
 
 static inline void
 queue_balance_callback(struct rq *rq,
@@ -2829,7 +2856,7 @@ static inline void idle_set_state(struct rq *rq,
 
 static inline struct cpuidle_state *idle_get_state(struct rq *rq)
 {
-	WARN_ON_ONCE(!rcu_read_lock_held());
+	lockdep_assert(rcu_read_lock_any_held());
 
 	return rq->idle_state;
 }
@@ -3999,6 +4026,29 @@ static inline void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct
 static inline void task_tick_mm_cid(struct rq *rq, struct task_struct *curr) { }
 static inline void init_sched_mm_cid(struct task_struct *t) { }
 #endif /* !CONFIG_SCHED_MM_CID */
+
+#ifdef CONFIG_SCHED_CACHE
+DECLARE_STATIC_KEY_FALSE(sched_cache_present);
+DECLARE_STATIC_KEY_FALSE(sched_cache_active);
+extern int sysctl_sched_cache_user;
+extern unsigned int llc_aggr_tolerance;
+extern unsigned int llc_epoch_period;
+extern unsigned int llc_epoch_affinity_timeout;
+extern unsigned int llc_imb_pct;
+extern unsigned int llc_overaggr_pct;
+
+static inline bool sched_cache_enabled(void)
+{
+	return static_branch_unlikely(&sched_cache_active);
+}
+
+extern void sched_cache_active_set(void);
+
+#endif
+
+void sched_domains_free_llc_id(int cpu);
+
+extern void init_sched_mm(struct task_struct *p);
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
