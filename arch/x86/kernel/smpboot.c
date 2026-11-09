@@ -379,6 +379,7 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 
 		if (c->topo.pkg_id == o->topo.pkg_id &&
 		    c->topo.die_id == o->topo.die_id &&
+		    c->topo.amd_node_id == o->topo.amd_node_id &&
 		    per_cpu_llc_id(cpu1) == per_cpu_llc_id(cpu2)) {
 			if (c->topo.core_id == o->topo.core_id)
 				return topology_sane(c, o, "smt");
@@ -400,10 +401,13 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 
 static bool match_die(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 {
-	if (c->topo.pkg_id == o->topo.pkg_id &&
-	    c->topo.die_id == o->topo.die_id)
-		return true;
-	return false;
+	if (c->topo.pkg_id != o->topo.pkg_id || c->topo.die_id != o->topo.die_id)
+		return false;
+
+	if (cpu_feature_enabled(X86_FEATURE_TOPOEXT) && topology_amd_nodes_per_pkg() > 1)
+		return c->topo.amd_node_id == o->topo.amd_node_id;
+
+	return true;
 }
 
 static bool match_l2c(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
@@ -454,6 +458,21 @@ static const struct x86_cpu_id intel_cod_cpu[] = {
 	{}
 };
 
+/*
+ * Allows splitting the LLC by matching 'core_id % split_llc'.
+ *
+ * This is mostly a debug hack to emulate systems with multiple LLCs per node
+ * on systems that do not naturally have this.
+ */
+static unsigned int split_llc = 0;
+
+static int __init split_llc_setup(char *str)
+{
+	get_option(&str, &split_llc);
+	return 0;
+}
+early_param("split_llc", split_llc_setup);
+
 static bool match_llc(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 {
 	const struct x86_cpu_id *id = x86_match_cpu(intel_cod_cpu);
@@ -466,6 +485,11 @@ static bool match_llc(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 
 	/* Do not match if LLC id does not match: */
 	if (per_cpu_llc_id(cpu1) != per_cpu_llc_id(cpu2))
+		return false;
+
+	if (split_llc &&
+	    (per_cpu_core_id(cpu1) % split_llc) !=
+	    (per_cpu_core_id(cpu2) % split_llc))
 		return false;
 
 	/*

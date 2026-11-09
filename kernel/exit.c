@@ -522,6 +522,9 @@ static void exit_mm(void)
 	if (!mm)
 		return;
 	sync_mm_rss(mm);
+
+	sched_cache_exit_mm(current);
+
 	mmap_read_lock(mm);
 	mmgrab_lazy_tlb(mm);
 	BUG_ON(mm != current->active_mm);

@@ -1060,6 +1060,12 @@ struct rq {
 	unsigned int		nr_preferred_running;
 	unsigned int		numa_migrate_on;
 #endif
+
+#ifdef CONFIG_SCHED_CACHE
+	unsigned int            nr_pref_llc_running;
+	unsigned int            nr_llc_running;
+#endif
+
 #ifdef CONFIG_NO_HZ_COMMON
 #ifdef CONFIG_SMP
 	unsigned long		last_blocked_load_update_tick;
@@ -1182,6 +1188,12 @@ struct rq {
 #endif
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	u64			prev_steal_time_rq;
+#endif
+#ifdef CONFIG_SCHED_CACHE
+	raw_spinlock_t		cpu_epoch_lock ____cacheline_aligned;
+	u64			cpu_runtime;
+	unsigned long		cpu_epoch;
+	unsigned long		cpu_epoch_next;
 #endif
 
 	/* calc_load related fields */
@@ -1419,6 +1431,14 @@ extern void sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags);
 extern void sched_core_get(void);
 extern void sched_core_put(void);
 
+static inline bool task_has_sched_core(struct task_struct *p)
+{
+	if (sched_core_disabled())
+		return false;
+
+	return !!p->core_cookie;
+}
+
 #else /* !CONFIG_SCHED_CORE: */
 
 static inline bool sched_core_enabled(struct rq *rq)
@@ -1456,6 +1476,11 @@ static inline bool sched_group_cookie_match(struct rq *rq,
 					    struct sched_group *group)
 {
 	return true;
+}
+
+static inline bool task_has_sched_core(struct task_struct *p)
+{
+	return false;
 }
 
 #endif /* !CONFIG_SCHED_CORE */
@@ -1879,6 +1904,8 @@ init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 
 #endif /* !CONFIG_NUMA_BALANCING */
 
+int task_llc(const struct task_struct *p);
+
 #ifdef CONFIG_SMP
 
 static inline void
@@ -1901,8 +1928,8 @@ queue_balance_callback(struct rq *rq,
 	rq->balance_callback = head;
 }
 
-#define rcu_dereference_check_sched_domain(p) \
-	rcu_dereference_check((p), lockdep_is_held(&sched_domains_mutex))
+#define rcu_dereference_sched_domain(p) \
+	rcu_dereference_all_check((p), lockdep_is_held(&sched_domains_mutex))
 
 /*
  * The domain tree (rq->sd) is protected by RCU's quiescent state transition.
@@ -1912,7 +1939,7 @@ queue_balance_callback(struct rq *rq,
  * preempt-disabled sections.
  */
 #define for_each_domain(cpu, __sd) \
-	for (__sd = rcu_dereference_check_sched_domain(cpu_rq(cpu)->sd); \
+	for (__sd = rcu_dereference_sched_domain(cpu_rq(cpu)->sd); \
 			__sd; __sd = __sd->parent)
 
 /* A mask of all the SD flags that have the SDF_SHARED_CHILD metaflag */
@@ -3426,6 +3453,29 @@ extern int preempt_dynamic_mode;
 extern int sched_dynamic_mode(const char *str);
 extern void sched_dynamic_update(int mode);
 #endif
+
+#ifdef CONFIG_SCHED_CACHE
+DECLARE_STATIC_KEY_FALSE(sched_cache_present);
+DECLARE_STATIC_KEY_FALSE(sched_cache_active);
+extern int sysctl_sched_cache_user;
+extern unsigned int llc_aggr_tolerance;
+extern unsigned int llc_epoch_period;
+extern unsigned int llc_epoch_affinity_timeout;
+extern unsigned int llc_imb_pct;
+extern unsigned int llc_overaggr_pct;
+
+static inline bool sched_cache_enabled(void)
+{
+	return static_branch_unlikely(&sched_cache_active);
+}
+
+extern void sched_cache_active_set(void);
+
+#endif
+
+void sched_domains_free_llc_id(int cpu);
+
+extern void init_sched_mm(struct task_struct *p);
 
 #ifdef CONFIG_SMP
 static inline

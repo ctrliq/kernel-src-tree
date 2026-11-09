@@ -133,6 +133,13 @@ static inline int cpu_to_coregroup_id(int cpu)
 
 struct cpumask *cpu_coregroup_mask(int cpu);
 
+/*
+ * Points to where the LLC is. On power9 this will point at CACHE
+ * domain, On others it will point to SMT domain. In all cases
+ * cpu_l2_cache_mask points to where LLC is
+ */
+#define arch_llc_mask(cpu)     cpu_l2_cache_mask(cpu)
+
 #ifdef CONFIG_PPC64
 #include <asm/smp.h>
 

@@ -17,6 +17,7 @@
 #include <linux/rcupdate.h>
 #include <linux/page-flags-layout.h>
 #include <linux/workqueue.h>
+#include <linux/sched.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
 #include <linux/futex_types.h>
@@ -822,6 +823,8 @@ struct mm_struct {
 		 */
 		atomic_t mm_count;
 
+		/* sched_cache related statistics */
+		struct sched_cache_group *sched_cache_grp;
 #ifdef CONFIG_MMU
 		atomic_long_t pgtables_bytes;	/* size of all page tables */
 #endif
@@ -1114,6 +1117,31 @@ static inline void vma_iter_init(struct vma_iterator *vmi,
 {
 	mas_init(&vmi->mas, &mm->mm_mt, addr);
 }
+
+#ifdef CONFIG_SCHED_CACHE
+int mm_init_sched(struct mm_struct *mm,
+		  struct sched_cache_time __percpu *pcpu_sched);
+void mm_destroy_sched(struct mm_struct *mm);
+
+static inline int mm_alloc_sched_noprof(struct mm_struct *mm)
+{
+	struct sched_cache_time __percpu *pcpu_sched =
+		alloc_percpu(struct sched_cache_time);
+
+	if (!pcpu_sched)
+		return -ENOMEM;
+
+	return mm_init_sched(mm, pcpu_sched);
+}
+
+#define mm_alloc_sched(...)	mm_alloc_sched_noprof(__VA_ARGS__)
+
+#else /* !CONFIG_SCHED_CACHE */
+
+static inline int mm_alloc_sched(struct mm_struct *mm) { return 0; }
+static inline void mm_destroy_sched(struct mm_struct *mm) { }
+
+#endif /* CONFIG_SCHED_CACHE */
 
 struct mmu_gather;
 extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);
