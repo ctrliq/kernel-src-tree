@@ -19,7 +19,6 @@
 #ifndef __RH_MESSAGES_H
 #define __RH_MESSAGES_H
 
-#include <linux/version.h>
 #include <linux/pci.h>
 
 #define DEV_DESC_LEN 256
@@ -47,10 +46,16 @@
 			     "module and not supported directly by Red Hat.\n"
 
 static const char *rh_deprecated_drivers[] = {
+	"dm_era",
+	"dm_switch",
+	"smc91x",
 	0     /* Terminating entry */
 };
 
 static const char *rh_deprecated_init_fns[] = {
+	"dm_era_init",
+	"dm_switch_init",
+	"smc_driver_init",
 	0     /* Terminating entry */
 };
 
