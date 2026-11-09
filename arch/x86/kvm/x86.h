@@ -113,6 +113,24 @@ static inline void kvm_leave_nested(struct kvm_vcpu *vcpu)
 	kvm_x86_ops.nested_ops->leave_nested(vcpu);
 }
 
+/*
+ * If IBRS is advertised to the vCPU, KVM must flush the indirect branch
+ * predictors when transitioning from L2 to L1, as L1 expects hardware (KVM in
+ * this case) to provide separate predictor modes.  Bare metal isolates the host
+ * from the guest, but doesn't isolate different guests from one another (in
+ * this case L1 and L2). The exception is if bare metal supports same mode IBRS,
+ * which offers protection within the same mode, and hence protects L1 from L2.
+ */
+static inline void kvm_nested_vmexit_handle_ibrs(struct kvm_vcpu *vcpu)
+{
+	if (cpu_feature_enabled(X86_FEATURE_AMD_IBRS_SAME_MODE))
+		return;
+
+	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SPEC_CTRL) ||
+	    guest_cpu_cap_has(vcpu, X86_FEATURE_AMD_IBRS))
+		indirect_branch_prediction_barrier();
+}
+
 static inline bool kvm_vcpu_has_run(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.last_vmentry_cpu != -1;
@@ -366,6 +384,7 @@ void kvm_inject_realmode_interrupt(struct kvm_vcpu *vcpu, int irq, int inc_eip);
 u64 get_kvmclock_ns(struct kvm *kvm);
 uint64_t kvm_get_wall_clock_epoch(struct kvm *kvm);
 bool kvm_get_monotonic_and_clockread(s64 *kernel_ns, u64 *tsc_timestamp);
+int kvm_guest_time_update(struct kvm_vcpu *v);
 
 int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
 	gva_t addr, void *val, unsigned int bytes,
@@ -388,7 +407,8 @@ int x86_decode_emulated_instruction(struct kvm_vcpu *vcpu, int emulation_type,
 				    void *insn, int insn_len);
 int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 			    int emulation_type, void *insn, int insn_len);
-fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu);
+fastpath_t handle_fastpath_wrmsr(struct kvm_vcpu *vcpu);
+fastpath_t handle_fastpath_wrmsr_imm(struct kvm_vcpu *vcpu, u32 msr, int reg);
 fastpath_t handle_fastpath_hlt(struct kvm_vcpu *vcpu);
 
 extern struct kvm_caps kvm_caps;
@@ -554,7 +574,6 @@ static inline void kvm_machine_check(void)
 void kvm_load_guest_xsave_state(struct kvm_vcpu *vcpu);
 void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu);
 int kvm_spec_ctrl_test_value(u64 value);
-bool __kvm_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4);
 int kvm_handle_memory_failure(struct kvm_vcpu *vcpu, int r,
 			      struct x86_exception *e);
 int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva);
@@ -567,6 +586,11 @@ bool kvm_msr_allowed(struct kvm_vcpu *vcpu, u32 index, u32 type);
  */
 #define  KVM_MSR_RET_INVALID	2	/* in-kernel MSR emulation #GP condition */
 #define  KVM_MSR_RET_FILTERED	3	/* #GP due to userspace MSR filter */
+
+static inline bool __kvm_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	return !(cr4 & vcpu->arch.cr4_guest_rsvd_bits);
+}
 
 #define __cr4_reserved_bits(__cpu_has, __c)             \
 ({                                                      \

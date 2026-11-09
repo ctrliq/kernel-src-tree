@@ -1750,15 +1750,18 @@ emulate them efficiently. The fields in each entry are defined as follows:
          the values returned by the cpuid instruction for
          this function/index combination
 
-The TSC deadline timer feature (CPUID leaf 1, ecx[24]) is always returned
-as false, since the feature depends on KVM_CREATE_IRQCHIP for local APIC
-support.  Instead it is reported via::
+x2APIC (CPUID leaf 1, ecx[21) and TSC deadline timer (CPUID leaf 1, ecx[24])
+may be returned as true, but they depend on KVM_CREATE_IRQCHIP for in-kernel
+emulation of the local APIC.  TSC deadline timer support is also reported via::
 
   ioctl(KVM_CHECK_EXTENSION, KVM_CAP_TSC_DEADLINE_TIMER)
 
 if that returns true and you use KVM_CREATE_IRQCHIP, or if you emulate the
 feature in userspace, then you can enable the feature for KVM_SET_CPUID2.
 
+Enabling x2APIC in KVM_SET_CPUID2 requires KVM_CREATE_IRQCHIP as KVM doesn't
+support forwarding x2APIC MSR accesses to userspace, i.e. KVM does not support
+emulating x2APIC in userspace.
 
 4.47 KVM_PPC_GET_PVINFO
 -----------------------
@@ -6285,9 +6288,9 @@ More architecture-specific flags detailing state of the VCPU that may
 affect the device's behavior. Current defined flags::
 
   /* x86, set if the VCPU is in system management mode */
-  #define KVM_RUN_X86_SMM     (1 << 0)
+  #define KVM_RUN_X86_SMM          (1 << 0)
   /* x86, set if bus lock detected in VM */
-  #define KVM_RUN_BUS_LOCK    (1 << 1)
+  #define KVM_RUN_X86_BUS_LOCK     (1 << 1)
   /* arm64, set for KVM_EXIT_DEBUG */
   #define KVM_DEBUG_ARCH_HSR_HIGH_VALID  (1 << 0)
 
@@ -7683,29 +7686,36 @@ Valid bits in args[0] are::
   #define KVM_BUS_LOCK_DETECTION_OFF      (1 << 0)
   #define KVM_BUS_LOCK_DETECTION_EXIT     (1 << 1)
 
-Enabling this capability on a VM provides userspace with a way to select
-a policy to handle the bus locks detected in guest. Userspace can obtain
-the supported modes from the result of KVM_CHECK_EXTENSION and define it
-through the KVM_ENABLE_CAP.
+Enabling this capability on a VM provides userspace with a way to select a
+policy to handle the bus locks detected in guest. Userspace can obtain the
+supported modes from the result of KVM_CHECK_EXTENSION and define it through
+the KVM_ENABLE_CAP. The supported modes are mutually-exclusive.
 
-KVM_BUS_LOCK_DETECTION_OFF and KVM_BUS_LOCK_DETECTION_EXIT are supported
-currently and mutually exclusive with each other. More bits can be added in
-the future.
+This capability allows userspace to force VM exits on bus locks detected in the
+guest, irrespective whether or not the host has enabled split-lock detection
+(which triggers an #AC exception that KVM intercepts). This capability is
+intended to mitigate attacks where a malicious/buggy guest can exploit bus
+locks to degrade the performance of the whole system.
 
-With KVM_BUS_LOCK_DETECTION_OFF set, bus locks in guest will not cause vm exits
-so that no additional actions are needed. This is the default mode.
+If KVM_BUS_LOCK_DETECTION_OFF is set, KVM doesn't force guest bus locks to VM
+exit, although the host kernel's split-lock #AC detection still applies, if
+enabled.
 
-With KVM_BUS_LOCK_DETECTION_EXIT set, vm exits happen when bus lock detected
-in VM. KVM just exits to userspace when handling them. Userspace can enforce
-its own throttling or other policy based mitigations.
+If KVM_BUS_LOCK_DETECTION_EXIT is set, KVM enables a CPU feature that ensures
+bus locks in the guest trigger a VM exit, and KVM exits to userspace for all
+such VM exits, e.g. to allow userspace to throttle the offending guest and/or
+apply some other policy-based mitigation. When exiting to userspace, KVM sets
+KVM_RUN_X86_BUS_LOCK in vcpu-run->flags, and conditionally sets the exit_reason
+to KVM_EXIT_X86_BUS_LOCK.
 
-This capability is aimed to address the thread that VM can exploit bus locks to
-degree the performance of the whole system. Once the userspace enable this
-capability and select the KVM_BUS_LOCK_DETECTION_EXIT mode, KVM will set the
-KVM_RUN_BUS_LOCK flag in vcpu-run->flags field and exit to userspace. Concerning
-the bus lock vm exit can be preempted by a higher priority VM exit, the exit
-notifications to userspace can be KVM_EXIT_BUS_LOCK or other reasons.
-KVM_RUN_BUS_LOCK flag is used to distinguish between them.
+Due to differences in the underlying hardware implementation, the vCPU's RIP at
+the time of exit diverges between Intel and AMD.  On Intel hosts, RIP points at
+the next instruction, i.e. the exit is trap-like.  On AMD hosts, RIP points at
+the offending instruction, i.e. the exit is fault-like.
+
+Note! Detected bus locks may be coincident with other exits to userspace, i.e.
+KVM_RUN_X86_BUS_LOCK should be checked regardless of the primary exit reason if
+userspace wants to take action on all detected bus locks.
 
 7.23 KVM_CAP_PPC_DAWR1
 ----------------------
@@ -8843,9 +8853,10 @@ the local APIC.
 
 The same is true for the ``KVM_FEATURE_PV_UNHALT`` paravirtualized feature.
 
-CPU[EAX=1]:ECX[24] (TSC_DEADLINE) is not reported by ``KVM_GET_SUPPORTED_CPUID``.
-It can be enabled if ``KVM_CAP_TSC_DEADLINE_TIMER`` is present and the kernel
-has enabled in-kernel emulation of the local APIC.
+On older versions of Linux, CPU[EAX=1]:ECX[24] (TSC_DEADLINE) is not reported by
+``KVM_GET_SUPPORTED_CPUID``, but it can be enabled if ``KVM_CAP_TSC_DEADLINE_TIMER``
+is present and the kernel has enabled in-kernel emulation of the local APIC.
+On newer versions, ``KVM_GET_SUPPORTED_CPUID`` does report the bit as available.
 
 CPU topology
 ~~~~~~~~~~~~
