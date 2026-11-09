@@ -3546,7 +3546,78 @@ find Documentation -type d | xargs chmod u+w
   %{__os_install_post}\
   %{__remove_unwanted_dbginfo_install_post}\
   %{__restore_unstripped_root_post}\
-  %{__modsign_install_post}
+  %{__modsign_install_post}\
+  %{__kmod_depcache_install_post}
+
+#
+# Avoid forking the ksym/modalias provides generators once per module
+# during file classification, which takes minutes with thousands of
+# modules. The stock kernel-rpm-macros scripts are run in parallel after
+# modules are signed and compressed, their output is cached per module,
+# and the generators are replaced by Lua macros that only read the cache.
+#
+%global kmod_depcache %{_builddir}/kmod-depcache
+
+# kernel-rpm-macros defines the ksym and modalias provides generators in its
+# attr files. The macros below replace them, so capture the stock definitions
+# first. The cache step fails the build if they are not the ones this was
+# validated with: a kernel-rpm-macros update that moves the scripts, adds
+# arguments, sets a protocol or drops the generators must be reviewed here,
+# rather than silently caching for a generator rpm no longer calls.
+%global kmod_depcache_ksyms_prov /usr/lib/rpm/redhat/find-provides.ksyms
+%global kmod_depcache_modalias_prov /usr/lib/rpm/redhat/find-provides.d/modalias.prov
+%global kmod_depcache_stock_ksyms %{?__provided_ksyms_provides}
+%global kmod_depcache_stock_modalias %{?__modalias_provides}
+
+# %1 = module path as rpm passes it (buildroot included), %2 = cache suffix,
+# %3 = generator script. The cache is keyed by that full path, so no
+# buildroot stripping is needed on either side.
+# A Lua error() would only be logged and the provides silently dropped, and
+# os.exit() is not permitted here, so on a cache miss warn and run the
+# generator for this module like rpm would.
+%define __kmod_depcache_lookup() %{lua:
+  local path = rpm.expand("%1")
+  local f = io.open(rpm.expand("%{kmod_depcache}") .. path .. "." .. rpm.expand("%2"))
+  if not f then
+    io.stderr:write("warning: no " .. rpm.expand("%2") .. " cache for " .. path .. "\\n")
+    f = io.popen("echo '" .. path .. "' | RPM_BUILD_ROOT='" ..
+                 rpm.expand("%{buildroot}") .. "' " .. rpm.expand("%3"))
+  end
+  print(f:read("a"))
+  f:close()
+}
+
+%define __provided_ksyms_provides() %{__kmod_depcache_lookup %1 ksyms %{kmod_depcache_ksyms_prov}}
+%define __modalias_provides() %{__kmod_depcache_lookup %1 modalias %{kmod_depcache_modalias_prov}}
+
+# Fill the cache read by __kmod_depcache_lookup. This runs as the last step
+# of __spec_install_post, after __modsign_install_post has signed and
+# compressed the modules, so the file names and contents are final. Every
+# .ko* file in the buildroot is fed to the stock find-provides.ksyms and
+# modalias.prov scripts, one module per invocation and RPM_BUILD_NCPUS at a
+# time, and each script's output is stored as <cache>/<full module path>.ksyms
+# and .modalias. The scripts need RPM_BUILD_ROOT, which %%install exports, to
+# tell in-tree modules (kernel() provides) from the rest (ksym() provides).
+# A failed mkdir or generator aborts the build. The %% in ${1%%/*} is rpm's
+# escape for a single %, so the shell sees ${1%/*}, the module's directory.
+%define __kmod_depcache_install_post \
+  if [ "%{?kmod_depcache_stock_ksyms}" != "%{kmod_depcache_ksyms_prov}" ] || \
+     [ "%{?kmod_depcache_stock_modalias}" != "%{kmod_depcache_modalias_prov}" ] || \
+     [ -n "%{?__provided_ksyms_protocol}%{?__modalias_protocol}" ]; then \
+    echo "error: kernel-rpm-macros provides generators differ from what the kmod depcache expects:" >&2 \
+    echo "  __provided_ksyms_provides='%{?kmod_depcache_stock_ksyms}' protocol='%{?__provided_ksyms_protocol}'" >&2 \
+    echo "  __modalias_provides='%{?kmod_depcache_stock_modalias}' protocol='%{?__modalias_protocol}'" >&2 \
+    exit 1 \
+  fi \
+  %{log_msg "Generating kernel module provides cache ..."} \
+  rm -rf %{kmod_depcache} \
+  find $RPM_BUILD_ROOT ! -type d -regextype posix-extended -regex '.*[.]ko([.](gz|bz2|xz|zst))?' -print0 | \
+  xargs -0 -r -n 1 -P${RPM_BUILD_NCPUS} sh -c ' \
+    mkdir -p "%{kmod_depcache}${1%%/*}" || exit 1 \
+    echo "$1" | %{kmod_depcache_ksyms_prov} > "%{kmod_depcache}$1.ksyms" || exit 1 \
+    echo "$1" | %{kmod_depcache_modalias_prov} > "%{kmod_depcache}$1.modalias" \
+  ' _ || exit 1 \
+%{nil}
 
 ###
 ### install
