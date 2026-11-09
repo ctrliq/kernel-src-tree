@@ -62,6 +62,15 @@ Note: permanent parameters such as ``enable_sriov`` and ``total_vfs`` require FW
    echo 1 >/sys/bus/pci/rescan
    grep ^ /sys/bus/pci/devices/0000:01:00.0/sriov_*
 
+   * - ``num_doorbells``
+     - driverinit
+     - This controls the number of channel doorbells used by the netdev. In all
+       cases, an additional doorbell is allocated and used for non-channel
+       communication (e.g. for PTP, HWS, etc.). Supported values are:
+
+       - 0: No channel-specific doorbells, use the global one for everything.
+       - [1, max_num_channels]: Spread netdev channels equally across these
+         doorbells.
 
 The ``mlx5`` driver also implements the following driver-specific
 parameters.
@@ -208,6 +217,20 @@ parameters.
        that enable compression.
        * ``balanced`` : Merges fewer CQEs, resulting in a moderate compression ratio but maintaining a balance between bandwidth savings and performance
        * ``aggressive`` : Merges more CQEs into a single entry, achieving a higher compression rate and maximizing performance, particularly under high traffic loads
+
+   * - ``swp_l4_csum_mode``
+     - string
+     - permanent
+     - Configure how the L4 checksum is calculated by the device when using
+       Software Parser (SWP) hints for header locations.
+
+       * ``default`` : Use the device's default checksum calculation
+         mode. The driver will discover during init whether or
+         full_csum or l4_only is in use. Setting this value explicitly
+         from userspace is not allowed, but some firmware versions may
+         return this value on param read.
+       * ``full_csum`` : Calculate full checksum including the pseudo-header
+       * ``l4_only`` : Calculate L4-only checksum, excluding the pseudo-header
 
 The ``mlx5`` driver supports reloading via ``DEVLINK_CMD_RELOAD``
 

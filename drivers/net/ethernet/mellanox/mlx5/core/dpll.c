@@ -435,7 +435,7 @@ static int mlx5_dpll_probe(struct auxiliary_device *adev,
 	if (err)
 		return err;
 
-	mdpll = kzalloc(sizeof(*mdpll), GFP_KERNEL);
+	mdpll = kzalloc_obj(*mdpll);
 	if (!mdpll)
 		return -ENOMEM;
 	mdpll->mdev = mdev;

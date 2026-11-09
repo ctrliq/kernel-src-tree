@@ -1092,7 +1092,7 @@ next_mr:
 				continue;
 			}
 
-			frame = kzalloc(sizeof(*frame), GFP_KERNEL);
+			frame = kzalloc_obj(*frame);
 			if (!frame) {
 				ret = -ENOMEM;
 				goto end;
@@ -1880,6 +1880,7 @@ int mlx5_odp_init_mkey_cache(struct mlx5_ib_dev *dev)
 	struct mlx5r_cache_rb_key rb_key = {
 		.access_mode = MLX5_MKC_ACCESS_MODE_KSM,
 		.ndescs = mlx5_imr_ksm_entries,
+		.ph = MLX5_IB_NO_PH,
 	};
 	struct mlx5_cache_ent *ent;
 
@@ -2096,7 +2097,7 @@ int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
 		return mlx5_ib_prefetch_sg_list(pd, advice, pf_flags, sg_list,
 						num_sge);
 
-	work = kvzalloc(struct_size(work, frags, num_sge), GFP_KERNEL);
+	work = kvzalloc_flex(*work, frags, num_sge);
 	if (!work)
 		return -ENOMEM;
 

@@ -6,6 +6,7 @@
 #include "en/port.h"
 #include "en_accel/en_accel.h"
 #include "en_accel/ipsec.h"
+#include "en_accel/psp.h"
 #include <linux/dim.h>
 #include <net/page_pool/types.h>
 #include <net/xdp_sock_drv.h>
@@ -1004,7 +1005,8 @@ void mlx5e_build_sq_param(struct mlx5_core_dev *mdev,
 	bool allow_swp;
 
 	allow_swp = mlx5_geneve_tx_allowed(mdev) ||
-		    (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_CRYPTO);
+		    (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_CRYPTO) ||
+		    mlx5_is_psp_device(mdev);
 	mlx5e_build_sq_param_common(mdev, param);
 	MLX5_SET(wq, wq, log_wq_sz, params->log_sq_size);
 	MLX5_SET(sqc, sqc, allow_swp, allow_swp);
@@ -1064,26 +1066,6 @@ u32 mlx5e_shampo_hd_per_wq(struct mlx5_core_dev *mdev,
 	hd_per_wqe = mlx5e_shampo_hd_per_wqe(mdev, params, rq_param);
 	hd_per_wq = roundup_pow_of_two(hd_per_wqe * wq_size);
 	return hd_per_wq;
-}
-
-static u32 mlx5e_shampo_icosq_sz(struct mlx5_core_dev *mdev,
-				 struct mlx5e_params *params,
-				 struct mlx5e_rq_param *rq_param)
-{
-	int max_num_of_umr_per_wqe, max_hd_per_wqe, max_ksm_per_umr, rest;
-	void *wqc = MLX5_ADDR_OF(rqc, rq_param->rqc, wq);
-	int wq_size = BIT(MLX5_GET(wq, wqc, log_wq_sz));
-	u32 wqebbs;
-
-	max_ksm_per_umr = MLX5E_MAX_KSM_PER_WQE(mdev);
-	max_hd_per_wqe = mlx5e_shampo_hd_per_wqe(mdev, params, rq_param);
-	max_num_of_umr_per_wqe = max_hd_per_wqe / max_ksm_per_umr;
-	rest = max_hd_per_wqe % max_ksm_per_umr;
-	wqebbs = MLX5E_KSM_UMR_WQEBBS(max_ksm_per_umr) * max_num_of_umr_per_wqe;
-	if (rest)
-		wqebbs += MLX5E_KSM_UMR_WQEBBS(rest);
-	wqebbs *= wq_size;
-	return wqebbs;
 }
 
 #define MLX5E_LRO_TIMEOUT_ARR_SIZE                      4
@@ -1170,9 +1152,6 @@ static u8 mlx5e_build_icosq_log_wq_sz(struct mlx5_core_dev *mdev,
 
 		wqebbs += max_xsk_wqebbs;
 	}
-
-	if (params->packet_merge.type == MLX5E_PACKET_MERGE_SHAMPO)
-		wqebbs += mlx5e_shampo_icosq_sz(mdev, params, rqp);
 
 	/* UMR WQEs don't cross the page boundary, they are padded with NOPs.
 	 * This padding is always smaller than the max WQE size. That gives us

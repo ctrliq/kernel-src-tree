@@ -112,6 +112,8 @@ mlx5_core-$(CONFIG_MLX5_EN_TLS) += en_accel/ktls_stats.o \
 				   en_accel/fs_tcp.o en_accel/ktls.o en_accel/ktls_txrx.o \
 				   en_accel/ktls_tx.o en_accel/ktls_rx.o
 
+mlx5_core-$(CONFIG_MLX5_EN_PSP) += en_accel/psp.o en_accel/psp_rxtx.o
+
 #
 # SW Steering
 #
@@ -168,6 +170,11 @@ mlx5_core-$(CONFIG_MLX5_SF) += sf/vhca_event.o sf/dev/dev.o sf/dev/driver.o irq_
 # SF manager
 #
 mlx5_core-$(CONFIG_MLX5_SF_MANAGER) += sf/cmd.o sf/hw_table.o sf/devlink.o
+
+#
+# TPH support
+#
+mlx5_core-$(CONFIG_PCIE_TPH) += lib/st.o
 
 obj-$(CONFIG_MLX5_DPLL) += mlx5_dpll.o
 mlx5_dpll-y :=	dpll.o

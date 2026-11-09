@@ -107,9 +107,7 @@ mlx5_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 	if (err)
 		return err;
 
-	err = mlx5_fw_version_query(dev, &running_fw, &stored_fw);
-	if (err)
-		return err;
+	mlx5_fw_version_query(dev, &running_fw, &stored_fw);
 
 	snprintf(version_str, sizeof(version_str), "%d.%d.%04d",
 		 mlx5_fw_ver_major(running_fw), mlx5_fw_ver_minor(running_fw),
@@ -294,7 +292,7 @@ static int mlx5_devlink_trap_init(struct devlink *devlink, const struct devlink_
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 	struct mlx5_devlink_trap *dl_trap;
 
-	dl_trap = kzalloc(sizeof(*dl_trap), GFP_KERNEL);
+	dl_trap = kzalloc_obj(*dl_trap);
 	if (!dl_trap)
 		return -ENOMEM;
 
@@ -535,6 +533,25 @@ mlx5_devlink_hairpin_queue_size_validate(struct devlink *devlink, u32 id,
 	return 0;
 }
 
+static int mlx5_devlink_num_doorbells_validate(struct devlink *devlink, u32 id,
+					       union devlink_param_value *val,
+					       struct netlink_ext_ack *extack)
+{
+	struct mlx5_core_dev *mdev = devlink_priv(devlink);
+	u32 val32 = val->vu32;
+	u32 max_num_channels;
+
+	max_num_channels = mlx5e_get_max_num_channels(mdev);
+	if (val32 > max_num_channels) {
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "Requested num_doorbells (%u) exceeds max number of channels (%u)",
+				       val32, max_num_channels);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static void mlx5_devlink_hairpin_params_init_values(struct devlink *devlink)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
@@ -614,6 +631,9 @@ static const struct devlink_param mlx5_devlink_eth_params[] = {
 			     "hairpin_queue_size", DEVLINK_PARAM_TYPE_U32,
 			     BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
 			     mlx5_devlink_hairpin_queue_size_validate),
+	DEVLINK_PARAM_GENERIC(NUM_DOORBELLS,
+			      BIT(DEVLINK_PARAM_CMODE_DRIVERINIT), NULL, NULL,
+			      mlx5_devlink_num_doorbells_validate),
 };
 
 static int mlx5_devlink_eth_params_register(struct devlink *devlink)
@@ -637,6 +657,10 @@ static int mlx5_devlink_eth_params_register(struct devlink *devlink)
 
 	mlx5_devlink_hairpin_params_init_values(devlink);
 
+	value.vu32 = MLX5_DEFAULT_NUM_DOORBELLS;
+	devl_param_driverinit_value_set(devlink,
+					DEVLINK_PARAM_GENERIC_ID_NUM_DOORBELLS,
+					&value);
 	return 0;
 }
 
