@@ -900,7 +900,7 @@ static inline bool mem_cgroup_online(struct mem_cgroup *memcg)
 {
 	if (mem_cgroup_disabled())
 		return true;
-	return !!(memcg->css.flags & CSS_ONLINE);
+	return css_is_online(&memcg->css);
 }
 
 void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
@@ -1086,6 +1086,8 @@ static inline u64 cgroup_id_from_mm(struct mm_struct *mm)
 	rcu_read_unlock();
 	return id;
 }
+
+void mem_cgroup_flush_workqueue(void);
 
 extern int mem_cgroup_init(void);
 #else /* CONFIG_MEMCG */
@@ -1508,6 +1510,8 @@ static inline u64 cgroup_id_from_mm(struct mm_struct *mm)
 {
 	return 0;
 }
+
+static inline void mem_cgroup_flush_workqueue(void) { }
 
 static inline int mem_cgroup_init(void) { return 0; }
 #endif /* CONFIG_MEMCG */

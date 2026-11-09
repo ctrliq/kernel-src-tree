@@ -396,10 +396,22 @@ static __net_init void preinit_net_sysctl(struct net *net)
 }
 
 /* init code that must occur even if setup_net() is not called. */
-static __net_init void preinit_net(struct net *net, struct user_namespace *user_ns)
+static __net_init int preinit_net(struct net *net, struct user_namespace *user_ns)
 {
+	const struct proc_ns_operations *ns_ops;
+	int ret;
+
+#ifdef CONFIG_NET_NS
+	ns_ops = &netns_operations;
+#else
+	ns_ops = NULL;
+#endif
+
+	ret = ns_common_init(&net->ns, ns_ops, false);
+	if (ret)
+		return ret;
+
 	refcount_set(&net->passive, 1);
-	refcount_set(&net->ns.count, 1);
 	ref_tracker_dir_init(&net->refcnt_tracker, 128, "net refcnt");
 	ref_tracker_dir_init(&net->notrefcnt_tracker, 128, "net notrefcnt");
 
@@ -419,6 +431,7 @@ static __net_init void preinit_net(struct net *net, struct user_namespace *user_
 	INIT_LIST_HEAD(&net->ptype_all);
 	INIT_LIST_HEAD(&net->ptype_specific);
 	preinit_net_sysctl(net);
+	return 0;
 }
 
 /*
@@ -560,7 +573,9 @@ struct net *copy_net_ns(u64 flags,
 		goto dec_ucounts;
 	}
 
-	preinit_net(net, user_ns);
+	rv = preinit_net(net, user_ns);
+	if (rv < 0)
+		goto dec_ucounts;
 	net->ucounts = ucounts;
 	get_user_ns(user_ns);
 
@@ -792,14 +807,24 @@ EXPORT_SYMBOL_GPL(get_net_ns_by_pid);
 
 static __net_init int net_ns_net_init(struct net *net)
 {
-#ifdef CONFIG_NET_NS
-	net->ns.ops = &netns_operations;
-#endif
-	return ns_alloc_inum(&net->ns);
+	int ret = 0;
+
+	if (net == &init_net)
+		net->ns.inum = PROC_NET_INIT_INO;
+	else
+		ret = proc_alloc_inum(&to_ns_common(net)->inum);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 static __net_exit void net_ns_net_exit(struct net *net)
 {
+	/*
+	 * Initial network namespace doesn't exit so we don't need any
+	 * special checks here.
+	 */
 	ns_free_inum(&net->ns);
 }
 
@@ -1249,7 +1274,12 @@ void __init net_ns_init(void)
 #ifdef CONFIG_KEYS
 	init_net.key_domain = &init_net_key_domain;
 #endif
-	preinit_net(&init_net, &init_user_ns);
+	/*
+	 * This currently cannot fail as the initial network namespace
+	 * has a static inode number.
+	 */
+	if (preinit_net(&init_net, &init_user_ns))
+		panic("Could not preinitialize the initial network namespace");
 
 	down_write(&pernet_ops_rwsem);
 	if (setup_net(&init_net))

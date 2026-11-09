@@ -233,7 +233,8 @@ static int test_cgcore_populated(const char *root)
 	if (err)
 		goto cleanup;
 
-	if (cg_read_strcmp(cg_test_d, "cgroup.events", "populated 0\n"))
+	if (cg_read_strcmp_wait(cg_test_d, "cgroup.events",
+				   "populated 0\n"))
 		goto cleanup;
 
 	/* Remove cgroup. */
@@ -425,7 +426,6 @@ static int test_cgcore_no_internal_process_constraint_on_threads(const char *roo
 	ret = KSFT_PASS;
 
 cleanup:
-	cg_enter_current(root);
 	cg_enter_current(root);
 	if (child)
 		cg_destroy(child);
