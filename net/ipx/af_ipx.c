@@ -1849,6 +1849,11 @@ static int ipx_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	struct sock *sk = sock->sk;
 	void __user *argp = (void __user *)arg;
 
+	switch (cmd) {
+	case SIOCGSTAMP:
+		return sock_get_timestamp(sk, argp);
+	}
+
 	lock_sock(sk);
 	switch (cmd) {
 	case TIOCOUTQ:
@@ -1894,9 +1899,6 @@ static int ipx_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 			break;
 		rc = get_user(ipx_sk(sk)->ipx_ncp_conn,
 			      (const unsigned short __user *)argp);
-		break;
-	case SIOCGSTAMP:
-		rc = sock_get_timestamp(sk, argp);
 		break;
 	case SIOCGIFDSTADDR:
 	case SIOCSIFDSTADDR:
