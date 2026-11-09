@@ -1145,6 +1145,11 @@ static int qrtr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	long len = 0;
 	int rc = 0;
 
+	switch (cmd) {
+	case SIOCGSTAMP:
+		return sock_get_timestamp(sk, argp);
+	}
+
 	lock_sock(sk);
 
 	switch (cmd) {
@@ -1172,9 +1177,6 @@ static int qrtr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 			rc = -EFAULT;
 			break;
 		}
-		break;
-	case SIOCGSTAMP:
-		rc = sock_get_timestamp(sk, argp);
 		break;
 	case SIOCADDRT:
 	case SIOCDELRT:

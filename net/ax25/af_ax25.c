@@ -1685,6 +1685,14 @@ static int ax25_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	void __user *argp = (void __user *)arg;
 	int res = 0;
 
+	switch (cmd) {
+	case SIOCGSTAMP:
+		return sock_get_timestamp(sk, argp);
+
+	case SIOCGSTAMPNS:
+		return sock_get_timestampns(sk, argp);
+	}
+
 	lock_sock(sk);
 	switch (cmd) {
 	case TIOCOUTQ: {
@@ -1706,14 +1714,6 @@ static int ax25_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		res = put_user(amount, (int __user *) argp);
 		break;
 	}
-
-	case SIOCGSTAMP:
-		res = sock_get_timestamp(sk, argp);
-		break;
-
-	case SIOCGSTAMPNS:
-		res = sock_get_timestampns(sk, argp);
-		break;
 
 	case SIOCAX25ADDUID:	/* Add a uid to the uid/call map table */
 	case SIOCAX25DELUID:	/* Delete a uid from the uid/call map table */
