@@ -69,6 +69,19 @@ int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
 		  unsigned int key_len);
 
 /**
+ * aes_zeroize_ctx - Clear a crypto_aes_ctx structure
+ * @ctx:	The location of the context that should be zeroized
+ *
+ * Explicitly fills the crypto_aes_ctx with zeroes. This should be done
+ * once the context is not required anymore to avoid that its contents
+ * are leaked on the stack or heap (if not using kfree_sensitive()).
+ */
+static inline void aes_zeroize_ctx(struct crypto_aes_ctx *ctx)
+{
+	memzero_explicit(ctx, sizeof(*ctx));
+}
+
+/**
  * aes_encrypt - Encrypt a single AES block
  * @ctx:	Context struct containing the key schedule
  * @out:	Buffer to store the ciphertext
