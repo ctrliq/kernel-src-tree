@@ -800,18 +800,14 @@ static bool msr_write_intercepted(struct kvm_vcpu *vcpu, u32 msr)
 	unsigned long tmp;
 	u32 offset;
 	u32 *msrpm;
+	struct vcpu_svm *svm = to_svm(vcpu);
 
 	/*
-	 * For non-nested case:
-	 * If the L01 MSR bitmap does not intercept the MSR, then we need to
-	 * save it.
-	 *
-	 * For nested case:
-	 * If the L02 MSR bitmap does not intercept the MSR, then we need to
-	 * save it.
+	 * Use the active VMCB's MSR bitmap.  When L2 is running, KVM uses
+	 * msrpm02 iff L1 intercepts MSR accesses (merged bitmap); otherwise
+	 * the active VMCB still points at msrpm01.
 	 */
-	msrpm = is_guest_mode(vcpu) ? to_svm(vcpu)->nested.msrpm:
-				      to_svm(vcpu)->msrpm;
+	msrpm = __va(__sme_clr(svm->vmcb->control.msrpm_base_pa));
 
 	offset    = svm_msrpm_offset(msr);
 	bit_write = 2 * (msr & 0x0f) + 1;
