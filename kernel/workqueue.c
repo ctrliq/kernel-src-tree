@@ -109,6 +109,10 @@ enum {
 	WQ_NAME_LEN		= 24,
 };
 
+enum work_cancel_flags {
+	WORK_CANCEL_DELAYED	= 1 << 0,	/* canceling a delayed_work */
+};
+
 /*
  * Structure fields follow one of the following exclusion rules.
  *
@@ -1230,7 +1234,7 @@ out_put:
 /**
  * try_to_grab_pending - steal work item from worklist and disable irq
  * @work: work item to steal
- * @is_dwork: @work is a delayed_work
+ * @cflags: %WORK_CANCEL_ flags
  * @irq_flags: place to store irq state
  *
  * Try to grab PENDING bit of @work.  This function can handle @work in any
@@ -1257,7 +1261,7 @@ out_put:
  *
  * This function is safe to call from any context including IRQ handler.
  */
-static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
+static int try_to_grab_pending(struct work_struct *work, u32 cflags,
 			       unsigned long *irq_flags)
 {
 	struct worker_pool *pool;
@@ -1266,7 +1270,7 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 	local_irq_save(*irq_flags);
 
 	/* try to steal the timer if it exists */
-	if (is_dwork) {
+	if (cflags & WORK_CANCEL_DELAYED) {
 		struct delayed_work *dwork = to_delayed_work(work);
 
 		/*
@@ -1733,7 +1737,8 @@ bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 	int ret;
 
 	do {
-		ret = try_to_grab_pending(&dwork->work, true, &irq_flags);
+		ret = try_to_grab_pending(&dwork->work, WORK_CANCEL_DELAYED,
+					  &irq_flags);
 	} while (unlikely(ret == -EAGAIN));
 
 	if (likely(ret >= 0)) {
@@ -3233,13 +3238,13 @@ bool flush_rcu_work(struct rcu_work *rwork)
 }
 EXPORT_SYMBOL(flush_rcu_work);
 
-static bool __cancel_work(struct work_struct *work, bool is_dwork)
+static bool __cancel_work(struct work_struct *work, u32 cflags)
 {
 	unsigned long irq_flags;
 	int ret;
 
 	do {
-		ret = try_to_grab_pending(work, is_dwork, &irq_flags);
+		ret = try_to_grab_pending(work, cflags, &irq_flags);
 	} while (unlikely(ret == -EAGAIN));
 
 	if (unlikely(ret < 0))
@@ -3264,14 +3269,14 @@ static int cwt_wakefn(wait_queue_entry_t *wait, unsigned mode, int sync, void *k
 	return autoremove_wake_function(wait, mode, sync, key);
 }
 
-static bool __cancel_work_sync(struct work_struct *work, bool is_dwork)
+static bool __cancel_work_sync(struct work_struct *work, u32 cflags)
 {
 	static DECLARE_WAIT_QUEUE_HEAD(cancel_waitq);
 	unsigned long irq_flags;
 	int ret;
 
 	do {
-		ret = try_to_grab_pending(work, is_dwork, &irq_flags);
+		ret = try_to_grab_pending(work, cflags, &irq_flags);
 		/*
 		 * If someone else is already canceling, wait for it to
 		 * finish.  flush_work() doesn't work for PREEMPT_NONE
@@ -3333,7 +3338,7 @@ static bool __cancel_work_sync(struct work_struct *work, bool is_dwork)
  */
 bool cancel_work(struct work_struct *work)
 {
-	return __cancel_work(work, false);
+	return __cancel_work(work, 0);
 }
 EXPORT_SYMBOL(cancel_work);
 
@@ -3357,7 +3362,7 @@ EXPORT_SYMBOL(cancel_work);
  */
 bool cancel_work_sync(struct work_struct *work)
 {
-	return __cancel_work_sync(work, false);
+	return __cancel_work_sync(work, 0);
 }
 EXPORT_SYMBOL_GPL(cancel_work_sync);
 
@@ -3379,7 +3384,7 @@ EXPORT_SYMBOL_GPL(cancel_work_sync);
  */
 bool cancel_delayed_work(struct delayed_work *dwork)
 {
-	return __cancel_work(&dwork->work, true);
+	return __cancel_work(&dwork->work, WORK_CANCEL_DELAYED);
 }
 EXPORT_SYMBOL(cancel_delayed_work);
 
@@ -3394,7 +3399,7 @@ EXPORT_SYMBOL(cancel_delayed_work);
  */
 bool cancel_delayed_work_sync(struct delayed_work *dwork)
 {
-	return __cancel_work_sync(&dwork->work, true);
+	return __cancel_work_sync(&dwork->work, WORK_CANCEL_DELAYED);
 }
 EXPORT_SYMBOL(cancel_delayed_work_sync);
 
