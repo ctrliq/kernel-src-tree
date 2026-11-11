@@ -7743,9 +7743,15 @@ static int sched_idle_rq(struct rq *rq)
 			rq->nr_running);
 }
 
-static int sched_idle_cpu(int cpu)
+static int choose_sched_idle_rq(struct rq *rq, struct task_struct *p)
 {
-	return sched_idle_rq(cpu_rq(cpu));
+	return sched_idle_rq(rq) && !task_has_idle_policy(p);
+}
+
+static int choose_idle_cpu(int cpu, struct task_struct *p)
+{
+	return available_idle_cpu(cpu) ||
+	       choose_sched_idle_rq(cpu_rq(cpu), p);
 }
 
 static void
@@ -8310,7 +8316,7 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 		if (!sched_core_cookie_match(rq, p))
 			continue;
 
-		if (sched_idle_cpu(i))
+		if (choose_sched_idle_rq(rq, p))
 			return i;
 
 		if (available_idle_cpu(i)) {
@@ -8401,8 +8407,7 @@ static inline int sched_balance_find_dst_cpu(struct sched_domain *sd, struct tas
 
 static inline int __select_idle_cpu(int cpu, struct task_struct *p)
 {
-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
-	    sched_cpu_cookie_match(cpu_rq(cpu), p))
+	if (choose_idle_cpu(cpu, p) && sched_cpu_cookie_match(cpu_rq(cpu), p))
 		return cpu;
 
 	return -1;
@@ -8416,7 +8421,7 @@ static inline void set_idle_cores(int cpu, int val)
 {
 	struct sched_domain_shared *sds;
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds)
 		WRITE_ONCE(sds->has_idle_cores, val);
 }
@@ -8425,7 +8430,7 @@ static inline bool test_idle_cores(int cpu)
 {
 	struct sched_domain_shared *sds;
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds)
 		return READ_ONCE(sds->has_idle_cores);
 
@@ -8434,7 +8439,7 @@ static inline bool test_idle_cores(int cpu)
 
 /*
  * Scans the local SMT mask to see if the entire core is idle, and records this
- * information in sd_llc_shared->has_idle_cores.
+ * information in sd_balance_shared->has_idle_cores.
  *
  * Since SMT siblings share all cache levels, inspecting this limited remote
  * state should be fairly cheap.
@@ -8464,7 +8469,8 @@ unlock:
 /*
  * Scan the entire LLC domain for idle cores; this dynamically switches off if
  * there are no idle cores left in the system; tracked through
- * sd_llc->shared->has_idle_cores and enabled through update_idle_core() above.
+ * sd_balance_shared->has_idle_cores and enabled through update_idle_core()
+ * above.
  */
 static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
 {
@@ -8475,7 +8481,8 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
 		if (!available_idle_cpu(cpu)) {
 			idle = false;
 			if (*idle_cpu == -1) {
-				if (sched_idle_cpu(cpu) && cpumask_test_cpu(cpu, cpus)) {
+				if (choose_sched_idle_rq(cpu_rq(cpu), p) &&
+				    cpumask_test_cpu(cpu, cpus)) {
 					*idle_cpu = cpu;
 					break;
 				}
@@ -8510,7 +8517,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 		 */
 		if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
 			continue;
-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+		if (choose_idle_cpu(cpu, p))
 			return cpu;
 	}
 
@@ -8549,20 +8556,25 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
-	struct sched_domain_shared *sd_share;
 
-	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
-
-	if (sched_feat(SIS_UTIL)) {
-		sd_share = rcu_dereference_all(per_cpu(sd_llc_shared, target));
-		if (sd_share) {
-			/* because !--nr is the condition to stop scan */
-			nr = READ_ONCE(sd_share->nr_idle_scan) + 1;
-			/* overloaded LLC is unlikely to have idle cpu/core */
-			if (nr == 1)
-				return -1;
-		}
+	if (sched_feat(SIS_UTIL) && sd->shared) {
+		/*
+		 * Increment because !--nr is the condition to stop scan.
+		 *
+		 * Since "sd" is "sd_llc" for target CPU dereferenced in the
+		 * caller, it is safe to directly dereference "sd->shared".
+		 * Topology bits always ensure it assigned for "sd_llc" abd it
+		 * cannot disappear as long as we have a RCU protected
+		 * reference to one the associated "sd" here.
+		 */
+		nr = READ_ONCE(sd->shared->nr_idle_scan) + 1;
+		/* overloaded LLC is unlikely to have idle cpu/core */
+		if (nr == 1)
+			return -1;
 	}
+
+	if (!cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr))
+		return -1;
 
 	if (static_branch_unlikely(&sched_cluster_active)) {
 		struct sched_group *sg = sd->groups;
@@ -8610,6 +8622,54 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 }
 
 /*
+ * Idle-capacity scan converts util_fits_cpu() outcomes into preference ranks,
+ * where lower values indicate a better fit - see select_idle_capacity().
+ *
+ * A CPU that both fits the task and sits on a fully-idle SMT core is returned
+ * immediately and is never assigned one of these ranks. On !SMT every CPU is
+ * its own "core", so the early return covers all fits-and-idle cases and the
+ * core-tier ranks below become unreachable.
+ *
+ *   Rank                            Val  Tier    Meaning
+ *   ------------------------------  ---  ------  ---------------------------
+ *   ASYM_IDLE_UCLAMP_MISFIT         -4   core    Idle core; capacity fits
+ *                                                util but uclamp_min misses.
+ *   ASYM_IDLE_COMPLETE_MISFIT       -3   core    Idle core; capacity does
+ *                                                not fit. Still beats every
+ *                                                thread-tier rank: a busy
+ *                                                sibling cuts effective
+ *                                                capacity more than a
+ *                                                misfit hurts a quiet core.
+ *   ASYM_IDLE_THREAD_FITS           -2   thread  Busy SMT sibling; capacity
+ *                                                fits util + uclamp.
+ *   ASYM_IDLE_THREAD_UCLAMP_MISFIT  -1   thread  Busy SMT sibling; capacity
+ *                                                fits but uclamp_min misses
+ *                                                (native util_fits_cpu()
+ *                                                return value).
+ *   ASYM_IDLE_THREAD_MISFIT          0   thread  Busy SMT sibling; capacity
+ *                                                does not fit.
+ *
+ * ASYM_IDLE_CORE_BIAS (-3) is an offset, not a state. On an idle core,
+ * fits += ASYM_IDLE_CORE_BIAS rebases thread-tier ranks into the core tier:
+ *
+ *   ASYM_IDLE_THREAD_UCLAMP_MISFIT (-1) + BIAS -> ASYM_IDLE_UCLAMP_MISFIT   (-4)
+ *   ASYM_IDLE_THREAD_MISFIT         (0) + BIAS -> ASYM_IDLE_COMPLETE_MISFIT (-3)
+ *
+ * ASYM_IDLE_THREAD_FITS (-2) is never rebased because a fully-fitting idle-core
+ * candidate early-returns from select_idle_capacity().
+ */
+enum asym_fits_state {
+	ASYM_IDLE_UCLAMP_MISFIT = -4,
+	ASYM_IDLE_COMPLETE_MISFIT,
+	ASYM_IDLE_THREAD_FITS,
+	ASYM_IDLE_THREAD_UCLAMP_MISFIT,
+	ASYM_IDLE_THREAD_MISFIT,
+
+	/* util_fits_cpu() bias for idle core */
+	ASYM_IDLE_CORE_BIAS = -3,
+};
+
+/*
  * Scan the asym_capacity domain for idle CPUs; pick the first idle one on which
  * the task fits. If no CPU is big enough, but there are idle ones, try to
  * maximize capacity.
@@ -8617,10 +8677,17 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 static int
 select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 {
+	/*
+	 * On !SMT systems, has_idle_core is always false and preferred_core
+	 * is always true (CPU == core), so the SMT preference logic below
+	 * collapses to the plain capacity scan.
+	 */
+	bool has_idle_core = sched_smt_active() && test_idle_cores(target);
 	unsigned long task_util, util_min, util_max, best_cap = 0;
-	int fits, best_fits = 0;
+	int fits, best_fits = ASYM_IDLE_THREAD_MISFIT;
 	int cpu, best_cpu = -1;
 	struct cpumask *cpus;
+	int nr = INT_MAX;
 
 	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
@@ -8629,16 +8696,41 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 	util_min = uclamp_eff_value(p, UCLAMP_MIN);
 	util_max = uclamp_eff_value(p, UCLAMP_MAX);
 
+	if (sched_feat(SIS_UTIL) && sd->shared) {
+		/*
+		 * Same nr_idle_scan hint as select_idle_cpu(), nr only limits
+		 * the scan when not preferring an idle core.
+		 */
+		nr = READ_ONCE(sd->shared->nr_idle_scan) + 1;
+		/* overloaded domain is unlikely to have idle cpu/core */
+		if (nr == 1)
+			return -1;
+	}
+
 	for_each_cpu_wrap(cpu, cpus, target) {
+		bool preferred_core = !has_idle_core || is_core_idle(cpu);
 		unsigned long cpu_cap = capacity_of(cpu);
 
-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+		/*
+		 * Stop when the nr_idle_scan is exhausted (mirrors
+		 * select_idle_cpu() logic).
+		 */
+		if (!has_idle_core && --nr <= 0)
+			return best_cpu;
+
+		if (!choose_idle_cpu(cpu, p))
 			continue;
 
 		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
 
-		/* This CPU fits with all requirements */
-		if (fits > 0)
+		/*
+		 * Perfect fit: capacity satisfies util + uclamp and the CPU
+		 * sits on a fully-idle SMT core, this is a !SMT system, or
+		 * there is no idle core to find.
+		 * Short-circuit the rank-based selection and return
+		 * immediately.
+		 */
+		if (fits > 0 && preferred_core)
 			return cpu;
 		/*
 		 * Only the min performance hint (i.e. uclamp_min) doesn't fit.
@@ -8646,9 +8738,33 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 		 */
 		else if (fits < 0)
 			cpu_cap = get_actual_cpu_capacity(cpu);
+		/*
+		 * fits > 0 implies we are not on a preferred core, but the util
+		 * fits CPU capacity. Set fits to ASYM_IDLE_THREAD_FITS
+		 * so the effective range becomes
+		 * [ASYM_IDLE_THREAD_FITS, ASYM_IDLE_THREAD_MISFIT], where:
+		 *    ASYM_IDLE_THREAD_MISFIT - does not fit
+		 *    ASYM_IDLE_THREAD_UCLAMP_MISFIT - fits with the exception of UCLAMP_MIN
+		 *    ASYM_IDLE_THREAD_FITS - fits with the exception of preferred_core
+		 */
+		else if (fits > 0)
+			fits = ASYM_IDLE_THREAD_FITS;
 
 		/*
-		 * First, select CPU which fits better (-1 being better than 0).
+		 * If we are on a preferred core, translate the range of fits
+		 * of [ASYM_IDLE_THREAD_UCLAMP_MISFIT, ASYM_IDLE_THREAD_MISFIT] to
+		 * [ASYM_IDLE_UCLAMP_MISFIT, ASYM_IDLE_COMPLETE_MISFIT].
+		 * This ensures that an idle core is always given priority over
+		 * (partially) busy core.
+		 *
+		 * A fully fitting idle core would have returned early and hence
+		 * fits > 0 for preferred_core need not be dealt with.
+		 */
+		if (preferred_core)
+			fits += ASYM_IDLE_CORE_BIAS;
+
+		/*
+		 * First, select CPU which fits better (lower is more preferred).
 		 * Then, select the one with best capacity at same level.
 		 */
 		if ((fits < best_fits) ||
@@ -8659,6 +8775,19 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 		}
 	}
 
+	/*
+	 * A value in the [ASYM_IDLE_UCLAMP_MISFIT, ASYM_IDLE_COMPLETE_MISFIT]
+	 * range means the chosen CPU is in a fully idle SMT core. Values above
+	 * ASYM_IDLE_COMPLETE_MISFIT mean we never ranked such a CPU best.
+	 *
+	 * The asym-capacity wakeup path returns from select_idle_sibling()
+	 * after this function and never runs select_idle_cpu(), so the usual
+	 * select_idle_cpu() tail that clears idle cores must live here when the
+	 * idle-core preference did not win.
+	 */
+	if (has_idle_core && best_fits > ASYM_IDLE_COMPLETE_MISFIT)
+		set_idle_cores(target, false);
+
 	return best_cpu;
 }
 
@@ -8667,12 +8796,22 @@ static inline bool asym_fits_cpu(unsigned long util,
 				 unsigned long util_max,
 				 int cpu)
 {
-	if (sched_asym_cpucap_active())
+	if (sched_asym_cpucap_active()) {
 		/*
 		 * Return true only if the cpu fully fits the task requirements
 		 * which include the utilization and the performance hints.
+		 *
+		 * When SMT is active, also require that the core has no busy
+		 * siblings.
+		 *
+		 * Note: gating on is_core_idle() also makes the early-bailout
+		 * candidates in select_idle_sibling() (target, prev,
+		 * recent_used_cpu) idle-core-aware on ASYM+SMT, which the
+		 * NO_ASYM path does not do.
 		 */
-		return (util_fits_cpu(util, util_min, util_max, cpu) > 0);
+		return (!sched_smt_active() || is_core_idle(cpu)) &&
+		       (util_fits_cpu(util, util_min, util_max, cpu) > 0);
+	}
 
 	return true;
 }
@@ -8703,7 +8842,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+	if (choose_idle_cpu(target, p) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
@@ -8711,7 +8850,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    choose_idle_cpu(prev, p) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
 
 		if (!static_branch_unlikely(&sched_cluster_active) ||
@@ -8743,7 +8882,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+	    choose_idle_cpu(recent_used_cpu, p) &&
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 
@@ -9243,10 +9382,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 	struct perf_domain *pd;
 	struct energy_env eenv;
 
-	rcu_read_lock();
 	pd = rcu_dereference_all(rd->pd);
 	if (!pd)
-		goto unlock;
+		return target;
 
 	/*
 	 * Energy-aware wake-up happens on the lowest sched_domain starting
@@ -9256,13 +9394,13 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 	while (sd && !cpumask_test_cpu(prev_cpu, sched_domain_span(sd)))
 		sd = sd->parent;
 	if (!sd)
-		goto unlock;
+		return target;
 
 	target = prev_cpu;
 
 	sync_entity_load_avg(&p->se);
 	if (!task_util_est(p) && p_util_min == 0)
-		goto unlock;
+		return target;
 
 	eenv_task_busy_time(&eenv, p, prev_cpu);
 
@@ -9357,7 +9495,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 						    prev_cpu);
 			/* CPU utilization has changed */
 			if (prev_delta < base_energy)
-				goto unlock;
+				return target;
 			prev_delta -= base_energy;
 			prev_actual_cap = cpu_actual_cap;
 			best_delta = min(best_delta, prev_delta);
@@ -9381,7 +9519,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 						   max_spare_cap_cpu);
 			/* CPU utilization has changed */
 			if (cur_delta < base_energy)
-				goto unlock;
+				return target;
 			cur_delta -= base_energy;
 
 			/*
@@ -9398,17 +9536,11 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			best_actual_cap = cpu_actual_cap;
 		}
 	}
-	rcu_read_unlock();
 
 	if ((best_fits > prev_fits) ||
 	    ((best_fits > 0) && (best_delta < prev_delta)) ||
 	    ((best_fits < 0) && (best_actual_cap > prev_actual_cap)))
 		target = best_energy_cpu;
-
-	return target;
-
-unlock:
-	rcu_read_unlock();
 
 	return target;
 }
@@ -9455,7 +9587,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
 	}
 
-	rcu_read_lock();
 	for_each_domain(cpu, tmp) {
 		/*
 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
@@ -9481,14 +9612,13 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			break;
 	}
 
-	if (unlikely(sd)) {
-		/* Slow path */
-		new_cpu = sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
-	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
-		/* Fast path */
-		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
-	}
-	rcu_read_unlock();
+	/* Slow path */
+	if (unlikely(sd))
+		return sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
+
+	/* Fast path */
+	if (wake_flags & WF_TTWU)
+		return select_idle_sibling(p, prev_cpu, new_cpu);
 
 	return new_cpu;
 }
@@ -10196,6 +10326,7 @@ struct lb_env {
 
 	int			dst_cpu;
 	struct rq		*dst_rq;
+	bool			dst_core_idle;
 
 	struct cpumask		*dst_grpmask;
 	int			new_dst_cpu;
@@ -11943,10 +12074,16 @@ static bool update_sd_pick_busiest(struct lb_env *env,
 	 * We can use max_capacity here as reduction in capacity on some
 	 * CPUs in the group should either be possible to resolve
 	 * internally or be covered by avg_load imbalance (eventually).
+	 *
+	 * When SMT is active, only pull a misfit to dst_cpu if it is on a
+	 * fully idle core; otherwise the effective capacity of the core is
+	 * reduced and we may not actually provide more capacity than the
+	 * source.
 	 */
 	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) &&
 	    (sgs->group_type == group_misfit_task) &&
-	    (!capacity_greater(capacity_of(env->dst_cpu), sg->sgc->max_capacity) ||
+	    (!env->dst_core_idle ||
+	     !capacity_greater(capacity_of(env->dst_cpu), sg->sgc->max_capacity) ||
 	     sds->local_stat.group_type != group_has_spare))
 		return false;
 
@@ -12437,6 +12574,7 @@ static void update_idle_cpu_scan(struct lb_env *env,
 				 unsigned long sum_util)
 {
 	struct sched_domain_shared *sd_share;
+	struct sched_domain *sd = env->sd;
 	int llc_weight, pct;
 	u64 x, y, tmp;
 	/*
@@ -12450,11 +12588,7 @@ static void update_idle_cpu_scan(struct lb_env *env,
 	if (!sched_feat(SIS_UTIL) || env->idle == CPU_NEWLY_IDLE)
 		return;
 
-	llc_weight = per_cpu(sd_llc_size, env->dst_cpu);
-	if (env->sd->span_weight != llc_weight)
-		return;
-
-	sd_share = rcu_dereference_all(per_cpu(sd_llc_shared, env->dst_cpu));
+	sd_share = sd->shared;
 	if (!sd_share)
 		return;
 
@@ -12488,10 +12622,11 @@ static void update_idle_cpu_scan(struct lb_env *env,
 	 */
 	/* equation [3] */
 	x = sum_util;
+	llc_weight = sd->span_weight;
 	do_div(x, llc_weight);
 
 	/* equation [4] */
-	pct = env->sd->imbalance_pct;
+	pct = sd->imbalance_pct;
 	tmp = x * x * pct * pct;
 	do_div(tmp, 10000 * SCHED_CAPACITY_SCALE);
 	tmp = min_t(long, tmp, SCHED_CAPACITY_SCALE);
@@ -12517,6 +12652,8 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
 	struct sg_lb_stats tmp_sgs;
 	unsigned long sum_util = 0;
 	bool sg_overloaded = 0, sg_overutilized = 0;
+
+	env->dst_core_idle = !sched_smt_active() || is_core_idle(env->dst_cpu);
 
 	do {
 		struct sg_lb_stats *sgs = &tmp_sgs;
@@ -13726,7 +13863,30 @@ static inline void update_newidle_stats(struct sched_domain *sd, unsigned int su
 	sd->newidle_success += success;
 
 	if (sd->newidle_call >= 1024) {
-		sd->newidle_ratio = sd->newidle_success;
+		u64 now = sched_clock();
+		s64 delta = now - sd->newidle_stamp;
+		sd->newidle_stamp = now;
+		int ratio = 0;
+
+		if (delta < 0)
+			delta = 0;
+
+		if (sched_feat(NI_RATE)) {
+			/*
+			 * ratio  delta   freq
+			 *
+			 * 1024 -  4  s -  128 Hz
+			 *  512 -  2  s -  256 Hz
+			 *  256 -  1  s -  512 Hz
+			 *  128 - .5  s - 1024 Hz
+			 *   64 - .25 s - 2048 Hz
+			 */
+			ratio = delta >> 22;
+		}
+
+		ratio += sd->newidle_success;
+
+		sd->newidle_ratio = min(1024, ratio);
 		sd->newidle_call /= 2;
 		sd->newidle_success /= 2;
 	}
@@ -13773,7 +13933,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
 	int continue_balancing = 1;
 	int cpu = rq->cpu;
-	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
+	int busy = idle != CPU_IDLE && !sched_idle_rq(rq);
 	unsigned long interval;
 	struct sched_domain *sd;
 	/* Earliest time when we have to do rebalance again */
@@ -13811,7 +13971,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 				 * state even if we migrated tasks. Update it.
 				 */
 				idle = idle_cpu(cpu);
-				busy = !idle && !sched_idle_cpu(cpu);
+				busy = !idle && !sched_idle_rq(rq);
 			}
 			sd->last_balance = jiffies;
 			interval = get_sd_balance_interval(sd, busy);
@@ -13967,8 +14127,6 @@ static void nohz_balancer_kick(struct rq *rq)
 		goto out;
 	}
 
-	rcu_read_lock();
-
 	sd = rcu_dereference_all(rq->sd);
 	if (sd) {
 		/*
@@ -13976,8 +14134,8 @@ static void nohz_balancer_kick(struct rq *rq)
 		 * capacity, kick the ILB to see if there's a better CPU to run on:
 		 */
 		if (rq->cfs.h_nr_runnable >= 1 && check_cpu_capacity(rq, sd)) {
-			flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-			goto unlock;
+			flags |= NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
+			goto out;
 		}
 	}
 
@@ -13993,8 +14151,8 @@ static void nohz_balancer_kick(struct rq *rq)
 		 */
 		for_each_cpu_and(i, sched_domain_span(sd), nohz.idle_cpus_mask) {
 			if (sched_asym(sd, i, cpu)) {
-				flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-				goto unlock;
+				flags |= NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
+				goto out;
 			}
 		}
 	}
@@ -14005,10 +14163,8 @@ static void nohz_balancer_kick(struct rq *rq)
 		 * When ASYM_CPUCAPACITY; see if there's a higher capacity CPU
 		 * to run the misfit task on.
 		 */
-		if (check_misfit_status(rq)) {
-			flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-			goto unlock;
-		}
+		if (check_misfit_status(rq))
+			flags |= NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
 
 		/*
 		 * For asymmetric systems, we do not want to nicely balance
@@ -14017,10 +14173,10 @@ static void nohz_balancer_kick(struct rq *rq)
 		 *
 		 * Skip the LLC logic because it's not relevant in that case.
 		 */
-		goto unlock;
+		goto out;
 	}
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds) {
 		/*
 		 * If there is an imbalance between LLC domains (IOW we could
@@ -14032,13 +14188,9 @@ static void nohz_balancer_kick(struct rq *rq)
 		 * like this LLC domain has tasks we could move.
 		 */
 		nr_busy = atomic_read(&sds->nr_busy_cpus);
-		if (nr_busy > 1) {
-			flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-			goto unlock;
-		}
+		if (nr_busy > 1)
+			flags |= NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
 	}
-unlock:
-	rcu_read_unlock();
 out:
 	if (READ_ONCE(nohz.needs_update))
 		flags |= NOHZ_NEXT_KICK;
@@ -14050,17 +14202,17 @@ out:
 static void set_cpu_sd_state_busy(int cpu)
 {
 	struct sched_domain *sd;
-
-	rcu_read_lock();
 	sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
 
-	if (!sd || !sd->nohz_idle)
-		goto unlock;
+	/*
+	 * sd->nohz_idle only pairs with nr_busy_cpus on sd->shared; if this
+	 * domain has no shared object there is nothing to clear or account.
+	 */
+	if (!sd || !sd->shared || !sd->nohz_idle)
+		return;
 	sd->nohz_idle = 0;
 
 	atomic_inc(&sd->shared->nr_busy_cpus);
-unlock:
-	rcu_read_unlock();
 }
 
 void nohz_balance_exit_idle(struct rq *rq)
@@ -14079,17 +14231,14 @@ void nohz_balance_exit_idle(struct rq *rq)
 static void set_cpu_sd_state_idle(int cpu)
 {
 	struct sched_domain *sd;
-
-	rcu_read_lock();
 	sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
 
-	if (!sd || sd->nohz_idle)
-		goto unlock;
+	/* See set_cpu_sd_state_busy(): nohz_idle is only used with sd->shared. */
+	if (!sd || !sd->shared || sd->nohz_idle)
+		return;
 	sd->nohz_idle = 1;
 
 	atomic_dec(&sd->shared->nr_busy_cpus);
-unlock:
-	rcu_read_unlock();
 }
 
 /*
@@ -14432,7 +14581,7 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 		if (sd->flags & SD_BALANCE_NEWIDLE) {
 			unsigned int weight = 1;
 
-			if (sched_feat(NI_RANDOM)) {
+			if (sched_feat(NI_RANDOM) && sd->newidle_ratio < 1024) {
 				/*
 				 * Throw a 1k sided dice; and only run
 				 * newidle_balance according to the success
