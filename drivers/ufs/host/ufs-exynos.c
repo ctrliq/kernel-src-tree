@@ -301,7 +301,7 @@ static int exynosauto_ufs_pre_pwr_change(struct exynos_ufs *ufs,
 }
 
 static int exynosauto_ufs_post_pwr_change(struct exynos_ufs *ufs,
-					  struct ufs_pa_layer_attr *pwr)
+					  const struct ufs_pa_layer_attr *pwr)
 {
 	struct ufs_hba *hba = ufs->hba;
 	u32 enabled_vh;
@@ -376,7 +376,7 @@ static int exynos7_ufs_pre_pwr_change(struct exynos_ufs *ufs,
 }
 
 static int exynos7_ufs_post_pwr_change(struct exynos_ufs *ufs,
-						struct ufs_pa_layer_attr *pwr)
+				       const struct ufs_pa_layer_attr *pwr)
 {
 	struct ufs_hba *hba = ufs->hba;
 	int lanes = max_t(u32, pwr->lane_rx, pwr->lane_tx);
@@ -771,26 +771,31 @@ static void exynos_ufs_config_sync_pattern_mask(struct exynos_ufs *ufs,
 	exynos_ufs_disable_ov_tm(hba);
 }
 
+#define UFS_HW_VER_MAJOR_MASK   GENMASK(15, 8)
+
+static u32 exynos_ufs_get_hs_gear(struct ufs_hba *hba)
+{
+	u8 major;
+
+	major = FIELD_GET(UFS_HW_VER_MAJOR_MASK, hba->ufs_version);
+
+	if (major >= 3)
+		return UFS_HS_G4;
+
+	/* Default is HS-G3 */
+	return UFS_HS_G3;
+}
+
 static int exynos_ufs_pre_pwr_mode(struct ufs_hba *hba,
-				struct ufs_pa_layer_attr *dev_max_params,
 				struct ufs_pa_layer_attr *dev_req_params)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 	struct phy *generic_phy = ufs->phy;
-	struct ufs_host_params host_params;
 	int ret;
 
 	if (!dev_req_params) {
 		pr_err("%s: incoming dev_req_params is NULL\n", __func__);
 		ret = -EINVAL;
-		goto out;
-	}
-
-	ufshcd_init_host_params(&host_params);
-
-	ret = ufshcd_negotiate_pwr_params(&host_params, dev_max_params, dev_req_params);
-	if (ret) {
-		pr_err("%s: failed to determine capabilities\n", __func__);
 		goto out;
 	}
 
@@ -820,7 +825,7 @@ out:
 
 #define PWR_MODE_STR_LEN	64
 static int exynos_ufs_post_pwr_mode(struct ufs_hba *hba,
-				struct ufs_pa_layer_attr *pwr_req)
+				const struct ufs_pa_layer_attr *pwr_req)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 	struct phy *generic_phy = ufs->phy;
@@ -1607,20 +1612,35 @@ static int exynos_ufs_link_startup_notify(struct ufs_hba *hba,
 	return ret;
 }
 
+static int exynos_ufs_negotiate_pwr_mode(struct ufs_hba *hba,
+					 const struct ufs_pa_layer_attr *dev_max_params,
+					 struct ufs_pa_layer_attr *dev_req_params)
+{
+	struct ufs_host_params host_params;
+
+	ufshcd_init_host_params(&host_params);
+
+	/* This driver only support symmetric gear setting e.g. hs_tx_gear == hs_rx_gear */
+	host_params.hs_tx_gear = exynos_ufs_get_hs_gear(hba);
+	host_params.hs_rx_gear = exynos_ufs_get_hs_gear(hba);
+
+	return ufshcd_negotiate_pwr_params(&host_params, dev_max_params, dev_req_params);
+}
+
 static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
 				enum ufs_notify_change_status status,
-				struct ufs_pa_layer_attr *dev_max_params,
 				struct ufs_pa_layer_attr *dev_req_params)
 {
 	int ret = 0;
 
 	switch (status) {
 	case PRE_CHANGE:
-		ret = exynos_ufs_pre_pwr_mode(hba, dev_max_params,
-					      dev_req_params);
+		ret = exynos_ufs_pre_pwr_mode(hba, dev_req_params);
 		break;
 	case POST_CHANGE:
-		ret = exynos_ufs_post_pwr_mode(hba, dev_req_params);
+		/* NULL when the gear switch failed: nothing to apply */
+		if (dev_req_params)
+			ret = exynos_ufs_post_pwr_mode(hba, dev_req_params);
 		break;
 	}
 
@@ -1922,6 +1942,7 @@ static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
 	.init				= exynos_ufs_init,
 	.hce_enable_notify		= exynos_ufs_hce_enable_notify,
 	.link_startup_notify		= exynos_ufs_link_startup_notify,
+	.negotiate_pwr_mode		= exynos_ufs_negotiate_pwr_mode,
 	.pwr_change_notify		= exynos_ufs_pwr_change_notify,
 	.setup_clocks			= exynos_ufs_setup_clocks,
 	.setup_xfer_req			= exynos_ufs_specify_nexus_t_xfer_req,
@@ -1961,8 +1982,7 @@ static void exynos_ufs_remove(struct platform_device *pdev)
 	struct ufs_hba *hba =  platform_get_drvdata(pdev);
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 
-	pm_runtime_get_sync(&(pdev)->dev);
-	ufshcd_remove(hba);
+	ufshcd_pltfrm_remove(pdev);
 
 	phy_power_off(ufs->phy);
 	phy_exit(ufs->phy);
@@ -2157,7 +2177,7 @@ static const struct dev_pm_ops exynos_ufs_pm_ops = {
 
 static struct platform_driver exynos_ufs_pltform = {
 	.probe	= exynos_ufs_probe,
-	.remove_new = exynos_ufs_remove,
+	.remove = exynos_ufs_remove,
 	.driver	= {
 		.name	= "exynos-ufshc",
 		.pm	= &exynos_ufs_pm_ops,
