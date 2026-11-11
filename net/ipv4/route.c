@@ -84,6 +84,7 @@
 #include <linux/jhash.h>
 #include <net/dst.h>
 #include <net/dst_metadata.h>
+#include <net/flow.h>
 #include <net/inet_dscp.h>
 #include <net/net_namespace.h>
 #include <net/ip.h>
@@ -1279,7 +1280,7 @@ void ip_rt_get_source(u8 *addr, struct sk_buff *skb, struct rtable *rt)
 		struct flowi4 fl4 = {
 			.daddr = iph->daddr,
 			.saddr = iph->saddr,
-			.flowi4_tos = iph->tos & INET_DSCP_MASK,
+			.flowi4_dscp = ip4h_dscp(iph),
 			.flowi4_oif = rt->dst.dev->ifindex,
 			.flowi4_iif = skb->dev->ifindex,
 			.flowi4_mark = skb->mark,
@@ -1688,7 +1689,7 @@ EXPORT_SYMBOL(rt_dst_clone);
 /* called in rcu_read_lock() section */
 enum skb_drop_reason
 ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		      u8 tos, struct net_device *dev,
+		      dscp_t dscp, struct net_device *dev,
 		      struct in_device *in_dev, u32 *itag)
 {
 	enum skb_drop_reason reason;
@@ -1711,8 +1712,8 @@ ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		    ip_hdr(skb)->protocol != IPPROTO_IGMP)
 			return SKB_DROP_REASON_IP_INVALID_SOURCE;
 	} else {
-		reason = fib_validate_source_reason(skb, saddr, 0, tos, 0,
-						    dev, in_dev, itag);
+		reason = fib_validate_source_reason(skb, saddr, 0, dscp, 0, dev,
+						    in_dev, itag);
 		if (reason)
 			return reason;
 	}
@@ -1722,7 +1723,7 @@ ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 /* called in rcu_read_lock() section */
 static enum skb_drop_reason
 ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		  u8 tos, struct net_device *dev, int our)
+		  dscp_t dscp, struct net_device *dev, int our)
 {
 	struct in_device *in_dev = __in_dev_get_rcu(dev);
 	unsigned int flags = RTCF_MULTICAST;
@@ -1730,7 +1731,7 @@ ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	struct rtable *rth;
 	u32 itag = 0;
 
-	reason = ip_mc_validate_source(skb, daddr, saddr, tos, dev, in_dev,
+	reason = ip_mc_validate_source(skb, daddr, saddr, dscp, dev, in_dev,
 				       &itag);
 	if (reason)
 		return reason;
@@ -1793,7 +1794,7 @@ static void ip_handle_martian_source(struct net_device *dev,
 static enum skb_drop_reason
 __mkroute_input(struct sk_buff *skb, const struct fib_result *res,
 		struct in_device *in_dev, __be32 daddr,
-		__be32 saddr, u32 tos)
+		__be32 saddr, dscp_t dscp)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	struct fib_nh_common *nhc = FIB_RES_NHC(*res);
@@ -1812,7 +1813,7 @@ __mkroute_input(struct sk_buff *skb, const struct fib_result *res,
 		return reason;
 	}
 
-	err = fib_validate_source(skb, saddr, daddr, tos, FIB_RES_OIF(*res),
+	err = fib_validate_source(skb, saddr, daddr, dscp, FIB_RES_OIF(*res),
 				  in_dev->dev, in_dev, &itag);
 	if (err < 0) {
 		reason = -err;
@@ -2143,7 +2144,7 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
 static enum skb_drop_reason
 ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
 		 struct in_device *in_dev, __be32 daddr,
-		 __be32 saddr, u32 tos, struct flow_keys *hkeys)
+		 __be32 saddr, dscp_t dscp, struct flow_keys *hkeys)
 {
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	if (res->fi && fib_info_num_path(res->fi) > 1) {
@@ -2155,7 +2156,7 @@ ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
 #endif
 
 	/* create a routing cache entry */
-	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
+	return __mkroute_input(skb, res, in_dev, daddr, saddr, dscp);
 }
 
 /* Implements all the saddr-related checks as ip_route_input_slow(),
@@ -2164,7 +2165,7 @@ ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
  */
 enum skb_drop_reason
 ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		  u8 tos, struct net_device *dev,
+		  dscp_t dscp, struct net_device *dev,
 		  const struct sk_buff *hint)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
@@ -2194,8 +2195,7 @@ ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (rt->rt_type != RTN_LOCAL)
 		goto skip_validate_source;
 
-	tos &= INET_DSCP_MASK;
-	reason = fib_validate_source_reason(skb, saddr, daddr, tos, 0, dev,
+	reason = fib_validate_source_reason(skb, saddr, daddr, dscp, 0, dev,
 					    in_dev, &tag);
 	if (reason)
 		goto martian_source;
@@ -2237,7 +2237,7 @@ static struct net_device *ip_rt_get_dev(struct net *net,
 
 static enum skb_drop_reason
 ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		    u8 tos, struct net_device *dev,
+		    dscp_t dscp, struct net_device *dev,
 		    struct fib_result *res)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
@@ -2313,7 +2313,7 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	fl4.flowi4_oif = 0;
 	fl4.flowi4_iif = dev->ifindex;
 	fl4.flowi4_mark = skb->mark;
-	fl4.flowi4_tos = tos;
+	fl4.flowi4_dscp = dscp;
 	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
 	fl4.flowi4_flags = 0;
 	fl4.daddr = daddr;
@@ -2347,8 +2347,8 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 
 	err = -EINVAL;
 	if (res->type == RTN_LOCAL) {
-		reason = fib_validate_source_reason(skb, saddr, daddr, tos,
-						    0, dev, in_dev, &itag);
+		reason = fib_validate_source_reason(skb, saddr, daddr, dscp, 0,
+						    dev, in_dev, &itag);
 		if (reason)
 			goto martian_source;
 		goto local_input;
@@ -2364,8 +2364,7 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	}
 
 make_route:
-	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos,
-				  flkeys);
+	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr, dscp, flkeys);
 
 out:
 	return reason;
@@ -2377,8 +2376,8 @@ brd_input:
 	}
 
 	if (!ipv4_is_zeronet(saddr)) {
-		reason = fib_validate_source_reason(skb, saddr, 0, tos, 0,
-						    dev, in_dev, &itag);
+		reason = fib_validate_source_reason(skb, saddr, 0, dscp, 0, dev,
+						    in_dev, &itag);
 		if (reason)
 			goto martian_source;
 	}
@@ -2468,7 +2467,7 @@ martian_source:
 /* called with rcu_read_lock held */
 static enum skb_drop_reason
 ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		   u8 tos, struct net_device *dev,
+		   dscp_t dscp, struct net_device *dev,
 		   struct fib_result *res)
 {
 	/* Multicast recognition logic is moved from route cache to here.
@@ -2510,25 +2509,24 @@ ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		     IN_DEV_MFORWARD(in_dev))
 #endif
 		   ) {
-			reason = ip_route_input_mc(skb, daddr, saddr, tos,
-						   dev, our);
+			reason = ip_route_input_mc(skb, daddr, saddr, dscp, dev,
+						   our);
 		}
 		return reason;
 	}
 
-	return ip_route_input_slow(skb, daddr, saddr, tos, dev, res);
+	return ip_route_input_slow(skb, daddr, saddr, dscp, dev, res);
 }
 
 enum skb_drop_reason ip_route_input_noref(struct sk_buff *skb, __be32 daddr,
-					  __be32 saddr, u8 tos,
+					  __be32 saddr, dscp_t dscp,
 					  struct net_device *dev)
 {
 	enum skb_drop_reason reason;
 	struct fib_result res;
 
-	tos &= INET_DSCP_MASK;
 	rcu_read_lock();
-	reason = ip_route_input_rcu(skb, daddr, saddr, tos, dev, &res);
+	reason = ip_route_input_rcu(skb, daddr, saddr, dscp, dev, &res);
 	rcu_read_unlock();
 
 	return reason;
@@ -2674,7 +2672,6 @@ struct rtable *ip_route_output_key_hash(struct net *net, struct flowi4 *fl4,
 	struct rtable *rth;
 
 	fl4->flowi4_iif = LOOPBACK_IFINDEX;
-	fl4->flowi4_tos &= INET_DSCP_MASK;
 
 	rcu_read_lock();
 	rth = ip_route_output_key_hash_rcu(net, fl4, &res, skb);
@@ -3279,6 +3276,7 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
 	struct flowi4 fl4 = {};
 	__be32 dst = 0;
 	__be32 src = 0;
+	dscp_t dscp;
 	kuid_t uid;
 	u32 iif;
 	int err;
@@ -3293,6 +3291,7 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
 	dst = tb[RTA_DST] ? nla_get_in_addr(tb[RTA_DST]) : 0;
 	iif = tb[RTA_IIF] ? nla_get_u32(tb[RTA_IIF]) : 0;
 	mark = tb[RTA_MARK] ? nla_get_u32(tb[RTA_MARK]) : 0;
+	dscp = inet_dsfield_to_dscp(rtm->rtm_tos);
 	if (tb[RTA_UID])
 		uid = make_kuid(current_user_ns(), nla_get_u32(tb[RTA_UID]));
 	else
@@ -3317,7 +3316,7 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
 
 	fl4.daddr = dst;
 	fl4.saddr = src;
-	fl4.flowi4_tos = rtm->rtm_tos & INET_DSCP_MASK;
+	fl4.flowi4_dscp = dscp;
 	fl4.flowi4_oif = tb[RTA_OIF] ? nla_get_u32(tb[RTA_OIF]) : 0;
 	fl4.flowi4_mark = mark;
 	fl4.flowi4_uid = uid;
@@ -3341,9 +3340,8 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
 		fl4.flowi4_iif = iif; /* for rt_fill_info */
 		skb->dev	= dev;
 		skb->mark	= mark;
-		err = ip_route_input_rcu(skb, dst, src,
-					 rtm->rtm_tos & INET_DSCP_MASK,
-					 dev, &res) ? -EINVAL : 0;
+		err = ip_route_input_rcu(skb, dst, src, dscp, dev,
+					 &res) ? -EINVAL : 0;
 
 		rt = skb_rtable(skb);
 		if (err == 0 && rt->dst.error)

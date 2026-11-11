@@ -32,6 +32,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 
+#include <net/flow.h>
 #include <net/inet_dscp.h>
 #include <net/ip.h>
 #include <net/protocol.h>
@@ -293,7 +294,7 @@ __be32 fib_compute_spec_dst(struct sk_buff *skb)
 			.flowi4_iif = LOOPBACK_IFINDEX,
 			.flowi4_l3mdev = l3mdev_master_ifindex_rcu(dev),
 			.daddr = ip_hdr(skb)->saddr,
-			.flowi4_tos = ip_hdr(skb)->tos & INET_DSCP_MASK,
+			.flowi4_dscp = ip4h_dscp(ip_hdr(skb)),
 			.flowi4_scope = scope,
 			.flowi4_mark = vmark ? skb->mark : 0,
 		};
@@ -342,7 +343,7 @@ EXPORT_SYMBOL_GPL(fib_info_nh_uses_dev);
  * called with rcu_read_lock()
  */
 static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
-				 u8 tos, int oif, struct net_device *dev,
+				 dscp_t dscp, int oif, struct net_device *dev,
 				 int rpf, struct in_device *idev, u32 *itag)
 {
 	struct net *net = dev_net(dev);
@@ -358,7 +359,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
 	fl4.flowi4_iif = oif ? : LOOPBACK_IFINDEX;
 	fl4.daddr = src;
 	fl4.saddr = dst;
-	fl4.flowi4_tos = tos;
+	fl4.flowi4_dscp = dscp;
 	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
 	fl4.flowi4_tun_key.tun_id = 0;
 	fl4.flowi4_flags = 0;
@@ -426,7 +427,7 @@ e_rpf:
 
 /* Ignore rp_filter for packets protected by IPsec. */
 int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
-			u8 tos, int oif, struct net_device *dev,
+			dscp_t dscp, int oif, struct net_device *dev,
 			struct in_device *idev, u32 *itag)
 {
 	int r = secpath_exists(skb) ? 0 : IN_DEV_RPFILTER(idev);
@@ -455,7 +456,8 @@ ok:
 	}
 
 full_check:
-	return __fib_validate_source(skb, src, dst, tos, oif, dev, r, idev, itag);
+	return __fib_validate_source(skb, src, dst, dscp, oif, dev, r, idev,
+				     itag);
 }
 
 static inline __be32 sk_extract_addr(struct sockaddr *addr)
@@ -1371,7 +1373,7 @@ static void nl_fib_lookup(struct net *net, struct fib_result_nl *frn)
 	struct flowi4           fl4 = {
 		.flowi4_mark = frn->fl_mark,
 		.daddr = frn->fl_addr,
-		.flowi4_tos = frn->fl_tos & INET_DSCP_MASK,
+		.flowi4_dscp = inet_dsfield_to_dscp(frn->fl_tos),
 		.flowi4_scope = frn->fl_scope,
 	};
 	struct fib_table *tb;

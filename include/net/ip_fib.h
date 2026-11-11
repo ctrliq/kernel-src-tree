@@ -440,7 +440,7 @@ static inline bool fib4_rules_early_flow_dissect(struct net *net,
 
 static inline bool fib_dscp_masked_match(dscp_t dscp, const struct flowi4 *fl4)
 {
-	return dscp == inet_dsfield_to_dscp(RT_TOS(fl4->flowi4_tos));
+	return dscp == (fl4->flowi4_dscp & INET_DSCP_LEGACY_TOS_MASK);
 }
 
 /* Exported by fib_frontend.c */
@@ -451,7 +451,7 @@ int fib_gw_from_via(struct fib_config *cfg, struct nlattr *nla,
 __be32 fib_compute_spec_dst(struct sk_buff *skb);
 bool fib_info_nh_uses_dev(struct fib_info *fi, const struct net_device *dev);
 int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
-			u8 tos, int oif, struct net_device *dev,
+			dscp_t dscp, int oif, struct net_device *dev,
 			struct in_device *idev, u32 *itag);
 
 static inline enum skb_drop_reason

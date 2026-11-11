@@ -289,7 +289,7 @@ struct dst_entry *__xfrm_dst_lookup(int family,
 EXPORT_SYMBOL(__xfrm_dst_lookup);
 
 static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
-						int tos, int oif,
+						dscp_t dscp, int oif,
 						xfrm_address_t *prev_saddr,
 						xfrm_address_t *prev_daddr,
 						int family, u32 mark)
@@ -312,7 +312,7 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
 	params.net = net;
 	params.saddr = saddr;
 	params.daddr = daddr;
-	params.tos = tos;
+	params.dscp = dscp;
 	params.oif = oif;
 	params.mark = mark;
 	params.ipproto = x->id.proto;
@@ -2567,10 +2567,10 @@ xfrm_tmpl_resolve(struct xfrm_policy **pols, int npols, const struct flowi *fl,
 
 }
 
-static int xfrm_get_tos(const struct flowi *fl, int family)
+static dscp_t xfrm_get_dscp(const struct flowi *fl, int family)
 {
 	if (family == AF_INET)
-		return fl->u.ip4.flowi4_tos & INET_DSCP_MASK;
+		return fl->u.ip4.flowi4_dscp;
 
 	return 0;
 }
@@ -2658,13 +2658,13 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 	int header_len = 0;
 	int nfheader_len = 0;
 	int trailer_len = 0;
-	int tos;
 	int family = policy->selector.family;
 	xfrm_address_t saddr, daddr;
+	dscp_t dscp;
 
 	xfrm_flowi_addr_get(fl, &saddr, &daddr, family);
 
-	tos = xfrm_get_tos(fl, family);
+	dscp = xfrm_get_dscp(fl, family);
 
 	dst_hold(dst);
 
@@ -2712,8 +2712,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 				family = xfrm[i]->props.family;
 
 			oif = fl->flowi_oif ? : fl->flowi_l3mdev;
-			dst = xfrm_dst_lookup(xfrm[i], tos, oif,
-					      &saddr, &daddr, family, mark);
+			dst = xfrm_dst_lookup(xfrm[i], dscp, oif, &saddr,
+					      &daddr, family, mark);
 			err = PTR_ERR(dst);
 			if (IS_ERR(dst))
 				goto put_states;
@@ -3432,7 +3432,7 @@ decode_session4(const struct xfrm_flow_keys *flkeys, struct flowi *fl, bool reve
 	}
 
 	fl4->flowi4_proto = flkeys->basic.ip_proto;
-	fl4->flowi4_tos = flkeys->ip.tos & ~INET_ECN_MASK;
+	fl4->flowi4_dscp = inet_dsfield_to_dscp(flkeys->ip.tos);
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
@@ -3564,7 +3564,7 @@ static bool xfrm_icmp_flow_decode(struct sk_buff *skb, unsigned short family,
 
 	fl1->flowi_oif = fl->flowi_oif;
 	fl1->flowi_mark = fl->flowi_mark;
-	fl1->flowi_tos = fl->flowi_tos;
+	fl1->flowi_dscp = fl->flowi_dscp;
 	nf_nat_decode_session(newskb, fl1, family);
 	ret = false;
 

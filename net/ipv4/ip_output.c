@@ -63,6 +63,7 @@
 #include <linux/stat.h>
 #include <linux/init.h>
 
+#include <net/flow.h>
 #include <net/snmp.h>
 #include <net/ip.h>
 #include <net/protocol.h>
@@ -484,24 +485,16 @@ int __ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl,
 	/* Make sure we can route this packet. */
 	rt = dst_rtable(__sk_dst_check(sk, 0));
 	if (!rt) {
-		__be32 daddr;
+		inet_sk_init_flowi4(inet, fl4);
 
-		/* Use correct destination address if we have options. */
-		daddr = inet->inet_daddr;
-		if (inet_opt && inet_opt->opt.srr)
-			daddr = inet_opt->opt.faddr;
+		/* sctp_v4_xmit() uses its own DSCP value */
+		fl4->flowi4_dscp = inet_dsfield_to_dscp(tos);
 
 		/* If this fails, retransmit mechanism of transport layer will
 		 * keep trying until route appears or the connection times
 		 * itself out.
 		 */
-		rt = ip_route_output_ports(net, fl4, sk,
-					   daddr, inet->inet_saddr,
-					   inet->inet_dport,
-					   inet->inet_sport,
-					   sk->sk_protocol,
-					   tos & INET_DSCP_MASK,
-					   sk->sk_bound_dev_if);
+		rt = ip_route_output_flow(net, fl4, sk);
 		if (IS_ERR(rt))
 			goto no_route;
 		sk_setup_caps(sk, &rt->dst);
