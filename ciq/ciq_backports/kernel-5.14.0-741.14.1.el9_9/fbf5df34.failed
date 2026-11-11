@@ -1,0 +1,191 @@
+tools: ynl: add scope qualifier for definitions
+
+jira KERNEL-1876
+Rebuild_History Non-Buildable kernel-5.14.0-741.14.1.el9_9
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit fbf5df34a4dbcd09d433dd4f0916bf9b2ddb16de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.14.1.el9_9/fbf5df34.failed
+
+Using definitions in kernel policies is awkward right now.
+On one hand we want defines for max values and such.
+On the other we don't have a way of adding kernel-only defines.
+Adding unnecessary defines to uAPI is a bad idea, we won't
+be able to delete them. And when it comes to policy user
+space should just query it via the policy dump, not use
+hard coded defines.
+
+Add a "scope" property to definitions, which will let us tell
+the codegen that a definition is for kernel use only. Support
+following values:
+  - uapi: render into the uAPI header (default, today's behavior)
+  - kernel: render to kernel header only
+  - user: same as kernel but for the user-side generated header
+
+Definitions may have a header property (definition is "external",
+provided by existing header). Extend the scope to headers, too.
+If definition has both scope and header properties we will only
+generate the includes in the right scope.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://patch.msgid.link/20260510192904.3987113-8-kuba@kernel.org
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit fbf5df34a4dbcd09d433dd4f0916bf9b2ddb16de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/net/ynl/ynl-gen-c.py
+diff --cc tools/net/ynl/ynl-gen-c.py
+index 6073c75aebe2,cdc3646f2642..000000000000
+--- a/tools/net/ynl/ynl-gen-c.py
++++ b/tools/net/ynl/ynl-gen-c.py
+@@@ -2508,6 -3210,11 +2508,14 @@@ def render_uapi(family, cw)
+  
+      defines = []
+      for const in family['definitions']:
+++<<<<<<< HEAD:tools/net/ynl/ynl-gen-c.py
+++=======
++         if const.get('header'):
++             continue
++         if const.get('scope', 'uapi') != 'uapi':
++             continue
++ 
+++>>>>>>> fbf5df34a4db (tools: ynl: add scope qualifier for definitions):tools/net/ynl/pyynl/ynl_gen_c.py
+          if const['type'] != 'const':
+              cw.writes_defines(defines)
+              defines = []
+@@@ -2632,8 -3341,31 +2640,27 @@@
+      cw.p(f'#endif /* {hdr_prot} */')
+  
+  
++ def render_scoped_consts(family, cw, scope):
++     defines = []
++     for const in family['definitions']:
++         if const['type'] != 'const':
++             continue
++         if const.get('header'):
++             continue
++         if const.get('scope') != scope:
++             continue
++         name_pfx = const.get('name-prefix', f"{family.ident_name}-")
++         defines.append([
++             c_upper(family.get('c-define-name',
++                                f"{name_pfx}{const['name']}")),
++             const['value']])
++     if defines:
++         cw.writes_defines(defines)
++         cw.nl()
++ 
++ 
+  def _render_user_ntf_entry(ri, op):
+ -    if not ri.family.is_classic():
+ -        ri.cw.block_start(line=f"[{op.enum_name}] = ")
+ -    else:
+ -        crud_op = ri.family.req_by_value[op.rsp_value]
+ -        ri.cw.block_start(line=f"[{crud_op.enum_name}] = ")
+ +    ri.cw.block_start(line=f"[{op.enum_name}] = ")
+      ri.cw.p(f".alloc_sz\t= sizeof({type_name(ri, 'event')}),")
+      ri.cw.p(f".cb\t\t= {op_prefix(ri, 'reply', deref=True)}_parse,")
+      ri.cw.p(f".policy\t\t= &{ri.struct['reply'].render_name}_nest,")
+@@@ -2777,9 -3524,13 +2804,19 @@@ def main()
+              cw.p(f'#include "{hdr_file}"')
+              cw.p('#include "ynl.h"')
+          headers = []
+++<<<<<<< HEAD:tools/net/ynl/ynl-gen-c.py
+ +    for definition in parsed['definitions']:
+ +        if 'header' in definition:
+ +            headers.append(definition['header'])
+++=======
++     for definition in parsed['definitions'] + parsed['attribute-sets']:
++         if 'header' not in definition:
++             continue
++         scope = definition.get('scope', 'uapi')
++         if scope != 'uapi' and scope != args.mode:
++             continue
++         headers.append(definition['header'])
+++>>>>>>> fbf5df34a4db (tools: ynl: add scope qualifier for definitions):tools/net/ynl/pyynl/ynl_gen_c.py
+      if args.mode == 'user':
+          headers.append(parsed.uapi_header)
+      seen_header = []
+diff --git a/Documentation/netlink/genetlink-c.yaml b/Documentation/netlink/genetlink-c.yaml
+index 9660ffb1ed6a..cb80548b34a2 100644
+--- a/Documentation/netlink/genetlink-c.yaml
++++ b/Documentation/netlink/genetlink-c.yaml
+@@ -68,6 +68,15 @@ properties:
+         header:
+           description: For C-compatible languages, header which already defines this value.
+           type: string
++        scope:
++          description: |
++            Visibility of this definition. "uapi" (default) renders into
++            the uAPI header, "kernel" renders into the kernel-side
++            generated header, "user" renders into the user-side
++            generated header. When combined with `header:`, the
++            definition is not rendered, and the named header is
++            included only by code matching the scope.
++          enum: [ uapi, kernel, user ]
+         type:
+           enum: [ const, enum, flags ]
+         doc:
+diff --git a/Documentation/netlink/genetlink-legacy.yaml b/Documentation/netlink/genetlink-legacy.yaml
+index 16380e12cabe..cd5fa4fd8832 100644
+--- a/Documentation/netlink/genetlink-legacy.yaml
++++ b/Documentation/netlink/genetlink-legacy.yaml
+@@ -79,6 +79,15 @@ properties:
+         header:
+           description: For C-compatible languages, header which already defines this value.
+           type: string
++        scope:
++          description: |
++            Visibility of this definition. "uapi" (default) renders into
++            the uAPI header, "kernel" renders into the kernel-side
++            generated header, "user" renders into the user-side
++            generated header. When combined with `header:`, the
++            definition is not rendered, and the named header is
++            included only by code matching the scope.
++          enum: [ uapi, kernel, user ]
+         type:
+           enum: [ const, enum, flags, struct ] # Trim
+         doc:
+diff --git a/Documentation/netlink/genetlink.yaml b/Documentation/netlink/genetlink.yaml
+index b036227b46f1..b1b721c47706 100644
+--- a/Documentation/netlink/genetlink.yaml
++++ b/Documentation/netlink/genetlink.yaml
+@@ -51,6 +51,15 @@ properties:
+         header:
+           description: For C-compatible languages, header which already defines this value.
+           type: string
++        scope:
++          description: |
++            Visibility of this definition. "uapi" (default) renders into
++            the uAPI header, "kernel" renders into the kernel-side
++            generated header, "user" renders into the user-side
++            generated header. When combined with `header:`, the
++            definition is not rendered, and the named header is
++            included only by code matching the scope.
++          enum: [ uapi, kernel, user ]
+         type:
+           enum: [ const, enum, flags ]
+         doc:
+diff --git a/Documentation/netlink/netlink-raw.yaml b/Documentation/netlink/netlink-raw.yaml
+index 1b0772c8e333..3479db1b223f 100644
+--- a/Documentation/netlink/netlink-raw.yaml
++++ b/Documentation/netlink/netlink-raw.yaml
+@@ -75,6 +75,15 @@ properties:
+         header:
+           description: For C-compatible languages, header which already defines this value.
+           type: string
++        scope:
++          description: |
++            Visibility of this definition. "uapi" (default) renders into
++            the uAPI header, "kernel" renders into the kernel-side
++            generated header, "user" renders into the user-side
++            generated header. When combined with `header:`, the
++            definition is not rendered, and the named header is
++            included only by code matching the scope.
++          enum: [ uapi, kernel, user ]
+         type:
+           enum: [ const, enum, flags, struct ] # Trim
+         doc:
+* Unmerged path tools/net/ynl/ynl-gen-c.py
