@@ -179,4 +179,23 @@ int BPF_PROG(trusted_acq_rel, struct task_struct *task, u64 clone_flags)
 	return subprog_trusted_acq_rel(task);
 }
 
+__weak int subprog_write_mem_arg(int *p)
+{
+	if (!p)
+		return 0;
+
+	*p = 42;
+	return 0;
+}
+
+SEC("?tp_btf/task_newtask")
+__failure
+__msg("only read is supported")
+int trusted_btf_field_to_writable_mem(void *ctx)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+
+	return subprog_write_mem_arg(&task->prio);
+}
+
 char _license[] SEC("license") = "GPL";
