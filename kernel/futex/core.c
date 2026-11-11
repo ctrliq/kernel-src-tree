@@ -1668,7 +1668,7 @@ static bool futex_ref_is_dead(struct futex_private_hash *fph)
 	return atomic_long_read(&mm->futex_atomic) == 0;
 }
 
-int futex_mm_init(struct mm_struct *mm)
+void futex_mm_init(struct mm_struct *mm)
 {
 	mutex_init(&mm->futex_hash_lock);
 	RCU_INIT_POINTER(mm->futex_phash, NULL);
@@ -1677,7 +1677,6 @@ int futex_mm_init(struct mm_struct *mm)
 	mm->futex_ref = NULL;
 	atomic_long_set(&mm->futex_atomic, 0);
 	mm->futex_batches = get_state_synchronize_rcu();
-	return 0;
 }
 
 void futex_hash_free(struct mm_struct *mm)
