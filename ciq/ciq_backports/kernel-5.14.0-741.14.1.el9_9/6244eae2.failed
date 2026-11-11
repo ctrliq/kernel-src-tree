@@ -1,0 +1,100 @@
+drm/amdgpu: reject mapping a reserved doorbell to a new queue
+
+jira KERNEL-1876
+cve CVE-2026-68103
+Rebuild_History Non-Buildable kernel-5.14.0-741.14.1.el9_9
+commit-author Zhu Lingshan <lingshan.zhu@amd.com>
+commit 6244eae22966350db52faf9c1369d3b2ffc5de4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.14.1.el9_9/6244eae2.failed
+
+When creating an user-queue, the user space
+provides a doorbell BO handle and an offset within
+the bo to obtain a doorbell.
+
+However current implementation using xa_store_irq()
+to store a doorbell, which allows a later queue created
+with the same BO and offset parameters to overwrite an
+existing queue and doorbell mapping.
+
+This can cause problems like misrouting fence IRQ
+processing to a wrong queue, and mislead the cleanup
+process of one queue erasing the mapping of another queue.
+
+This commit fixes this issue by replacing xa_store_irq with
+xa_insert_irq, which rejects mapping a reserved
+doorbell to a newly created queue
+
+	Signed-off-by: Zhu Lingshan <lingshan.zhu@amd.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 6244eae22966350db52faf9c1369d3b2ffc5de4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+index 0e015741ab24,82c8809d1d9c..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+@@@ -850,44 -696,23 +850,51 @@@ amdgpu_userq_create(struct drm_file *fi
+  	r = uq_funcs->mqd_create(queue, &args->in);
+  	if (r) {
+  		drm_file_err(uq_mgr->file, "Failed to create Queue\n");
+ -		goto clean_doorbell_bo;
+ +		amdgpu_userq_fence_driver_free(queue);
+ +		kfree(queue);
+ +		goto unlock;
+  	}
+  
+ -	/* Update VM owner at userq submit-time for page-fault attribution. */
+ -	amdgpu_vm_set_task_info(&fpriv->vm);
+ +	/* drop this refcount during queue destroy */
+ +	kref_init(&queue->refcount);
+  
+++<<<<<<< HEAD
+ +	/* Wait for mode-1 reset to complete */
+ +	down_read(&adev->reset_domain->sem);
+ +	r = xa_err(xa_store_irq(&adev->userq_doorbell_xa, index, queue, GFP_KERNEL));
+ +	if (r) {
+ +		kfree(queue);
+ +		up_read(&adev->reset_domain->sem);
+ +		goto unlock;
+ +	}
+++=======
++ 	r = xa_insert_irq(&adev->userq_doorbell_xa, index, queue,
++ 			  GFP_KERNEL);
++ 	if (r)
++ 		goto clean_mqd;
+++>>>>>>> 6244eae22966 (drm/amdgpu: reject mapping a reserved doorbell to a new queue)
+  
+ -	amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+ +	r = xa_alloc(&uq_mgr->userq_xa, &qid, queue,
+ +		     XA_LIMIT(1, AMDGPU_MAX_USERQ_COUNT), GFP_KERNEL);
+ +	if (r) {
+ +		drm_file_err(uq_mgr->file, "Failed to allocate a queue id\n");
+ +		amdgpu_userq_fence_driver_free(queue);
+ +		uq_funcs->mqd_destroy(queue);
+ +		kfree(queue);
+ +		r = -ENOMEM;
+ +		up_read(&adev->reset_domain->sem);
+ +		goto unlock;
+ +	}
+ +	up_read(&adev->reset_domain->sem);
+  
+  	/* don't map the queue if scheduling is halted */
+ -	if (!adev->userq_halt_for_enforce_isolation ||
+ -	    ((queue->queue_type != AMDGPU_HW_IP_GFX) &&
+ -	     (queue->queue_type != AMDGPU_HW_IP_COMPUTE))) {
+ +	if (adev->userq_halt_for_enforce_isolation &&
+ +	    ((queue->queue_type == AMDGPU_HW_IP_GFX) ||
+ +	     (queue->queue_type == AMDGPU_HW_IP_COMPUTE)))
+ +		skip_map_queue = true;
+ +	else
+ +		skip_map_queue = false;
+ +	if (!skip_map_queue) {
+  		r = amdgpu_userq_map_helper(queue);
+  		if (r) {
+  			drm_file_err(uq_mgr->file, "Failed to map Queue\n");
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
