@@ -346,7 +346,7 @@ static int nvm_write(void *priv, unsigned int offset, void *val, size_t bytes)
 	return ret;
 }
 
-static int tb_switch_nvm_add(struct tb_switch *sw)
+static int tb_switch_nvm_init(struct tb_switch *sw)
 {
 	struct tb_nvm *nvm;
 	int ret;
@@ -363,6 +363,26 @@ static int tb_switch_nvm_add(struct tb_switch *sw)
 	ret = tb_nvm_read_version(nvm);
 	if (ret)
 		goto err_nvm;
+
+	sw->nvm = nvm;
+	return 0;
+
+err_nvm:
+	tb_sw_dbg(sw, "NVM upgrade disabled\n");
+	sw->no_nvm_upgrade = true;
+	if (!IS_ERR(nvm))
+		tb_nvm_free(nvm);
+
+	return ret;
+}
+
+static int tb_switch_nvm_add(struct tb_switch *sw)
+{
+	struct tb_nvm *nvm = sw->nvm;
+	int ret;
+
+	if (!nvm)
+		return 0;
 
 	/*
 	 * If the switch is in safe-mode the only accessible portion of
@@ -382,14 +402,12 @@ static int tb_switch_nvm_add(struct tb_switch *sw)
 			goto err_nvm;
 	}
 
-	sw->nvm = nvm;
 	return 0;
 
 err_nvm:
 	tb_sw_dbg(sw, "NVM upgrade disabled\n");
 	sw->no_nvm_upgrade = true;
-	if (!IS_ERR(nvm))
-		tb_nvm_free(nvm);
+	tb_nvm_free(nvm);
 
 	return ret;
 }
@@ -3309,6 +3327,10 @@ int tb_switch_add(struct tb_switch *sw)
 		dev_err(&sw->dev, "failed to add DMA port\n");
 		return ret;
 	}
+
+	ret = tb_switch_nvm_init(sw);
+	if (ret)
+		return ret;
 
 	if (!sw->safe_mode) {
 		tb_switch_credits_init(sw);
