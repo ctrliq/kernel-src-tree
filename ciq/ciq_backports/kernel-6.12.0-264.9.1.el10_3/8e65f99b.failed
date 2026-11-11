@@ -1,0 +1,240 @@
+cxl/region: Add helper to check Soft Reserved containment by CXL regions
+
+jira KERNEL-1884
+Rebuild_History Non-Buildable kernel-6.12.0-264.9.1.el10_3
+commit-author Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+commit 8e65f99b525b3f49b87db0db0d0e0fc1a0c53e40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.9.1.el10_3/8e65f99b.failed
+
+Add a helper to determine whether a given Soft Reserved memory range is
+fully contained within the committed CXL region.
+
+This helper provides a primitive for policy decisions in subsequent
+patches such as co-ordination with dax_hmem to determine whether CXL has
+fully claimed ownership of Soft Reserved memory ranges.
+
+	Signed-off-by: Smita Koralahalli <Smita.KoralahalliChannabasappa@amd.com>
+	Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+	Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://patch.msgid.link/20260322195343.206900-8-Smita.KoralahalliChannabasappa@amd.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit 8e65f99b525b3f49b87db0db0d0e0fc1a0c53e40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cxl/core/region.c
+diff --cc drivers/cxl/core/region.c
+index 6c32ed492a33,f7b20f60ac5c..000000000000
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@@ -10,6 -11,8 +10,11 @@@
+  #include <linux/sort.h>
+  #include <linux/idr.h>
+  #include <linux/memory-tiers.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/string_choices.h>
++ #include <cxl/cxl.h>
+++>>>>>>> 8e65f99b525b (cxl/region: Add helper to check Soft Reserved containment by CXL regions)
+  #include <cxlmem.h>
+  #include <cxl.h>
+  #include "core.h"
+@@@ -3587,6 -4040,169 +3592,172 @@@ static void shutdown_notifiers(void *_c
+  	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void remove_debugfs(void *dentry)
++ {
++ 	debugfs_remove_recursive(dentry);
++ }
++ 
++ static int validate_region_offset(struct cxl_region *cxlr, u64 offset)
++ {
++ 	struct cxl_region_params *p = &cxlr->params;
++ 	resource_size_t region_size;
++ 	u64 hpa;
++ 
++ 	if (offset < p->cache_size) {
++ 		dev_err(&cxlr->dev,
++ 			"Offset %#llx is within extended linear cache %pa\n",
++ 			offset, &p->cache_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	region_size = resource_size(p->res);
++ 	if (offset >= region_size) {
++ 		dev_err(&cxlr->dev, "Offset %#llx exceeds region size %pa\n",
++ 			offset, &region_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	hpa = p->res->start + offset;
++ 	if (hpa < p->res->start || hpa > p->res->end) {
++ 		dev_err(&cxlr->dev, "HPA %#llx not in region %pr\n", hpa,
++ 			p->res);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int cxl_region_debugfs_poison_inject(void *data, u64 offset)
++ {
++ 	struct dpa_result result = { .dpa = ULLONG_MAX, .cxlmd = NULL };
++ 	struct cxl_region *cxlr = data;
++ 	int rc;
++ 
++ 	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
++ 	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
++ 		return rc;
++ 
++ 	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
++ 	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
++ 		return rc;
++ 
++ 	if (validate_region_offset(cxlr, offset))
++ 		return -EINVAL;
++ 
++ 	offset -= cxlr->params.cache_size;
++ 	rc = region_offset_to_dpa_result(cxlr, offset, &result);
++ 	if (rc || !result.cxlmd || result.dpa == ULLONG_MAX) {
++ 		dev_dbg(&cxlr->dev,
++ 			"Failed to resolve DPA for region offset %#llx rc %d\n",
++ 			offset, rc);
++ 
++ 		return rc ? rc : -EINVAL;
++ 	}
++ 
++ 	return cxl_inject_poison_locked(result.cxlmd, result.dpa);
++ }
++ 
++ DEFINE_DEBUGFS_ATTRIBUTE(cxl_poison_inject_fops, NULL,
++ 			 cxl_region_debugfs_poison_inject, "%llx\n");
++ 
++ static int cxl_region_debugfs_poison_clear(void *data, u64 offset)
++ {
++ 	struct dpa_result result = { .dpa = ULLONG_MAX, .cxlmd = NULL };
++ 	struct cxl_region *cxlr = data;
++ 	int rc;
++ 
++ 	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
++ 	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem)))
++ 		return rc;
++ 
++ 	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
++ 	if ((rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem)))
++ 		return rc;
++ 
++ 	if (validate_region_offset(cxlr, offset))
++ 		return -EINVAL;
++ 
++ 	offset -= cxlr->params.cache_size;
++ 	rc = region_offset_to_dpa_result(cxlr, offset, &result);
++ 	if (rc || !result.cxlmd || result.dpa == ULLONG_MAX) {
++ 		dev_dbg(&cxlr->dev,
++ 			"Failed to resolve DPA for region offset %#llx rc %d\n",
++ 			offset, rc);
++ 
++ 		return rc ? rc : -EINVAL;
++ 	}
++ 
++ 	return cxl_clear_poison_locked(result.cxlmd, result.dpa);
++ }
++ 
++ DEFINE_DEBUGFS_ATTRIBUTE(cxl_poison_clear_fops, NULL,
++ 			 cxl_region_debugfs_poison_clear, "%llx\n");
++ 
++ static int cxl_region_setup_poison(struct cxl_region *cxlr)
++ {
++ 	struct device *dev = &cxlr->dev;
++ 	struct cxl_region_params *p = &cxlr->params;
++ 	struct dentry *dentry;
++ 
++ 	/*
++ 	 * Do not enable poison injection in Normalized Address mode.
++ 	 * Conversion between SPA and DPA is required for this, but it is
++ 	 * not supported in this mode.
++ 	 */
++ 	if (test_bit(CXL_REGION_F_NORMALIZED_ADDRESSING, &cxlr->flags))
++ 		return 0;
++ 
++ 	/* Create poison attributes if all memdevs support the capabilities */
++ 	for (int i = 0; i < p->nr_targets; i++) {
++ 		struct cxl_endpoint_decoder *cxled = p->targets[i];
++ 		struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
++ 
++ 		if (!cxl_memdev_has_poison_cmd(cxlmd, CXL_POISON_ENABLED_INJECT) ||
++ 		    !cxl_memdev_has_poison_cmd(cxlmd, CXL_POISON_ENABLED_CLEAR))
++ 			return 0;
++ 	}
++ 
++ 	dentry = cxl_debugfs_create_dir(dev_name(dev));
++ 	debugfs_create_file("inject_poison", 0200, dentry, cxlr,
++ 			    &cxl_poison_inject_fops);
++ 	debugfs_create_file("clear_poison", 0200, dentry, cxlr,
++ 			    &cxl_poison_clear_fops);
++ 
++ 	return devm_add_action_or_reset(dev, remove_debugfs, dentry);
++ }
++ 
++ static int region_contains_resource(struct device *dev, void *data)
++ {
++ 	struct resource *res = data;
++ 	struct cxl_region *cxlr;
++ 	struct cxl_region_params *p;
++ 
++ 	if (!is_cxl_region(dev))
++ 		return 0;
++ 
++ 	cxlr = to_cxl_region(dev);
++ 	p = &cxlr->params;
++ 
++ 	if (p->state != CXL_CONFIG_COMMIT)
++ 		return 0;
++ 
++ 	if (!p->res)
++ 		return 0;
++ 
++ 	return resource_contains(p->res, res) ? 1 : 0;
++ }
++ 
++ bool cxl_region_contains_resource(struct resource *res)
++ {
++ 	guard(rwsem_read)(&cxl_rwsem.region);
++ 	return bus_for_each_dev(&cxl_bus_type, NULL, res,
++ 				region_contains_resource) != 0;
++ }
++ EXPORT_SYMBOL_GPL(cxl_region_contains_resource);
++ 
+++>>>>>>> 8e65f99b525b (cxl/region: Add helper to check Soft Reserved containment by CXL regions)
+  static int cxl_region_can_probe(struct cxl_region *cxlr)
+  {
+  	struct cxl_region_params *p = &cxlr->params;
+* Unmerged path drivers/cxl/core/region.c
+diff --git a/include/cxl/cxl.h b/include/cxl/cxl.h
+new file mode 100644
+index 000000000000..b12d3d0f6658
+--- /dev/null
++++ b/include/cxl/cxl.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Advanced Micro Devices, Inc. */
++#ifndef _CXL_H_
++#define _CXL_H_
++
++#ifdef CONFIG_CXL_REGION
++bool cxl_region_contains_resource(struct resource *res);
++#else
++static inline bool cxl_region_contains_resource(struct resource *res)
++{
++	return false;
++}
++#endif
++
++#endif /* _CXL_H_ */
