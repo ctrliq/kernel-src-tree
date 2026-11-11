@@ -28,7 +28,6 @@ static void cxl_memdev_release(struct device *dev)
 	struct device *parent = dev->parent;
 
 	ida_free(&cxl_memdev_ida, cxlmd->id);
-	devm_cxl_memdev_edac_release(cxlmd);
 	kfree(cxlmd);
 	put_device(parent);
 }
