@@ -189,7 +189,7 @@ static struct raw_dev *dev_new(void)
 {
 	struct raw_dev *dev;
 
-	dev = kzalloc_obj(*dev, GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 	if (!dev)
 		return NULL;
 	/* Matches kref_put() in raw_release(). */
@@ -1250,7 +1250,7 @@ static int raw_ioctl_eps_info(struct raw_dev *dev, unsigned long value)
 	struct usb_raw_eps_info *info;
 	struct raw_ep *ep;
 
-	info = kzalloc_obj(*info, GFP_KERNEL);
+	info = kzalloc_obj(*info);
 	if (!info) {
 		ret = -ENOMEM;
 		goto out;

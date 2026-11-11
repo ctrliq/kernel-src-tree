@@ -515,7 +515,7 @@ uvc_video_alloc_requests(struct uvc_video *video)
 		 * (video->ep->mult);
 
 	for (i = 0; i < video->uvc_num_requests; i++) {
-		ureq = kzalloc_obj(struct uvc_request, GFP_KERNEL);
+		ureq = kzalloc_obj(struct uvc_request);
 		if (ureq == NULL)
 			goto error;
 

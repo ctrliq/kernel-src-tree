@@ -157,7 +157,7 @@ static int uvcg_config_create_group(struct config_group *parent,
 {
 	struct config_group *group;
 
-	group = kzalloc_obj(*group, GFP_KERNEL);
+	group = kzalloc_obj(*group);
 	if (!group)
 		return -ENOMEM;
 
@@ -269,7 +269,7 @@ static struct config_item *uvcg_control_header_make(struct config_group *group,
 {
 	struct uvcg_control_header *h;
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -1272,7 +1272,7 @@ static struct config_item *uvcg_extension_make(struct config_group *group, const
 	opts_item = group->cg_item.ci_parent->ci_parent;
 	opts = to_f_uvc_opts(opts_item);
 
-	xu = kzalloc_obj(*xu, GFP_KERNEL);
+	xu = kzalloc_obj(*xu);
 	if (!xu)
 		return ERR_PTR(-ENOMEM);
 
@@ -1436,7 +1436,7 @@ static int uvcg_control_class_create_children(struct config_group *parent)
 	for (i = 0; i < ARRAY_SIZE(names); ++i) {
 		struct uvcg_control_class_group *group;
 
-		group = kzalloc_obj(*group, GFP_KERNEL);
+		group = kzalloc_obj(*group);
 		if (!group)
 			return -ENOMEM;
 
@@ -1784,7 +1784,7 @@ static int uvcg_streaming_header_allow_link(struct config_item *src,
 
 	uvcg_format_set_indices(to_config_group(target));
 
-	format_ptr = kzalloc_obj(*format_ptr, GFP_KERNEL);
+	format_ptr = kzalloc_obj(*format_ptr);
 	if (!format_ptr) {
 		ret = -ENOMEM;
 		goto out;
@@ -1898,7 +1898,7 @@ static struct config_item
 {
 	struct uvcg_streaming_header *h;
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -2162,7 +2162,7 @@ static struct config_item *uvcg_frame_make(struct config_group *group,
 	struct config_item *opts_item;
 	struct uvcg_frame_ptr *frame_ptr;
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -2196,7 +2196,7 @@ static struct config_item *uvcg_frame_make(struct config_group *group,
 		return ERR_PTR(-EINVAL);
 	}
 
-	frame_ptr = kzalloc_obj(*frame_ptr, GFP_KERNEL);
+	frame_ptr = kzalloc_obj(*frame_ptr);
 	if (!frame_ptr) {
 		mutex_unlock(&opts->lock);
 		kfree(h);
@@ -2482,7 +2482,7 @@ static struct config_group *uvcg_uncompressed_make(struct config_group *group,
 	if (!color_match)
 		return ERR_PTR(-EINVAL);
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -2674,7 +2674,7 @@ static struct config_group *uvcg_mjpeg_make(struct config_group *group,
 	if (!color_match)
 		return ERR_PTR(-EINVAL);
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -2925,7 +2925,7 @@ static struct config_group *uvcg_framebased_make(struct config_group *group,
 	if (!color_match)
 		return ERR_PTR(-EINVAL);
 
-	h = kzalloc_obj(*h, GFP_KERNEL);
+	h = kzalloc_obj(*h);
 	if (!h)
 		return ERR_PTR(-ENOMEM);
 
@@ -3074,7 +3074,7 @@ static struct config_group *uvcg_color_matching_make(struct config_group *group,
 {
 	struct uvcg_color_matching *color_match;
 
-	color_match = kzalloc_obj(*color_match, GFP_KERNEL);
+	color_match = kzalloc_obj(*color_match);
 	if (!color_match)
 		return ERR_PTR(-ENOMEM);
 
@@ -3096,7 +3096,7 @@ static int uvcg_color_matching_create_children(struct config_group *parent)
 {
 	struct uvcg_color_matching *color_match;
 
-	color_match = kzalloc_obj(*color_match, GFP_KERNEL);
+	color_match = kzalloc_obj(*color_match);
 	if (!color_match)
 		return -ENOMEM;
 
@@ -3552,7 +3552,7 @@ static int uvcg_streaming_class_create_children(struct config_group *parent)
 	for (i = 0; i < ARRAY_SIZE(names); ++i) {
 		struct uvcg_streaming_class_group *group;
 
-		group = kzalloc_obj(*group, GFP_KERNEL);
+		group = kzalloc_obj(*group);
 		if (!group)
 			return -ENOMEM;
 
