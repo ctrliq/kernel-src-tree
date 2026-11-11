@@ -1,0 +1,236 @@
+xfrm: propagate -EINPROGRESS from validate_xmit_xfrm()
+
+jira KERNEL-1876
+cve CVE-2026-68426
+Rebuild_History Non-Buildable kernel-5.14.0-741.14.1.el9_9
+commit-author Petr Wozniak <petr.wozniak@gmail.com>
+commit 6860b467f569f732b11cbc588ae7e195e90e7e23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.14.1.el9_9/6860b467.failed
+
+validate_xmit_xfrm() returns NULL both when a packet is dropped and
+when it is stolen by async crypto (-EINPROGRESS from ->xmit()).
+Callers cannot distinguish the two cases.
+
+f53c723902d1 ("net: Add asynchronous callbacks for xfrm on layer 2.")
+changed the semantics of a NULL return from "dropped" to "stolen or
+dropped", but __dev_queue_xmit() was not updated.  On virtual/bridge
+interfaces (noqueue qdisc) __dev_queue_xmit() initialises rc=-ENOMEM
+and jumps to out: when skb is NULL, returning -ENOMEM to the caller
+even though the packet will be delivered correctly via xfrm_dev_resume().
+
+Return ERR_PTR(-EINPROGRESS) from validate_xmit_xfrm() for the async
+case so callers can tell it apart from a real drop.  Update
+__dev_queue_xmit() to handle ERR_PTR(-EINPROGRESS) from
+validate_xmit_skb() correctly.  Update validate_xmit_skb_list() to
+use IS_ERR_OR_NULL() so that ERR_PTR(-EINPROGRESS) is not mistakenly
+added to the transmitted list.
+
+Fixes: f53c723902d1 ("net: Add asynchronous callbacks for xfrm on layer 2.")
+	Suggested-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 6860b467f569f732b11cbc588ae7e195e90e7e23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index e31fb9b00708,5933c5dab09e..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3861,6 -3956,71 +3861,74 @@@ int skb_csum_hwoffload_help(struct sk_b
+  }
+  EXPORT_SYMBOL(skb_csum_hwoffload_help);
+  
+++<<<<<<< HEAD
+++=======
++ /* Checks if this SKB belongs to an HW offloaded socket
++  * and whether any SW fallbacks are required based on dev.
++  * Check decrypted mark in case skb_orphan() cleared socket.
++  */
++ static struct sk_buff *sk_validate_xmit_skb(struct sk_buff *skb,
++ 					    struct net_device *dev)
++ {
++ #ifdef CONFIG_SOCK_VALIDATE_XMIT
++ 	struct sk_buff *(*sk_validate)(struct sock *sk, struct net_device *dev,
++ 				       struct sk_buff *skb);
++ 	struct sock *sk = skb->sk;
++ 
++ 	sk_validate = NULL;
++ 	if (sk) {
++ 		if (sk_fullsock(sk))
++ 			sk_validate = sk->sk_validate_xmit_skb;
++ 		else if (sk_is_inet(sk) && sk->sk_state == TCP_TIME_WAIT)
++ 			sk_validate = inet_twsk(sk)->tw_validate_xmit_skb;
++ 	}
++ 
++ 	if (sk_validate) {
++ 		skb = sk_validate(sk, dev, skb);
++ 	} else if (unlikely(skb_is_decrypted(skb))) {
++ 		pr_warn_ratelimited("unencrypted skb with no associated socket - dropping\n");
++ 		kfree_skb(skb);
++ 		skb = NULL;
++ 	}
++ #endif
++ 
++ 	return skb;
++ }
++ 
++ static struct sk_buff *validate_xmit_unreadable_skb(struct sk_buff *skb,
++ 						    struct net_device *dev)
++ {
++ 	struct skb_shared_info *shinfo;
++ 	struct net_iov *niov;
++ 
++ 	if (likely(skb_frags_readable(skb) ||
++ 		   dev->netmem_tx == NETMEM_TX_NO_DMA))
++ 		goto out;
++ 
++ 	if (dev->netmem_tx == NETMEM_TX_NONE)
++ 		goto out_free;
++ 
++ 	shinfo = skb_shinfo(skb);
++ 
++ 	if (shinfo->nr_frags > 0) {
++ 		niov = netmem_to_net_iov(skb_frag_netmem(&shinfo->frags[0]));
++ 		if (net_is_devmem_iov(niov) &&
++ 		    READ_ONCE(net_devmem_iov_binding(niov)->dev) != dev)
++ 			goto out_free;
++ 	}
++ 
++ out:
++ 	return skb;
++ 
++ out_free:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ 
++ /* Returns the skb on success, NULL if dropped, or ERR_PTR(-EINPROGRESS)
++  * if stolen by async xfrm crypto (delivered via xfrm_dev_resume()).
++  */
+++>>>>>>> 6860b467f569 (xfrm: propagate -EINPROGRESS from validate_xmit_xfrm())
+  static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
+  {
+  	netdev_features_t features;
+@@@ -4616,45 -4849,61 +4684,66 @@@ int __dev_queue_xmit(struct sk_buff *sk
+  	 * Check this and shot the lock. It is not prone from deadlocks.
+  	 *Either shot noqueue qdisc, it is even simpler 8)
+  	 */
+ -	if (unlikely(!(dev->flags & IFF_UP))) {
+ -		reason = SKB_DROP_REASON_DEV_READY;
+ -		goto drop;
+ -	}
+ +	if (dev->flags & IFF_UP) {
+ +		int cpu = smp_processor_id(); /* ok because BHs are off */
+  
+ -	cpu = smp_processor_id(); /* ok because BHs are off */
+ +		/* Other cpus might concurrently change txq->xmit_lock_owner
+ +		 * to -1 or to their cpu id, but not to our id.
+ +		 */
+ +		if (READ_ONCE(txq->xmit_lock_owner) != cpu) {
+ +			if (dev_xmit_recursion())
+ +				goto recursion_alert;
+  
+ -	if (likely(!netif_tx_owned(txq, cpu))) {
+ -		bool is_list = false;
+ +			skb = validate_xmit_skb(skb, dev, &again);
+ +			if (!skb)
+ +				goto out;
+  
+ -		if (dev_xmit_recursion())
+ -			goto recursion_alert;
+ +			HARD_TX_LOCK(dev, txq, cpu);
+  
+++<<<<<<< HEAD
+ +			if (!netif_xmit_stopped(txq)) {
+ +				dev_xmit_recursion_inc();
+ +				skb = dev_hard_start_xmit(skb, dev, txq, &rc);
+ +				dev_xmit_recursion_dec();
+ +				if (dev_xmit_complete(rc)) {
+ +					HARD_TX_UNLOCK(dev, txq);
+ +					goto out;
+ +				}
+ +			}
+ +			HARD_TX_UNLOCK(dev, txq);
+ +			net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
+ +					     dev->name);
+ +		} else {
+ +			/* Recursion is detected! It is possible,
+ +			 * unfortunately
+++=======
++ 		skb = validate_xmit_skb(skb, dev, &again);
++ 		if (IS_ERR_OR_NULL(skb)) {
++ 			if (PTR_ERR(skb) == -EINPROGRESS)
++ 				rc = NET_XMIT_SUCCESS;
++ 			goto out;
++ 		}
++ 
++ 		HARD_TX_LOCK(dev, txq, cpu);
++ 
++ 		if (!netif_xmit_stopped(txq)) {
++ 			is_list = !!skb->next;
++ 
++ 			dev_xmit_recursion_inc();
++ 			skb = dev_hard_start_xmit(skb, dev, txq, &rc);
++ 			dev_xmit_recursion_dec();
++ 
++ 			/* GSO segments a single SKB into a list of frames.
++ 			 * TCP expects error to mean none of the data was sent.
+++>>>>>>> 6860b467f569 (xfrm: propagate -EINPROGRESS from validate_xmit_xfrm())
+  			 */
+ -			if (is_list)
+ -				rc = NETDEV_TX_OK;
+ -		}
+ -		HARD_TX_UNLOCK(dev, txq);
+ -		if (!skb) /* xmit completed */
+ -			goto out;
+ -
+ -		net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
+ -				     dev->name);
+ -		/* NETDEV_TX_BUSY or queue was stopped */
+ -		if (!is_list)
+ -			rc = -ENETDOWN;
+ -	} else {
+ -		/* Recursion is detected! It is possible unfortunately. */
+  recursion_alert:
+ -		net_crit_ratelimited("Dead loop on virtual device %s (net %llu), fix it urgently!\n",
+ -				     dev->name, dev_net(dev)->net_cookie);
+ -
+ -		rc = -ENETDOWN;
+ +			net_crit_ratelimited("Dead loop on virtual device %s, fix it urgently!\n",
+ +					     dev->name);
+ +		}
+  	}
+  
+ -	reason = SKB_DROP_REASON_RECURSION_LIMIT;
+ -drop:
+ +	rc = -ENETDOWN;
+  	rcu_read_unlock_bh();
+  
+  	dev_core_stats_tx_dropped_inc(dev);
+* Unmerged path net/core/dev.c
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 7492350184ab..115b137669ac 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -180,7 +180,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 		err = x->type_offload->xmit(x, skb, esp_features);
+ 		if (err) {
+ 			if (err == -EINPROGRESS)
+-				return NULL;
++				return ERR_PTR(-EINPROGRESS);
+ 
+ 			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ 			kfree_skb(skb);
+@@ -222,7 +222,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 		pskb = skb2;
+ 	}
+ 
+-	return skb;
++	return skb ? skb : ERR_PTR(-EINPROGRESS);
+ }
+ EXPORT_SYMBOL_GPL(validate_xmit_xfrm);
+ 
