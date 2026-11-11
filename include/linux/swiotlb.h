@@ -32,8 +32,12 @@ struct scatterlist;
 #define IO_TLB_SHIFT 11
 #define IO_TLB_SIZE (1 << IO_TLB_SHIFT)
 
-/* default to 64MB */
-#define IO_TLB_DEFAULT_SIZE (64UL<<20)
+/* compile-time default; overridable via CONFIG_SWIOTLB_DEFAULT_SIZE_MB */
+#ifdef CONFIG_SWIOTLB
+#define IO_TLB_DEFAULT_SIZE ((unsigned long)CONFIG_SWIOTLB_DEFAULT_SIZE_MB << 20)
+#else
+#define IO_TLB_DEFAULT_SIZE (64UL << 20)
+#endif
 
 unsigned long swiotlb_size_or_default(void);
 void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
@@ -98,10 +102,10 @@ struct io_tlb_pool {
  * @pools:	List of IO TLB memory pool descriptors (if dynamic).
  * @dyn_alloc:	Dynamic IO TLB pool allocation work.
  * @total_used:	The total number of slots in the pool that are currently used
- *		across all areas. Used only for calculating used_hiwater in
- *		debugfs.
- * @used_hiwater: The high water mark for total_used.  Used only for reporting
- *		in debugfs.
+ *		across all areas. Used only for calculating used_hiwater via boot
+ *		parameter swiotlb=track_hiwater and exposed via debugfs.
+ * @used_hiwater: The high water mark for total_used.  Can be enabled at boot
+ *		time via swiotlb=track_hiwater and exposed via debugfs.
  * @transient_nslabs: The total number of slots in all transient pools that
  *		are currently used across all areas.
  */
