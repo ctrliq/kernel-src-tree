@@ -24,6 +24,10 @@
 #include <scsi/scsi_transport.h>
 #include <scsi/scsi_transport_fc.h>
 
+#ifdef CONFIG_X86
+#include <asm/hypervisor.h>
+#endif
+
 #include "qla_target.h"
 
 /*
@@ -2652,6 +2656,19 @@ static struct isp_operations qla27xx_isp_ops = {
 	.initialize_adapter	= qla2x00_initialize_adapter,
 };
 
+/*
+ * RHEL-only: true when running as a Microsoft Hyper-V guest.
+ */
+static bool
+qla2x00_hyperv_guest(void)
+{
+#ifdef CONFIG_X86
+	return hypervisor_is_type(X86_HYPER_MS_HYPERV);
+#else
+	return false;
+#endif
+}
+
 static inline void
 qla2x00_set_isp_flags(struct qla_hw_data *ha)
 {
@@ -2822,11 +2839,43 @@ qla2x00_set_isp_flags(struct qla_hw_data *ha)
 	else {
 		/* Get adapter physical port no from interrupt pin register. */
 		pci_read_config_byte(ha->pdev, PCI_INTERRUPT_PIN, &ha->port_no);
-		if (IS_QLA25XX(ha) || IS_QLA2031(ha) ||
-		    IS_QLA27XX(ha) || IS_QLA28XX(ha))
-			ha->port_no--;
-		else
-			ha->port_no = !(ha->port_no & 1);
+		if (ha->port_no == 0 && qla2x00_hyperv_guest()) {
+			u32 v = 0;
+
+			/*
+			 * RHEL-only: pci-hyperv returns 0 for byte and word
+			 * reads of PCI_INTERRUPT_PIN ("PCI: hv: Return zero,
+			 * not garbage, when reading PCI_INTERRUPT_PIN"). With
+			 * Discrete Device Assignment every function is
+			 * presented as function 0, so PCI_FUNC() cannot tell
+			 * the ports apart either. A dword read at
+			 * PCI_INTERRUPT_LINE is passed through to the device
+			 * and returns the real pin in bits 15:8.
+			 *
+			 * NOTE: this depends on pci-hyperv not virtualizing
+			 * dword reads at 0x3c. If that changes, this path
+			 * falls back to PCI_FUNC() below and warns.
+			 */
+			pci_read_config_dword(ha->pdev, PCI_INTERRUPT_LINE, &v);
+			ha->port_no = (v >> 8) & 0xff;
+			ql_log_pci(ql_log_info, ha->pdev, 0xffff,
+			    "Hyper-V: INTx pin reads 0, config dword 0x%08x gives pin %u.\n",
+			    v, ha->port_no);
+		}
+		if (ha->port_no == 0) {
+			/* None of INT[A|B|C|D] may be virtualized by vfio */
+			ha->port_no = PCI_FUNC(ha->pdev->devfn);
+			if (qla2x00_hyperv_guest())
+				ql_log_pci(ql_log_warn, ha->pdev, 0xffff,
+				    "Hyper-V: unable to determine physical port, using PCI function %u. Ports may report duplicate WWPNs.\n",
+				    ha->port_no);
+		} else {
+			if (IS_QLA25XX(ha) || IS_QLA2031(ha) ||
+			    IS_QLA27XX(ha) || IS_QLA28XX(ha))
+				ha->port_no--;
+			else
+				ha->port_no = !(ha->port_no & 1);
+		}
 	}
 
 	ql_dbg_pci(ql_dbg_init, ha->pdev, 0x000b,
