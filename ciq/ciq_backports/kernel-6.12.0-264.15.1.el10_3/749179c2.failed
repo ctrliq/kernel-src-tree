@@ -1,0 +1,185 @@
+can: bcm: add locking when updating filter and timer values
+
+jira KERNEL-1889
+cve CVE-2025-38004
+Rebuild_History Non-Buildable kernel-6.12.0-264.15.1.el10_3
+commit-author Oliver Hartkopp <socketcan@hartkopp.net>
+commit 749179c2e25b95d22499ed29096b3e02d6dfd2b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.15.1.el10_3/749179c2.failed
+
+KCSAN detected a simultaneous access to timer values that can be
+overwritten in bcm_rx_setup() when updating timer and filter content
+while bcm_rx_handler(), bcm_rx_timeout_handler() or bcm_rx_thr_handler()
+run concurrently on incoming CAN traffic.
+
+Protect the timer (ival1/ival2/kt_ival1/kt_ival2/kt_lastmsg) and filter
+(nframes/flags/frames/last_frames) updates in bcm_rx_setup() with a new
+per-op bcm_rx_update_lock, taken with the matching scope in the RX
+handlers. memcpy_from_msg() is staged into a temporary buffer before the
+lock is taken, since it can sleep and must not run under a spinlock.
+
+hrtimer_cancel() is always called without bcm_rx_update_lock held, since
+bcm_rx_timeout_handler()/bcm_rx_thr_handler() take the same lock and a
+running callback would otherwise deadlock against the canceller.
+
+Also close a related race: bcm_rx_setup() cleared the RTR flag in the
+stored reply frame's can_id as a separate, unprotected step after the
+frame content was already installed, so a concurrent bcm_rx_handler()
+could transmit a stale reply with CAN_RTR_FLAG still set. Fold that
+normalization into the initial frame preparation instead (on the staged
+buffer for updates, directly on op->frames pre-registration for new
+ops), so the installed frame is always atomically self-consistent.
+
+bcm_rx_handler()'s RX_RTR_FRAME check now takes a lock-protected
+snapshot of op->flags before deciding whether to call bcm_can_tx(),
+but does not hold the lock across that call.
+
+Also take a lock-protected snapshot of the currframe in bcm_can_tx()
+to avoid partly overwrites by content updates in bcm_tx_setup().
+Finally check if a TX_RESET_MULTI_IDX/SETTIMER might have reset
+op->currframe between the two locked sections in bcm_can_tx().
+
+Omit calling hrtimer_forward() with zero interval in bcm_rx_thr_handler().
+kt_ival2 may have been concurrently cleared by bcm_rx_setup() before it
+cancels this timer, so check kt_ival2 inside the bcm_rx_update_lock.
+
+Fixes: c2aba69d0c36 ("can: bcm: add locking for bcm_op runtime updates")
+	Reported-by: syzbot+75e5e4ae00c3b4bb544e@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/linux-can/6975d5cf.a00a0220.33ccc7.0022.GAE@google.com/
+	Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Link: https://patch.msgid.link/20260714-bcm_fixes-v15-3-562f7e3e42da@hartkopp.net
+	Cc: stable@kernel.org
+	Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+(cherry picked from commit 749179c2e25b95d22499ed29096b3e02d6dfd2b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/can/bcm.c
+diff --cc net/can/bcm.c
+index 9be9a7c49553,1e5f8d65d351..000000000000
+--- a/net/can/bcm.c
++++ b/net/can/bcm.c
+@@@ -126,6 -128,8 +126,11 @@@ struct bcm_op 
+  	struct canfd_frame last_sframe;
+  	struct sock *sk;
+  	struct net_device *rx_reg_dev;
+++<<<<<<< HEAD
+++=======
++ 	spinlock_t bcm_tx_lock; /* protect currframe/count in runtime updates */
++ 	spinlock_t bcm_rx_update_lock; /* protect filter/timer data updates */
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  };
+  
+  struct bcm_sock {
+@@@ -285,17 -294,29 +290,35 @@@ static int bcm_proc_show(struct seq_fil
+   * bcm_can_tx - send the (next) CAN frame to the appropriate CAN interface
+   *              of the given bcm tx op
+   */
+- static void bcm_can_tx(struct bcm_op *op)
++ static void bcm_can_tx(struct bcm_op *op, struct canfd_frame *cf)
+  {
+  	struct sk_buff *skb;
+ -	struct can_skb_ext *csx;
+  	struct net_device *dev;
+++<<<<<<< HEAD
+ +	struct canfd_frame *cf = op->frames + op->cfsiz * op->currframe;
+++=======
++ 	struct canfd_frame cframe;
++ 	bool cyclic = !cf;
++ 	unsigned int idx = 0;
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  	int err;
+  
+  	/* no target device? => exit */
+  	if (!op->ifindex)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cyclic) {
++ 		/* read currframe under lock protection */
++ 		spin_lock_bh(&op->bcm_tx_lock);
++ 		idx = op->currframe;
++ 		memcpy(&cframe, op->frames + op->cfsiz * idx, op->cfsiz);
++ 		cf = &cframe;
++ 		spin_unlock_bh(&op->bcm_tx_lock);
++ 	}
++ 
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  	dev = dev_get_by_index(sock_net(op->sk), op->ifindex);
+  	if (!dev) {
+  		/* RFC: should this bcm_op remove itself here? */
+@@@ -319,11 -344,26 +342,28 @@@
+  	if (!err)
+  		op->frames_abs++;
+  
+- 	op->currframe++;
++ 	/* only advance the cyclic sequence if nothing reset currframe while
++ 	 * we were sending - a concurrent TX_RESET_MULTI_IDX means this
++ 	 * frame's bookkeeping belongs to a sequence that no longer exists
++ 	 */
++ 	if (!cyclic || op->currframe == idx) {
++ 		op->currframe++;
+  
+++<<<<<<< HEAD
+ +	/* reached last frame? */
+ +	if (op->currframe >= op->nframes)
+ +		op->currframe = 0;
+++=======
++ 		/* reached last frame? */
++ 		if (op->currframe >= op->nframes)
++ 			op->currframe = 0;
++ 
++ 		if (op->count > 0)
++ 			op->count--;
++ 	}
++ 
++ 	spin_unlock_bh(&op->bcm_tx_lock);
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  out:
+  	dev_put(dev);
+  }
+@@@ -435,7 -474,7 +475,11 @@@ static enum hrtimer_restart bcm_tx_time
+  	struct bcm_msg_head msg_head;
+  
+  	if (op->kt_ival1 && (op->count > 0)) {
+++<<<<<<< HEAD
+ +		op->count--;
+++=======
++ 		bcm_can_tx(op, NULL);
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  		if (!op->count && (op->flags & TX_COUNTEVT)) {
+  
+  			/* create notification to user */
+@@@ -450,10 -489,9 +494,10 @@@
+  
+  			bcm_send_to_user(op, &msg_head, NULL, 0);
+  		}
+ +		bcm_can_tx(op);
+  
+  	} else if (op->kt_ival2) {
+- 		bcm_can_tx(op);
++ 		bcm_can_tx(op, NULL);
+  	}
+  
+  	return bcm_tx_set_expiry(op, &op->timer) ?
+@@@ -1078,11 -1158,8 +1152,16 @@@ static int bcm_tx_setup(struct bcm_msg_
+  		op->flags |= TX_ANNOUNCE;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (op->flags & TX_ANNOUNCE) {
+ +		bcm_can_tx(op);
+ +		if (op->count)
+ +			op->count--;
+ +	}
+++=======
++ 	if (op->flags & TX_ANNOUNCE)
++ 		bcm_can_tx(op, NULL);
+++>>>>>>> 749179c2e25b (can: bcm: add locking when updating filter and timer values)
+  
+  	if (op->flags & STARTTIMER)
+  		bcm_tx_start_timer(op);
+* Unmerged path net/can/bcm.c
