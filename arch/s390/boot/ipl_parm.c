@@ -10,6 +10,7 @@
 #include "boot.h"
 
 char __bootdata(early_command_line)[COMMAND_LINE_SIZE];
+static char command_line_buf[COMMAND_LINE_SIZE] __section(.data);
 struct ipl_parameter_block __bootdata_preserved(ipl_block);
 int __bootdata_preserved(ipl_block_valid);
 unsigned int __bootdata_preserved(zlib_dfltcc_support) = ZLIB_DFLTCC_FULL;
@@ -118,31 +119,29 @@ out:
 
 static void append_ipl_block_parm(void)
 {
-	char *parm, *delim;
-	size_t len, rc = 0;
+	size_t len, extra = 0;
+	char *delim;
 
 	len = strlen(early_command_line);
-
-	delim = early_command_line + len;    /* '\0' character position */
-	parm = early_command_line + len + 1; /* append right after '\0' */
+	delim = early_command_line + len; /* '\0' character position */
 
 	switch (ipl_block.pb0_hdr.pbt) {
 	case IPL_PBT_CCW:
-		rc = ipl_block_get_ascii_vmparm(
-			parm, COMMAND_LINE_SIZE - len - 1, &ipl_block);
+		extra = ipl_block_get_ascii_vmparm(command_line_buf, sizeof(command_line_buf), &ipl_block);
 		break;
 	case IPL_PBT_FCP:
 	case IPL_PBT_NVME:
 	case IPL_PBT_ECKD:
-		rc = ipl_block_get_ascii_scpdata(
-			parm, COMMAND_LINE_SIZE - len - 1, &ipl_block);
+		extra = ipl_block_get_ascii_scpdata(command_line_buf, sizeof(command_line_buf), &ipl_block);
 		break;
 	}
-	if (rc) {
-		if (*parm == '=')
-			memmove(early_command_line, parm + 1, rc);
-		else
+	if (extra) {
+		if (command_line_buf[0] == '=') {
+			memmove(early_command_line, command_line_buf + 1, extra);
+		} else if (len < COMMAND_LINE_SIZE - 2) {
 			*delim = ' '; /* replace '\0' with space */
+			strlcpy(delim + 1, command_line_buf, COMMAND_LINE_SIZE - len - 1);
+		}
 	}
 }
 
@@ -170,7 +169,6 @@ void setup_boot_command_line(void)
 		append_ipl_block_parm();
 }
 
-static char command_line_buf[COMMAND_LINE_SIZE] __section(.data);
 static void parse_mem_opt(void)
 {
 	char *param, *val;

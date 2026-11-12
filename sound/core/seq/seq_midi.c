@@ -79,12 +79,13 @@ static void snd_midi_input_event(struct snd_rawmidi_substream *substream)
 	if (msynth == NULL)
 		return;
 
-	scoped_guard(rcu) {
-		if (rcu_dereference(msynth->input_substream) != substream)
-			return;
-
-		snd_use_lock_use(&msynth->input_use_lock);
+	rcu_read_lock();
+	if (rcu_dereference(msynth->input_substream) != substream) {
+		rcu_read_unlock();
+		return;
 	}
+	snd_use_lock_use(&msynth->input_use_lock);
+	rcu_read_unlock();
 
 	memset(&ev, 0, sizeof(ev));
 	while (runtime->avail > 0) {
@@ -140,12 +141,14 @@ static int event_process_midi(struct snd_seq_event *ev, int direct,
 	if (snd_BUG_ON(!msynth))
 		return -EINVAL;
 
-	scoped_guard(rcu) {
-		substream = rcu_dereference(msynth->output_substream);
-		if (!substream)
-			return -ENODEV;
-		snd_use_lock_use(&msynth->output_use_lock);
+	rcu_read_lock();
+	substream = rcu_dereference(msynth->output_substream);
+	if (!substream) {
+		rcu_read_unlock();
+		return -ENODEV;
 	}
+	snd_use_lock_use(&msynth->output_use_lock);
+	rcu_read_unlock();
 
 	if (ev->type == SNDRV_SEQ_EVENT_SYSEX) {	/* special case, to save space */
 		if ((ev->flags & SNDRV_SEQ_EVENT_LENGTH_MASK) != SNDRV_SEQ_EVENT_LENGTH_VARIABLE) {
