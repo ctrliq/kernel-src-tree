@@ -1,0 +1,258 @@
+Revert "net/smc: Introduce TCP ULP support"
+
+jira KERNEL-1894
+cve CVE-2026-46330
+Rebuild_History Non-Buildable kernel-4.18.0-553.185.1.el8_10
+commit-author D. Wythe <alibuda@linux.alibaba.com>
+commit df31a6b0a3057e66994ad6ccf5d95b9b9514f033
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.185.1.el8_10/df31a6b0.failed
+
+This reverts commit d7cd421da9da2cc7b4d25b8537f66db5c8331c40.
+
+As reported by Al Viro, the TCP ULP support for SMC is fundamentally
+broken. The implementation attempts to convert an active TCP socket
+into an SMC socket by modifying the underlying `struct file`, dentry,
+and inode in-place, which violates core VFS invariants that assume
+these structures are immutable for an open file, creating a risk of
+use after free errors and general system instability.
+
+Given the severity of this design flaw and the fact that cleaner
+alternatives (e.g., LD_PRELOAD, BPF) exist for legacy application
+transparency, the correct course of action is to remove this feature
+entirely.
+
+Fixes: d7cd421da9da ("net/smc: Introduce TCP ULP support")
+Link: https://lore.kernel.org/netdev/Yus1SycZxcd+wHwz@ZenIV/
+	Reported-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: D. Wythe <alibuda@linux.alibaba.com>
+	Reviewed-by: Tony Lu <tonylu@linux.alibaba.com>
+	Reviewed-by: Dust Li <dust.li@linux.alibaba.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20260128055452.98251-1-alibuda@linux.alibaba.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit df31a6b0a3057e66994ad6ccf5d95b9b9514f033)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/af_smc.c
+diff --cc net/smc/af_smc.c
+index ba47279e2373,d8201eb3ac5f..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -3234,11 -3337,30 +3234,35 @@@ static const struct proto_ops smc_sock_
+  	.splice_read	= smc_splice_read,
+  };
+  
+++<<<<<<< HEAD
+ +static int __smc_create(struct net *net, struct socket *sock, int protocol,
+ +			int kern, struct socket *clcsock)
+++=======
++ int smc_create_clcsk(struct net *net, struct sock *sk, int family)
++ {
++ 	struct smc_sock *smc = smc_sk(sk);
++ 	int rc;
++ 
++ 	rc = sock_create_kern(net, family, SOCK_STREAM, IPPROTO_TCP,
++ 			      &smc->clcsock);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/* smc_clcsock_release() does not wait smc->clcsock->sk's
++ 	 * destruction;  its sk_state might not be TCP_CLOSE after
++ 	 * smc->sk is close()d, and TCP timers can be fired later,
++ 	 * which need net ref.
++ 	 */
++ 	sk = smc->clcsock->sk;
++ 	sk_net_refcnt_upgrade(sk);
++ 	return 0;
++ }
++ 
++ static int smc_create(struct net *net, struct socket *sock, int protocol,
++ 		      int kern)
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  {
+  	int family = (protocol == SMCPROTO_SMC6) ? PF_INET6 : PF_INET;
+- 	struct smc_sock *smc;
+  	struct sock *sk;
+  	int rc;
+  
+@@@ -3257,40 -3379,11 +3281,47 @@@
+  	if (!sk)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	/* create internal TCP socket for CLC handshake and fallback */
+ +	smc = smc_sk(sk);
+ +	smc->use_fallback = false; /* assume rdma capability first */
+ +	smc->fallback_rsn = 0;
+ +
+ +	/* default behavior from limit_smc_hs in every net namespace */
+ +	smc->limit_smc_hs = net->smc.limit_smc_hs;
+ +
+ +	rc = 0;
+ +	if (!clcsock) {
+ +		rc = sock_create_kern(net, family, SOCK_STREAM, IPPROTO_TCP,
+ +				      &smc->clcsock);
+ +		if (rc) {
+ +			sk_common_release(sk);
+ +			goto out;
+ +		}
+ +
+ +		/* smc_clcsock_release() does not wait smc->clcsock->sk's
+ +		 * destruction;  its sk_state might not be TCP_CLOSE after
+ +		 * smc->sk is close()d, and TCP timers can be fired later,
+ +		 * which need net ref.
+ +		 */
+ +		sk = smc->clcsock->sk;
+ +		sk->sk_net_refcnt = 1;
+ +		get_net(net);
+ +		sock_prot_inuse_add(net, sk->sk_prot, 1);
+ +
+ +	} else {
+ +		smc->clcsock = clcsock;
+++=======
++ 	rc = smc_create_clcsk(net, sk, family);
++ 	if (rc) {
++ 		sk_common_release(sk);
++ 		sock->sk = NULL;
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  	}
+ +
+ +	smc->sk.sk_sndbuf = max(smc->clcsock->sk->sk_sndbuf, SMC_BUF_MIN_SIZE);
+ +	smc->sk.sk_rcvbuf = max(smc->clcsock->sk->sk_rcvbuf, SMC_BUF_MIN_SIZE);
+ +
+  out:
+  	return rc;
+  }
+@@@ -3307,64 -3394,6 +3332,67 @@@ static const struct net_proto_family sm
+  	.create	= smc_create,
+  };
+  
+++<<<<<<< HEAD
+ +static int smc_ulp_init(struct sock *sk)
+ +{
+ +	struct socket *tcp = sk->sk_socket;
+ +	struct net *net = sock_net(sk);
+ +	struct socket *smcsock;
+ +	int protocol, ret;
+ +
+ +	/* only TCP can be replaced */
+ +	if (tcp->type != SOCK_STREAM || sk->sk_protocol != IPPROTO_TCP ||
+ +	    (sk->sk_family != AF_INET && sk->sk_family != AF_INET6))
+ +		return -ESOCKTNOSUPPORT;
+ +	/* don't handle wq now */
+ +	if (tcp->state != SS_UNCONNECTED || !tcp->file || tcp->wq->fasync_list)
+ +		return -ENOTCONN;
+ +
+ +	if (sk->sk_family == AF_INET)
+ +		protocol = SMCPROTO_SMC;
+ +	else
+ +		protocol = SMCPROTO_SMC6;
+ +
+ +	smcsock = sock_alloc();
+ +	if (!smcsock)
+ +		return -ENFILE;
+ +
+ +	smcsock->type = SOCK_STREAM;
+ +	__module_get(THIS_MODULE); /* tried in __tcp_ulp_find_autoload */
+ +	ret = __smc_create(net, smcsock, protocol, 1, tcp);
+ +	if (ret) {
+ +		sock_release(smcsock); /* module_put() which ops won't be NULL */
+ +		return ret;
+ +	}
+ +
+ +	/* replace tcp socket to smc */
+ +	smcsock->file = tcp->file;
+ +	smcsock->file->private_data = smcsock;
+ +	smcsock->file->f_inode = SOCK_INODE(smcsock); /* replace inode when sock_close */
+ +	smcsock->file->f_path.dentry->d_inode = SOCK_INODE(smcsock); /* dput() in __fput */
+ +	tcp->file = NULL;
+ +
+ +	return ret;
+ +}
+ +
+ +static void smc_ulp_clone(const struct request_sock *req, struct sock *newsk,
+ +			  const gfp_t priority)
+ +{
+ +	struct inet_connection_sock *icsk = inet_csk(newsk);
+ +
+ +	/* don't inherit ulp ops to child when listen */
+ +	icsk->icsk_ulp_ops = NULL;
+ +}
+ +
+ +static struct tcp_ulp_ops smc_ulp_ops __read_mostly = {
+ +	.name		= "smc",
+ +	.owner		= THIS_MODULE,
+ +	.init		= smc_ulp_init,
+ +	.clone		= smc_ulp_clone,
+ +};
+ +
+++=======
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  unsigned int smc_net_id;
+  
+  static __net_init int smc_net_init(struct net *net)
+@@@ -3487,16 -3516,21 +3515,34 @@@ static int __init smc_init(void
+  		pr_err("%s: ib_register fails with %d\n", __func__, rc);
+  		goto out_sock;
+  	}
+++<<<<<<< HEAD
+ +
+ +	rc = tcp_register_ulp(&smc_ulp_ops);
+ +	if (rc) {
+ +		pr_err("%s: tcp_ulp_register fails with %d\n", __func__, rc);
+ +		goto out_ib;
+ +	}
+ +
+ +	static_branch_enable(&tcp_have_smc);
+ +	return 0;
+ +
+++=======
++ 	rc = smc_inet_init();
++ 	if (rc) {
++ 		pr_err("%s: smc_inet_init fails with %d\n", __func__, rc);
++ 		goto out_ib;
++ 	}
++ 	rc = bpf_smc_hs_ctrl_init();
++ 	if (rc) {
++ 		pr_err("%s: bpf_smc_hs_ctrl_init fails with %d\n", __func__,
++ 		       rc);
++ 		goto out_inet;
++ 	}
++ 	static_branch_enable(&tcp_have_smc);
++ 	return 0;
++ out_inet:
++ 	smc_inet_exit();
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  out_ib:
+  	smc_ib_unregister_client();
+  out_sock:
+@@@ -3531,7 -3565,7 +3577,11 @@@ out_pernet_subsys
+  static void __exit smc_exit(void)
+  {
+  	static_branch_disable(&tcp_have_smc);
+++<<<<<<< HEAD
+ +	tcp_unregister_ulp(&smc_ulp_ops);
+++=======
++ 	smc_inet_exit();
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  	sock_unregister(PF_SMC);
+  	smc_core_exit();
+  	smc_ib_unregister_client();
+@@@ -3556,5 -3590,9 +3606,13 @@@ MODULE_AUTHOR("Ursula Braun <ubraun@lin
+  MODULE_DESCRIPTION("smc socket address family");
+  MODULE_LICENSE("GPL");
+  MODULE_ALIAS_NETPROTO(PF_SMC);
+++<<<<<<< HEAD
+ +MODULE_ALIAS_TCP_ULP("smc");
+++=======
++ /* 256 for IPPROTO_SMC and 1 for SOCK_STREAM */
++ MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET, 256, 1);
++ #if IS_ENABLED(CONFIG_IPV6)
++ MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET6, 256, 1);
++ #endif /* CONFIG_IPV6 */
+++>>>>>>> df31a6b0a305 (Revert "net/smc: Introduce TCP ULP support")
+  MODULE_ALIAS_GENL_FAMILY(SMC_GENL_FAMILY_NAME);
+* Unmerged path net/smc/af_smc.c
