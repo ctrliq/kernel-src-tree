@@ -308,6 +308,7 @@ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
 				      struct dst_entry *dst)
 {
 	skb_orphan(skb);
+	skb_dst_drop(skb);
 	skb_dst_set_noref(skb, dst);
 	dst_output(state->net, state->sk, skb);
 	return NF_STOLEN;
@@ -859,6 +860,7 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 		xmit.dest = neigh->ha;
+		skb_dst_drop(skb);
 		skb_dst_set_noref(skb, &rt->dst);
 		break;
 	case FLOW_OFFLOAD_XMIT_DIRECT:
@@ -1176,6 +1178,7 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 		xmit.dest = neigh->ha;
+		skb_dst_drop(skb);
 		skb_dst_set_noref(skb, &rt->dst);
 		break;
 	case FLOW_OFFLOAD_XMIT_DIRECT:
