@@ -11,6 +11,8 @@
 #include <net/tcp_states.h>
 #include <net/sock.h>
 
+#include "af_unix.h"
+
 static int sk_diag_dump_name(struct sock *sk, struct sk_buff *nlskb)
 {
 	/* might or might not have a hash table lock */

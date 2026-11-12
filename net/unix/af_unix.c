@@ -118,6 +118,8 @@
 #include <linux/btf_ids.h>
 #include <linux/bpf-cgroup.h>
 
+#include "af_unix.h"
+
 static atomic_long_t unix_nr_socks;
 static struct hlist_head bsd_socket_buckets[UNIX_HASH_SIZE / 2];
 static spinlock_t bsd_socket_locks[UNIX_HASH_SIZE / 2];
