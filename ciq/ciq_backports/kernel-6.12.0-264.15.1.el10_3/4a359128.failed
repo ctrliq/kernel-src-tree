@@ -1,0 +1,155 @@
+entry: Fix seccomp bypass after ptrace with TSYNC
+
+jira KERNEL-1889
+cve CVE-2026-89603
+Rebuild_History Non-Buildable kernel-6.12.0-264.15.1.el10_3
+commit-author Jinjie Ruan <ruanjinjie@huawei.com>
+commit 4a3591287fb7f808e209b4974ed337f609a2006b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.15.1.el10_3/4a359128.failed
+
+Sashiko review pointed out the following issue.
+
+If a thread is stopped in syscall_trace_enter() for ptrace, another
+thread can install a seccomp filter with SECCOMP_FILTER_FLAG_TSYNC
+(e.g., via seccomp_attach_filter()). This will successfully set
+SYSCALL_WORK_SECCOMP on the stopped thread, but syscall_trace_enter()
+evaluates a cached 'work' variable sampled on entry. Consequently,
+the subsequent check for SYSCALL_WORK_SECCOMP misses the newly
+assigned flag, and the filter is silently bypassed.
+
+This race condition could allow an unprivileged process to execute
+a prohibited system call (e.g., execve) that the newly installed filter
+was intended to block, especially since the tracer might have modified
+the system call number during the ptrace stop.
+
+Fix this by re-reading the syscall_work flags after ptrace handling,
+so that any new SYSCALL_WORK_SECCOMP flag set by another thread via
+TSYNC during the ptrace stop is observed before the subsequent
+seccomp check.
+
+Fixes: 142781e108b1 ("entry: Provide generic syscall entry functionality")
+	Signed-off-by: Jinjie Ruan <ruanjinjie@huawei.com>
+	Signed-off-by: Thomas Gleixner <tglx@kernel.org>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/all/20260629132914.1135C1F000E9@smtp.kernel.org/
+Link: https://patch.msgid.link/20260713025712.416366-1-ruanjinjie@huawei.com
+(cherry picked from commit 4a3591287fb7f808e209b4974ed337f609a2006b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/entry-common.h
+diff --cc include/linux/entry-common.h
+index 7177436f0f9e,299f13c78a6f..000000000000
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@@ -41,28 -36,88 +41,98 @@@
+  				 SYSCALL_WORK_SYSCALL_TRACE |		\
+  				 SYSCALL_WORK_SYSCALL_AUDIT |		\
+  				 SYSCALL_WORK_SYSCALL_USER_DISPATCH |	\
+ -				 SYSCALL_WORK_SYSCALL_EXIT_TRAP)
+ +				 SYSCALL_WORK_SYSCALL_EXIT_TRAP	|	\
+ +				 ARCH_SYSCALL_WORK_EXIT)
+  
+  /**
+ - * arch_ptrace_report_syscall_permit_entry - Architecture specific wrapper for
+ - *					     ptrace_report_syscall_permit_entry()
+ - * @regs: Pointer to the register state at syscall entry
+ + * syscall_enter_from_user_mode_prepare - Establish state and enable interrupts
+ + * @regs:	Pointer to currents pt_regs
+ + *
+ + * Invoked from architecture specific syscall entry code with interrupts
+ + * disabled. The calling code has to be non-instrumentable. When the
+ + * function returns all state is correct, interrupts are enabled and the
+ + * subsequent functions can be instrumented.
+   *
+ - * Invoked from syscall_trace_enter() to wrap ptrace_report_syscall_permit_entry().
+ + * This handles lockdep, RCU (context tracking) and tracing state, i.e.
+ + * the functionality provided by enter_from_user_mode().
+   *
+ - * This allows architecture specific ptrace_report_syscall_permit_entry()
+ - * implementations. If not defined by the architecture this falls back to
+ - * to ptrace_report_syscall_permit_entry().
+ + * This is invoked when there is extra architecture specific functionality
+ + * to be done between establishing state and handling user mode entry work.
+   */
+ -static __always_inline bool arch_ptrace_report_syscall_permit_entry(struct pt_regs *regs);
+ +void syscall_enter_from_user_mode_prepare(struct pt_regs *regs);
+  
+++<<<<<<< HEAD
+ +long syscall_trace_enter(struct pt_regs *regs, long syscall,
+ +			 unsigned long work);
+++=======
++ #ifndef arch_ptrace_report_syscall_permit_entry
++ static __always_inline bool arch_ptrace_report_syscall_permit_entry(struct pt_regs *regs)
++ {
++ 	return ptrace_report_syscall_permit_entry(regs);
++ }
++ #endif
++ 
++ long trace_syscall_enter(struct pt_regs *regs, long syscall);
++ void trace_syscall_exit(struct pt_regs *regs, long ret);
++ 
++ static inline void syscall_enter_audit(struct pt_regs *regs, long syscall)
++ {
++ 	if (unlikely(audit_context())) {
++ 		unsigned long args[6];
++ 
++ 		syscall_get_arguments(current, regs, args);
++ 		audit_syscall_entry(syscall, args[0], args[1], args[2], args[3]);
++ 	}
++ }
++ 
++ static __always_inline long syscall_trace_enter(struct pt_regs *regs, unsigned long work,
++ 						long syscall)
++ {
++ 	/*
++ 	 * Handle Syscall User Dispatch.  This must comes first, since
++ 	 * the ABI here can be something that doesn't make sense for
++ 	 * other syscall_work features.
++ 	 */
++ 	if (work & SYSCALL_WORK_SYSCALL_USER_DISPATCH) {
++ 		if (syscall_user_dispatch(regs))
++ 			return -1L;
++ 	}
++ 
++ 	/*
++ 	 * User space got a time slice extension granted and relinquishes
++ 	 * the CPU. The work stops the slice timer to avoid an extra round
++ 	 * through hrtimer_interrupt().
++ 	 */
++ 	if (work & SYSCALL_WORK_SYSCALL_RSEQ_SLICE)
++ 		rseq_syscall_enter_work(syscall);
++ 
++ 	/* Handle ptrace */
++ 	if (work & (SYSCALL_WORK_SYSCALL_TRACE | SYSCALL_WORK_SYSCALL_EMU)) {
++ 		if (!arch_ptrace_report_syscall_permit_entry(regs) ||
++ 		    (work & SYSCALL_WORK_SYSCALL_EMU))
++ 			return -1L;
++ 
++ 		/* ptrace might have changed work flags */
++ 		work = READ_ONCE(current_thread_info()->syscall_work);
++ 	}
++ 
++ 	/* Do seccomp after ptrace, to catch any tracer changes. */
++ 	if (work & SYSCALL_WORK_SECCOMP) {
++ 		if (!__seccomp_permit_syscall())
++ 			return -1L;
++ 	}
++ 
++ 	/* Either of the above might have changed the syscall number */
++ 	syscall = syscall_get_nr(current, regs);
++ 
++ 	if (unlikely(work & SYSCALL_WORK_SYSCALL_TRACEPOINT))
++ 		syscall = trace_syscall_enter(regs, syscall);
++ 
++ 	syscall_enter_audit(regs, syscall);
++ 
++ 	return syscall;
++ }
+++>>>>>>> 4a3591287fb7 (entry: Fix seccomp bypass after ptrace with TSYNC)
+  
+  /**
+   * syscall_enter_from_user_mode_work - Check and handle work before invoking
+* Unmerged path include/linux/entry-common.h
