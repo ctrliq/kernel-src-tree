@@ -4573,6 +4573,7 @@ fi\
 #
 %changelog
 * Wed Nov 11 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.63-1.1
+-- configs: CONFIG_CRYPTO_FIPS_VERSION="ciq.6.18.20260531" to  "ciq.6.18.20261112" (Jonathan Maple)
 -- Rebased changes for Linux 6.18.63 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.63-1)
 -- [CIQ] v6.18.62 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.60 - updated spec (github-actions[bot])
