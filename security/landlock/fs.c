@@ -954,7 +954,7 @@ static int current_check_access_path(const struct path *const path,
 	return -EACCES;
 }
 
-static access_mask_t get_mode_access(const umode_t mode)
+static __attribute_const__ access_mask_t get_mode_access(const umode_t mode)
 {
 	switch (mode & S_IFMT) {
 	case S_IFLNK:
