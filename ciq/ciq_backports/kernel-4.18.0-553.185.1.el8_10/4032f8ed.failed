@@ -1,0 +1,255 @@
+openvswitch: fix GSO userspace truncation underflow
+
+jira KERNEL-1894
+cve CVE-2026-68123
+Rebuild_History Non-Buildable kernel-4.18.0-553.185.1.el8_10
+commit-author Kyle Zeng <kylebot@openai.com>
+commit 4032f8ed10fcb84d41c508dfb04be96589f78dfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.185.1.el8_10/4032f8ed.failed
+
+OVS_ACTION_ATTR_TRUNC currently stores a delta from the original skb
+length in OVS_CB(skb)->cutlen. When a later userspace action segments a
+GSO skb, queue_gso_packets() reuses that delta for each smaller segment.
+A segment can then reach queue_userspace_packet() with cutlen greater
+than skb->len, underflowing the length passed to skb_zerocopy().
+
+Store the maximum preserved length instead and bound each consumer
+against the current skb length. Use U32_MAX as the no-truncation
+sentinel so the value remains valid if skb geometry changes before a
+consumer handles it.
+
+Fixes: f2a4d086ed4c ("openvswitch: Add packet truncation support.")
+	Cc: stable@vger.kernel.org
+Assisted-by: Codex:gpt-5.5
+	Signed-off-by: Kyle Zeng <kylebot@openai.com>
+	Reviewed-by: Ilya Maximets <i.maximets@ovn.org>
+	Reviewed-by: Aaron Conole <aconole@redhat.com>
+Link: https://patch.msgid.link/20260707221635.27489-1-kylebot@openai.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 4032f8ed10fcb84d41c508dfb04be96589f78dfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/actions.c
+#	net/openvswitch/datapath.h
+#	net/openvswitch/vport.c
+diff --cc net/openvswitch/actions.c
+index 3045090382c3,513fca6a8e8a..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -1289,6 -1205,44 +1285,47 @@@ static int execute_dec_ttl(struct sk_bu
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_PSAMPLE)
++ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++ 			    const struct nlattr *attr)
++ {
++ 	struct psample_group psample_group = {};
++ 	struct psample_metadata md = {};
++ 	const struct nlattr *a;
++ 	u32 rate;
++ 	int rem;
++ 
++ 	nla_for_each_attr(a, nla_data(attr), nla_len(attr), rem) {
++ 		switch (nla_type(a)) {
++ 		case OVS_PSAMPLE_ATTR_GROUP:
++ 			psample_group.group_num = nla_get_u32(a);
++ 			break;
++ 
++ 		case OVS_PSAMPLE_ATTR_COOKIE:
++ 			md.user_cookie = nla_data(a);
++ 			md.user_cookie_len = nla_len(a);
++ 			break;
++ 		}
++ 	}
++ 
++ 	psample_group.net = ovs_dp_get_net(dp);
++ 	md.in_ifindex = OVS_CB(skb)->input_vport->dev->ifindex;
++ 	md.trunc_size = min(skb->len, OVS_CB(skb)->cutlen);
++ 	md.rate_as_probability = 1;
++ 
++ 	rate = OVS_CB(skb)->probability ? OVS_CB(skb)->probability : U32_MAX;
++ 
++ 	psample_sample_packet(&psample_group, skb, rate, &md);
++ }
++ #else
++ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
++ 			    const struct nlattr *attr)
++ {}
++ #endif
++ 
+++>>>>>>> 4032f8ed10fc (openvswitch: fix GSO userspace truncation underflow)
+  /* Execute a list of actions against 'skb'. */
+  static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+  			      struct sw_flow_key *key,
+@@@ -1338,7 -1294,11 +1374,15 @@@
+  		case OVS_ACTION_ATTR_USERSPACE:
+  			output_userspace(dp, skb, key, a, attr,
+  						     len, OVS_CB(skb)->cutlen);
+++<<<<<<< HEAD
+ +			OVS_CB(skb)->cutlen = 0;
+++=======
++ 			OVS_CB(skb)->cutlen = U32_MAX;
++ 			if (nla_is_last(a, rem)) {
++ 				consume_skb(skb);
++ 				return 0;
++ 			}
+++>>>>>>> 4032f8ed10fc (openvswitch: fix GSO userspace truncation underflow)
+  			break;
+  
+  		case OVS_ACTION_ATTR_HASH:
+@@@ -1484,6 -1436,24 +1528,27 @@@
+  				return dec_ttl_exception_handler(dp, skb,
+  								 key, a);
+  			break;
+++<<<<<<< HEAD
+++=======
++ 
++ 		case OVS_ACTION_ATTR_DROP: {
++ 			enum ovs_drop_reason reason = nla_get_u32(a)
++ 				? OVS_DROP_EXPLICIT_WITH_ERROR
++ 				: OVS_DROP_EXPLICIT;
++ 
++ 			ovs_kfree_skb_reason(skb, reason);
++ 			return 0;
++ 		}
++ 
++ 		case OVS_ACTION_ATTR_PSAMPLE:
++ 			execute_psample(dp, skb, a);
++ 			OVS_CB(skb)->cutlen = U32_MAX;
++ 			if (nla_is_last(a, rem)) {
++ 				consume_skb(skb);
++ 				return 0;
++ 			}
++ 			break;
+++>>>>>>> 4032f8ed10fc (openvswitch: fix GSO userspace truncation underflow)
+  		}
+  
+  		if (unlikely(err)) {
+diff --cc net/openvswitch/datapath.h
+index 3b15e97e2ad0,696640e88fa7..000000000000
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@@ -127,7 -118,11 +127,15 @@@ struct datapath 
+   * @mru: The maximum received fragement size; 0 if the packet is not
+   * fragmented.
+   * @acts_origlen: The netlink size of the flow actions applied to this skb.
+++<<<<<<< HEAD
+ + * @cutlen: The number of bytes from the packet end to be removed.
+++=======
++  * @cutlen: The number of bytes in the packet to preserve on output.
++  * @probability: The sampling probability that was applied to this skb; 0 means
++  * no sampling has occurred; U32_MAX means 100% probability.
++  * @upcall_pid: Netlink socket PID to use for sending this packet to userspace;
++  * 0 means "not set" and default per-CPU or per-vport dispatch should be used.
+++>>>>>>> 4032f8ed10fc (openvswitch: fix GSO userspace truncation underflow)
+   */
+  struct ovs_skb_cb {
+  	struct vport		*input_vport;
+diff --cc net/openvswitch/vport.c
+index fbf6a1e37a0c,12741485c939..000000000000
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@@ -511,7 -502,9 +511,13 @@@ int ovs_vport_receive(struct vport *vpo
+  
+  	OVS_CB(skb)->input_vport = vport;
+  	OVS_CB(skb)->mru = 0;
+++<<<<<<< HEAD
+ +	OVS_CB(skb)->cutlen = 0;
+++=======
++ 	OVS_CB(skb)->cutlen = U32_MAX;
++ 	OVS_CB(skb)->probability = 0;
++ 	OVS_CB(skb)->upcall_pid = 0;
+++>>>>>>> 4032f8ed10fc (openvswitch: fix GSO userspace truncation underflow)
+  	if (unlikely(dev_net(skb->dev) != ovs_dp_get_net(vport->dp))) {
+  		u32 mark;
+  
+* Unmerged path net/openvswitch/actions.c
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 0615f6a50961..deca8267dce4 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -283,7 +283,7 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
+ 			upcall.portid = ovs_vport_find_upcall_portid(p, skb);
+ 
+ 		upcall.mru = OVS_CB(skb)->mru;
+-		error = ovs_dp_upcall(dp, skb, key, &upcall, 0);
++		error = ovs_dp_upcall(dp, skb, key, &upcall, U32_MAX);
+ 		switch (error) {
+ 		case 0:
+ 		case -EAGAIN:
+@@ -448,7 +448,8 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 	struct sk_buff *nskb = NULL;
+ 	struct sk_buff *user_skb = NULL; /* to be queued to userspace */
+ 	struct nlattr *nla;
+-	size_t len;
++	size_t msg_size;
++	size_t skb_len;
+ 	unsigned int hlen;
+ 	int err, dp_ifindex;
+ 	u64 hash;
+@@ -469,7 +470,8 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 		skb = nskb;
+ 	}
+ 
+-	if (nla_attr_size(skb->len) > USHRT_MAX) {
++	skb_len = min(skb->len, cutlen);
++	if (nla_attr_size(skb_len) > USHRT_MAX) {
+ 		err = -EFBIG;
+ 		goto out;
+ 	}
+@@ -484,13 +486,13 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 	 * padding logic. Only perform zerocopy if padding is not required.
+ 	 */
+ 	if (dp->user_features & OVS_DP_F_UNALIGNED)
+-		hlen = skb_zerocopy_headlen(skb);
++		hlen = min(skb_zerocopy_headlen(skb), cutlen);
+ 	else
+-		hlen = skb->len;
++		hlen = skb_len;
+ 
+-	len = upcall_msg_size(upcall_info, hlen - cutlen,
+-			      OVS_CB(skb)->acts_origlen);
+-	user_skb = genlmsg_new(len, GFP_ATOMIC);
++	msg_size = upcall_msg_size(upcall_info, hlen,
++				   OVS_CB(skb)->acts_origlen);
++	user_skb = genlmsg_new(msg_size, GFP_ATOMIC);
+ 	if (!user_skb) {
+ 		err = -ENOMEM;
+ 		goto out;
+@@ -551,7 +553,7 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 	}
+ 
+ 	/* Add OVS_PACKET_ATTR_LEN when packet is truncated */
+-	if (cutlen > 0 &&
++	if (skb_len < skb->len &&
+ 	    nla_put_u32(user_skb, OVS_PACKET_ATTR_LEN, skb->len)) {
+ 		err = -ENOBUFS;
+ 		goto out;
+@@ -576,9 +578,9 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 		err = -ENOBUFS;
+ 		goto out;
+ 	}
+-	nla->nla_len = nla_attr_size(skb->len - cutlen);
++	nla->nla_len = nla_attr_size(skb_len);
+ 
+-	err = skb_zerocopy(user_skb, skb, skb->len - cutlen, hlen);
++	err = skb_zerocopy(user_skb, skb, skb_len, hlen);
+ 	if (err)
+ 		goto out;
+ 
+@@ -635,6 +637,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 		packet->ignore_df = 1;
+ 	}
+ 	OVS_CB(packet)->mru = mru;
++	OVS_CB(packet)->cutlen = U32_MAX;
+ 
+ 	if (a[OVS_PACKET_ATTR_HASH]) {
+ 		hash = nla_get_u64(a[OVS_PACKET_ATTR_HASH]);
+* Unmerged path net/openvswitch/datapath.h
+* Unmerged path net/openvswitch/vport.c
