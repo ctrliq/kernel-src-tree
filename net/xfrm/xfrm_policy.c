@@ -1733,6 +1733,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 	if (!dev)
 		goto free_dst;
 
+	dev_hold(dev);
+
 	xfrm_init_path((struct xfrm_dst *)dst0, dst, nfheader_len);
 	xfrm_init_pmtu(dst_prev);
 
@@ -1741,7 +1743,7 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 
 		err = xfrm_fill_dst(xdst, dev, fl);
 		if (err)
-			goto free_dst;
+			goto put_dev;
 
 		dst_prev->header_len = header_len;
 		dst_prev->trailer_len = trailer_len;
@@ -1749,12 +1751,16 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 		trailer_len -= xdst->u.dst.xfrm->props.trailer_len;
 	}
 
+	dev_put(dev);
 out:
 	return dst0;
 
 put_states:
 	for (; i < nx; i++)
 		xfrm_state_put(xfrm[i]);
+	goto free_dst;
+put_dev:
+	dev_put(dev);
 free_dst:
 	if (dst0)
 		dst_free(dst0);
@@ -2001,13 +2007,18 @@ static struct xfrm_dst *xfrm_create_dummy_bundle(struct net *net,
 	if (!dev)
 		goto free_dst;
 
+	dev_hold(dev);
+
 	err = xfrm_fill_dst(xdst, dev, fl);
 	if (err)
-		goto free_dst;
+		goto put_dev;
 
+	dev_put(dev);
 out:
 	return xdst;
 
+put_dev:
+	dev_put(dev);
 free_dst:
 	dst_release(dst1);
 	xdst = ERR_PTR(err);
