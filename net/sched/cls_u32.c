@@ -1028,6 +1028,9 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
 
 	s = nla_data(tb[TCA_U32_SEL]);
 
+	if (s->offshift >= 16)
+		return -EINVAL;
+
 	n = kzalloc(sizeof(*n) + s->nkeys*sizeof(struct tc_u32_key), GFP_KERNEL);
 	if (n == NULL)
 		return -ENOBUFS;
