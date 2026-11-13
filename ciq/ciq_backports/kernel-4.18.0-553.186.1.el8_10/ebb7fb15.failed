@@ -1,0 +1,240 @@
+xfs, iomap: limit individual ioend chain lengths in writeback
+
+jira KERNEL-1911
+Rebuild_History Non-Buildable kernel-4.18.0-553.186.1.el8_10
+commit-author Dave Chinner <dchinner@redhat.com>
+commit ebb7fb1557b1d03b906b668aa2164b51e6b7d19a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.186.1.el8_10/ebb7fb15.failed
+
+Trond Myklebust reported soft lockups in XFS IO completion such as
+this:
+
+ watchdog: BUG: soft lockup - CPU#12 stuck for 23s! [kworker/12:1:3106]
+ CPU: 12 PID: 3106 Comm: kworker/12:1 Not tainted 4.18.0-305.10.2.el8_4.x86_64 #1
+ Workqueue: xfs-conv/md127 xfs_end_io [xfs]
+ RIP: 0010:_raw_spin_unlock_irqrestore+0x11/0x20
+ Call Trace:
+  wake_up_page_bit+0x8a/0x110
+  iomap_finish_ioend+0xd7/0x1c0
+  iomap_finish_ioends+0x7f/0xb0
+  xfs_end_ioend+0x6b/0x100 [xfs]
+  xfs_end_io+0xb9/0xe0 [xfs]
+  process_one_work+0x1a7/0x360
+  worker_thread+0x1fa/0x390
+  kthread+0x116/0x130
+  ret_from_fork+0x35/0x40
+
+Ioends are processed as an atomic completion unit when all the
+chained bios in the ioend have completed their IO. Logically
+contiguous ioends can also be merged and completed as a single,
+larger unit.  Both of these things can be problematic as both the
+bio chains per ioend and the size of the merged ioends processed as
+a single completion are both unbound.
+
+If we have a large sequential dirty region in the page cache,
+write_cache_pages() will keep feeding us sequential pages and we
+will keep mapping them into ioends and bios until we get a dirty
+page at a non-sequential file offset. These large sequential runs
+can will result in bio and ioend chaining to optimise the io
+patterns. The pages iunder writeback are pinned within these chains
+until the submission chaining is broken, allowing the entire chain
+to be completed. This can result in huge chains being processed
+in IO completion context.
+
+We get deep bio chaining if we have large contiguous physical
+extents. We will keep adding pages to the current bio until it is
+full, then we'll chain a new bio to keep adding pages for writeback.
+Hence we can build bio chains that map millions of pages and tens of
+gigabytes of RAM if the page cache contains big enough contiguous
+dirty file regions. This long bio chain pins those pages until the
+final bio in the chain completes and the ioend can iterate all the
+chained bios and complete them.
+
+OTOH, if we have a physically fragmented file, we end up submitting
+one ioend per physical fragment that each have a small bio or bio
+chain attached to them. We do not chain these at IO submission time,
+but instead we chain them at completion time based on file
+offset via iomap_ioend_try_merge(). Hence we can end up with unbound
+ioend chains being built via completion merging.
+
+XFS can then do COW remapping or unwritten extent conversion on that
+merged chain, which involves walking an extent fragment at a time
+and running a transaction to modify the physical extent information.
+IOWs, we merge all the discontiguous ioends together into a
+contiguous file range, only to then process them individually as
+discontiguous extents.
+
+This extent manipulation is computationally expensive and can run in
+a tight loop, so merging logically contiguous but physically
+discontigous ioends gains us nothing except for hiding the fact the
+fact we broke the ioends up into individual physical extents at
+submission and then need to loop over those individual physical
+extents at completion.
+
+Hence we need to have mechanisms to limit ioend sizes and
+to break up completion processing of large merged ioend chains:
+
+1. bio chains per ioend need to be bound in length. Pure overwrites
+go straight to iomap_finish_ioend() in softirq context with the
+exact bio chain attached to the ioend by submission. Hence the only
+way to prevent long holdoffs here is to bound ioend submission
+sizes because we can't reschedule in softirq context.
+
+2. iomap_finish_ioends() has to handle unbound merged ioend chains
+correctly. This relies on any one call to iomap_finish_ioend() being
+bound in runtime so that cond_resched() can be issued regularly as
+the long ioend chain is processed. i.e. this relies on mechanism #1
+to limit individual ioend sizes to work correctly.
+
+3. filesystems have to loop over the merged ioends to process
+physical extent manipulations. This means they can loop internally,
+and so we break merging at physical extent boundaries so the
+filesystem can easily insert reschedule points between individual
+extent manipulations.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reported-and-tested-by: Trond Myklebust <trondmy@hammerspace.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit ebb7fb1557b1d03b906b668aa2164b51e6b7d19a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/buffered-io.c
+diff --cc fs/iomap/buffered-io.c
+index 2a16916e22e9,6c51a75d0be6..000000000000
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@@ -22,21 -21,23 +22,23 @@@
+  
+  #include "../internal.h"
+  
++ #define IOEND_BATCH_SIZE	4096
++ 
+  /*
+ - * Structure allocated for each folio when block size < folio size
+ - * to track sub-folio uptodate status and I/O completions.
+ + * Structure allocated for each page when block size < PAGE_SIZE to track
+ + * sub-page uptodate status and I/O completions.
+   */
+  struct iomap_page {
+ -	atomic_t		read_bytes_pending;
+ -	atomic_t		write_bytes_pending;
+ +	atomic_t		read_count;
+ +	atomic_t		write_count;
+  	spinlock_t		uptodate_lock;
+ -	unsigned long		uptodate[];
+ +	DECLARE_BITMAP(uptodate, PAGE_SIZE / 512);
+  };
+  
+ -static inline struct iomap_page *to_iomap_page(struct folio *folio)
+ +static inline struct iomap_page *to_iomap_page(struct page *page)
+  {
+ -	if (folio_test_private(folio))
+ -		return folio_get_private(folio);
+ +	if (page_has_private(page))
+ +		return (struct iomap_page *)page_private(page);
+  	return NULL;
+  }
+  
+@@@ -1364,10 -1050,10 +1366,11 @@@ iomap_finish_ioend(struct iomap_ioend *
+  	u64 start = bio->bi_iter.bi_sector;
+  	loff_t offset = ioend->io_offset;
+  	bool quiet = bio_flagged(bio, BIO_QUIET);
++ 	u32 folio_count = 0;
+  
+  	for (bio = &ioend->io_inline_bio; bio; bio = next) {
+ -		struct folio_iter fi;
+ +		struct bio_vec *bv;
+ +		int		i;
+  
+  		/*
+  		 * For the last bio, bi_private points to the ioend, so we
+@@@ -1378,9 -1064,12 +1381,18 @@@
+  		else
+  			next = bio->bi_private;
+  
+++<<<<<<< HEAD
+ +		/* walk each page on bio, ending page IO on them */
+ +		bio_for_each_segment_all(bv, bio, i)
+ +			iomap_finish_page_writeback(inode, bv->bv_page, error);
+++=======
++ 		/* walk all folios in bio, ending page IO on them */
++ 		bio_for_each_folio_all(fi, bio) {
++ 			iomap_finish_folio_write(inode, fi.folio, fi.length,
++ 					error);
++ 			folio_count++;
++ 		}
+++>>>>>>> ebb7fb1557b1 (xfs, iomap: limit individual ioend chain lengths in writeback)
+  		bio_put(bio);
+  	}
+  	/* The ioend has been freed by bio_put() */
+@@@ -1652,10 -1377,13 +1701,12 @@@ iomap_writepage_map(struct iomap_writep
+  				 &submit_list);
+  		count++;
+  	}
++ 	if (count)
++ 		wpc->ioend->io_folios++;
+  
+  	WARN_ON_ONCE(!wpc->ioend && !list_empty(&submit_list));
+ -	WARN_ON_ONCE(!folio_test_locked(folio));
+ -	WARN_ON_ONCE(folio_test_writeback(folio));
+ -	WARN_ON_ONCE(folio_test_dirty(folio));
+ +	WARN_ON_ONCE(!PageLocked(page));
+ +	WARN_ON_ONCE(PageWriteback(page));
+  
+  	/*
+  	 * We cannot cancel the ioend directly here on error.  We may have
+* Unmerged path fs/iomap/buffered-io.c
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 6ce7bf5065f0..6a743c82dfb5 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -135,7 +135,20 @@ xfs_end_ioend(
+ 	memalloc_nofs_restore(nofs_flag);
+ }
+ 
+-/* Finish all pending io completions. */
++/*
++ * Finish all pending IO completions that require transactional modifications.
++ *
++ * We try to merge physical and logically contiguous ioends before completion to
++ * minimise the number of transactions we need to perform during IO completion.
++ * Both unwritten extent conversion and COW remapping need to iterate and modify
++ * one physical extent at a time, so we gain nothing by merging physically
++ * discontiguous extents here.
++ *
++ * The ioend chain length that we can be processing here is largely unbound in
++ * length and we may have to perform significant amounts of work on each ioend
++ * to complete it. Hence we have to be careful about holding the CPU for too
++ * long in this loop.
++ */
+ void
+ xfs_end_io(
+ 	struct work_struct	*work)
+@@ -156,6 +169,7 @@ xfs_end_io(
+ 		list_del_init(&ioend->io_list);
+ 		iomap_ioend_try_merge(ioend, &tmp);
+ 		xfs_end_ioend(ioend);
++		cond_resched();
+ 	}
+ }
+ 
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index 851862557c32..d9294910a334 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -298,9 +298,11 @@ struct iomap_ioend {
+ 	struct list_head	io_list;	/* next ioend in chain */
+ 	u16			io_type;
+ 	u16			io_flags;	/* IOMAP_F_* */
++	u32			io_folios;	/* folios added to ioend */
+ 	struct inode		*io_inode;	/* file being written to */
+ 	size_t			io_size;	/* size of the extent */
+ 	loff_t			io_offset;	/* offset in the file */
++	sector_t		io_sector;	/* start sector of ioend */
+ 	struct bio		*io_bio;	/* bio being built */
+ 	struct bio		io_inline_bio;	/* MUST BE LAST! */
+ };
