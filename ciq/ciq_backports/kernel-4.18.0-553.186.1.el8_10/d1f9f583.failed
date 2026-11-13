@@ -1,0 +1,255 @@
+drm/amdgpu: validate and share PSP fw_pri_buf copies via psp_copy_fw
+
+jira KERNEL-1911
+cve CVE-2026-97494
+Rebuild_History Non-Buildable kernel-4.18.0-553.186.1.el8_10
+commit-author Candice Li <candice.li@amd.com>
+commit d1f9f5839bd785a3a06335a01d53282e80f8e5fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.186.1.el8_10/d1f9f583.failed
+
+Change psp_copy_fw from void to int: return -ENODEV when drm_dev_enter
+fails, and -EINVAL when the image size is zero or larger than the
+1 MiB PSP private buffer.
+
+Replace open-coded memset/memcpy into fw_pri_buf with psp_copy_fw.
+
+	Signed-off-by: Candice Li <candice.li@amd.com>
+	Reviewed-by: Tao Zhou <tao.zhou1@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit d1f9f5839bd785a3a06335a01d53282e80f8e5fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/psp_v14_0.c
+* Unmerged path drivers/gpu/drm/amd/amdgpu/psp_v14_0.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+index 89a62df76a12..59e6b521a2f5 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -729,7 +729,11 @@ static int psp_load_toc(struct psp_context *psp,
+ 	struct psp_gfx_cmd_resp *cmd = acquire_psp_cmd_buf(psp);
+ 
+ 	/* Copy toc to psp firmware private buffer */
+-	psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes);
++	ret = psp_copy_fw(psp, psp->toc.start_addr, psp->toc.size_bytes);
++	if (ret) {
++		release_psp_cmd_buf(psp);
++		return ret;
++	}
+ 
+ 	psp_prep_load_toc_cmd_buf(cmd, psp->fw_pri_mc_addr, psp->toc.size_bytes);
+ 
+@@ -943,8 +947,11 @@ static int psp_rl_load(struct amdgpu_device *adev)
+ 
+ 	cmd = acquire_psp_cmd_buf(psp);
+ 
+-	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+-	memcpy(psp->fw_pri_buf, psp->rl.start_addr, psp->rl.size_bytes);
++	ret = psp_copy_fw(psp, psp->rl.start_addr, psp->rl.size_bytes);
++	if (ret) {
++		release_psp_cmd_buf(psp);
++		return ret;
++	}
+ 
+ 	cmd->cmd_id = GFX_CMD_ID_LOAD_IP_FW;
+ 	cmd->cmd.cmd_load_ip_fw.fw_phy_addr_lo = lower_32_bits(psp->fw_pri_mc_addr);
+@@ -1116,8 +1123,12 @@ int psp_ta_load(struct psp_context *psp, struct ta_context *context)
+ 
+ 	cmd = acquire_psp_cmd_buf(psp);
+ 
+-	psp_copy_fw(psp, context->bin_desc.start_addr,
+-		    context->bin_desc.size_bytes);
++	ret = psp_copy_fw(psp, context->bin_desc.start_addr,
++			  context->bin_desc.size_bytes);
++	if (ret) {
++		release_psp_cmd_buf(psp);
++		return ret;
++	}
+ 
+ 	psp_prep_ta_load_cmd_buf(cmd, psp->fw_pri_mc_addr, context);
+ 
+@@ -3468,17 +3479,24 @@ static ssize_t psp_usbc_pd_fw_sysfs_write(struct device *dev,
+ 	return count;
+ }
+ 
+-void psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size)
++int psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size)
+ {
+ 	int idx;
+ 
+ 	if (!drm_dev_enter(adev_to_drm(psp->adev), &idx))
+-		return;
++		return -ENODEV;
++
++	if (!bin_size || bin_size > PSP_1_MEG) {
++		dev_err(psp->adev->dev, "PSP firmware is invalid\n");
++		drm_dev_exit(idx);
++		return -EINVAL;
++	}
+ 
+ 	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+ 	memcpy(psp->fw_pri_buf, start_addr, bin_size);
+ 
+ 	drm_dev_exit(idx);
++	return 0;
+ }
+ 
+ static DEVICE_ATTR(usbc_pd_fw, S_IRUGO | S_IWUSR,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+index cf4f60c66122..3fbf9570f58b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.h
+@@ -517,7 +517,7 @@ int psp_get_fw_attestation_records_addr(struct psp_context *psp,
+ 
+ int psp_load_fw_list(struct psp_context *psp,
+ 		     struct amdgpu_firmware_info **ucode_list, int ucode_count);
+-void psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size);
++int psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size);
+ 
+ int is_psp_fw_valid(struct psp_bin_desc bin);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+index 8f84fe40abbb..7f6c45539eb8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+@@ -193,7 +193,9 @@ static int psp_v11_0_bootloader_load_component(struct psp_context  	*psp,
+ 		return ret;
+ 
+ 	/* Copy PSP System Driver binary to memory */
+-	psp_copy_fw(psp, bin_desc->start_addr, bin_desc->size_bytes);
++	ret = psp_copy_fw(psp, bin_desc->start_addr, bin_desc->size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the sys driver to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
+@@ -239,7 +241,9 @@ static int psp_v11_0_bootloader_load_sos(struct psp_context *psp)
+ 		return ret;
+ 
+ 	/* Copy Secure OS binary to PSP memory */
+-	psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	ret = psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP secure OS to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v12_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v12_0.c
+index fcd708eae75c..14e6cd44cc01 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v12_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v12_0.c
+@@ -90,7 +90,9 @@ static int psp_v12_0_bootloader_load_sysdrv(struct psp_context *psp)
+ 		return ret;
+ 
+ 	/* Copy PSP System Driver binary to memory */
+-	psp_copy_fw(psp, psp->sys.start_addr, psp->sys.size_bytes);
++	ret = psp_copy_fw(psp, psp->sys.start_addr, psp->sys.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the sys driver to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
+@@ -129,7 +131,9 @@ static int psp_v12_0_bootloader_load_sos(struct psp_context *psp)
+ 		return ret;
+ 
+ 	/* Copy Secure OS binary to PSP memory */
+-	psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	ret = psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP secure OS to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+index bf6b2b9f1811..5eb8fdbb4907 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v13_0.c
+@@ -169,10 +169,9 @@ static int psp_v13_0_bootloader_load_component(struct psp_context  	*psp,
+ 	if (ret)
+ 		return ret;
+ 
+-	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+-
+-	/* Copy PSP KDB binary to memory */
+-	memcpy(psp->fw_pri_buf, bin_desc->start_addr, bin_desc->size_bytes);
++	ret = psp_copy_fw(psp, bin_desc->start_addr, bin_desc->size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP KDB to bootloader */
+ 	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_36,
+@@ -238,10 +237,9 @@ static int psp_v13_0_bootloader_load_sos(struct psp_context *psp)
+ 	if (ret)
+ 		return ret;
+ 
+-	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+-
+-	/* Copy Secure OS binary to PSP memory */
+-	memcpy(psp->fw_pri_buf, psp->sos.start_addr, psp->sos.size_bytes);
++	ret = psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP secure OS to bootloader */
+ 	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_36,
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v13_0_4.c b/drivers/gpu/drm/amd/amdgpu/psp_v13_0_4.c
+index 555599280277..89e33bc04d1d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v13_0_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v13_0_4.c
+@@ -108,10 +108,9 @@ static int psp_v13_0_4_bootloader_load_component(struct psp_context  	*psp,
+ 	if (ret)
+ 		return ret;
+ 
+-	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+-
+-	/* Copy PSP KDB binary to memory */
+-	memcpy(psp->fw_pri_buf, bin_desc->start_addr, bin_desc->size_bytes);
++	ret = psp_copy_fw(psp, bin_desc->start_addr, bin_desc->size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP KDB to bootloader */
+ 	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_36,
+@@ -171,10 +170,9 @@ static int psp_v13_0_4_bootloader_load_sos(struct psp_context *psp)
+ 	if (ret)
+ 		return ret;
+ 
+-	memset(psp->fw_pri_buf, 0, PSP_1_MEG);
+-
+-	/* Copy Secure OS binary to PSP memory */
+-	memcpy(psp->fw_pri_buf, psp->sos.start_addr, psp->sos.size_bytes);
++	ret = psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP secure OS to bootloader */
+ 	WREG32_SOC15(MP0, 0, regMP0_SMN_C2PMSG_36,
+* Unmerged path drivers/gpu/drm/amd/amdgpu/psp_v14_0.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+index f6b75e3e47ff..b0c1046c355d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v3_1.c
+@@ -96,7 +96,9 @@ static int psp_v3_1_bootloader_load_sysdrv(struct psp_context *psp)
+ 		return ret;
+ 
+ 	/* Copy PSP System Driver binary to memory */
+-	psp_copy_fw(psp, psp->sys.start_addr, psp->sys.size_bytes);
++	ret = psp_copy_fw(psp, psp->sys.start_addr, psp->sys.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the sys driver to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
+@@ -135,7 +137,9 @@ static int psp_v3_1_bootloader_load_sos(struct psp_context *psp)
+ 		return ret;
+ 
+ 	/* Copy Secure OS binary to PSP memory */
+-	psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	ret = psp_copy_fw(psp, psp->sos.start_addr, psp->sos.size_bytes);
++	if (ret)
++		return ret;
+ 
+ 	/* Provide the PSP secure OS to bootloader */
+ 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
