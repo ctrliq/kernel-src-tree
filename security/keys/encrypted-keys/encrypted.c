@@ -599,6 +599,7 @@ static struct encrypted_key_payload *encrypted_key_alloc(struct key *key,
 {
 	struct encrypted_key_payload *epayload = NULL;
 	unsigned short datablob_len;
+	unsigned short payload_totallen;
 	unsigned short decrypted_datalen;
 	unsigned short payload_datalen;
 	unsigned int encrypted_datalen;
@@ -633,16 +634,23 @@ static struct encrypted_key_payload *encrypted_key_alloc(struct key *key,
 
 	encrypted_datalen = roundup(decrypted_datalen, blksize);
 
-	datablob_len = format_len + 1 + strlen(master_desc) + 1
+	ret = format_len + 1 + strlen(master_desc) + 1
 	    + strlen(datalen) + 1 + ivsize + 1 + encrypted_datalen;
+	if (ret > USHRT_MAX)
+		return ERR_PTR(-EINVAL);
+	datablob_len = ret;
 
-	ret = key_payload_reserve(key, payload_datalen + datablob_len
-				  + HASH_SIZE + 1);
+	ret = datablob_len + payload_datalen + HASH_SIZE + 1;
+	if (ret > USHRT_MAX)
+		return ERR_PTR(-EINVAL);
+	payload_totallen = ret;
+
+	ret = key_payload_reserve(key, payload_totallen);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	epayload = kzalloc(sizeof(*epayload) + payload_datalen +
-			   datablob_len + HASH_SIZE + 1, GFP_KERNEL);
+	epayload = kzalloc(sizeof(*epayload) + payload_totallen,
+			   GFP_KERNEL);
 	if (!epayload)
 		return ERR_PTR(-ENOMEM);
 
