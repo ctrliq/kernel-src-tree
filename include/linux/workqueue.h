@@ -71,8 +71,8 @@ enum {
 	 * data contains off-queue information when !WORK_STRUCT_PWQ.
 	 *
 	 * MSB
-	 * [ pool ID ] [ OFFQ flags ] [ STRUCT flags ]
-	 *                 1 bit        4 or 5 bits
+	 * [ disable depth ] [ pool ID ] [ OFFQ flags ] [ STRUCT flags ]
+	 *      16 bits         31 bits       1 bit        4 or 5 bits
 	 */
 	WORK_OFFQ_FLAG_SHIFT	= WORK_STRUCT_FLAG_BITS,
 	WORK_OFFQ_CANCELING_BIT = WORK_OFFQ_FLAG_SHIFT,
@@ -83,15 +83,22 @@ enum {
 	 * When a work item is off queue, the high bits encode off-queue flags
 	 * and the last pool it was on. Cap pool ID to 31 bits and use the
 	 * highest number to indicate that no pool is associated.
+	 *
+	 * The pool ID keeps its pre-disable position so WORK_STRUCT_NO_POOL,
+	 * which modules inline through INIT_WORK(), doesn't change (kABI).
 	 */
 	WORK_OFFQ_POOL_SHIFT	= WORK_OFFQ_FLAG_SHIFT + WORK_OFFQ_FLAG_BITS,
 	WORK_OFFQ_LEFT		= BITS_PER_LONG - WORK_OFFQ_POOL_SHIFT,
 	WORK_OFFQ_POOL_BITS	= WORK_OFFQ_LEFT <= 31 ? WORK_OFFQ_LEFT : 31,
 	WORK_OFFQ_POOL_NONE	= (1LU << WORK_OFFQ_POOL_BITS) - 1,
 
+	WORK_OFFQ_DISABLE_SHIFT	= WORK_OFFQ_POOL_SHIFT + WORK_OFFQ_POOL_BITS,
+	WORK_OFFQ_DISABLE_BITS	= 16,
+
 	/* convenience constants */
 	WORK_OFFQ_CANCELING	= (1 << WORK_OFFQ_CANCELING_BIT),
 	WORK_OFFQ_FLAG_MASK	= ((1UL << WORK_OFFQ_FLAG_BITS) - 1) << WORK_OFFQ_FLAG_SHIFT,
+	WORK_OFFQ_DISABLE_MASK	= ((1UL << WORK_OFFQ_DISABLE_BITS) - 1) << WORK_OFFQ_DISABLE_SHIFT,
 	WORK_STRUCT_PWQ_MASK	= ~((1UL << WORK_STRUCT_PWQ_SHIFT) - 1),
 	WORK_STRUCT_NO_POOL	= (unsigned long)WORK_OFFQ_POOL_NONE << WORK_OFFQ_POOL_SHIFT,
 
@@ -469,6 +476,14 @@ extern bool cancel_work_sync(struct work_struct *work);
 extern bool flush_delayed_work(struct delayed_work *dwork);
 extern bool cancel_delayed_work(struct delayed_work *dwork);
 extern bool cancel_delayed_work_sync(struct delayed_work *dwork);
+
+extern bool disable_work(struct work_struct *work);
+extern bool disable_work_sync(struct work_struct *work);
+extern bool enable_work(struct work_struct *work);
+
+extern bool disable_delayed_work(struct delayed_work *dwork);
+extern bool disable_delayed_work_sync(struct delayed_work *dwork);
+extern bool enable_delayed_work(struct delayed_work *dwork);
 
 extern bool flush_rcu_work(struct rcu_work *rwork);
 
