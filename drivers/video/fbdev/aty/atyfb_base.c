@@ -2330,8 +2330,6 @@ static void aty_calc_mem_refresh(struct atyfb_par *par, int xclk)
  * Initialisation
  */
 
-static struct fb_info *fb_list = NULL;
-
 #if defined(__i386__) && defined(CONFIG_FB_ATY_GENERIC_LCD)
 static int atyfb_get_timings_from_lcd(struct atyfb_par *par,
 				      struct fb_var_screeninfo *var)
@@ -2762,8 +2760,6 @@ static int aty_init(struct fb_info *info)
 		fb_dealloc_cmap(&info->cmap);
 		goto aty_init_exit;
 	}
-
-	fb_list = info;
 
 	PRINTKI("fb%d: %s frame buffer device on %s\n",
 		info->node, info->fix.id, par->bus_type == ISA ? "ISA" : "PCI");
