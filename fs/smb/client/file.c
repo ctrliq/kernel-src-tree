@@ -3379,13 +3379,44 @@ fsync_exit:
  * As file closes, flush all cached write data for this inode checking
  * for write behind errors.
  */
+struct cifs_flush_work {
+	struct work_struct	work;
+	struct inode		*inode;
+	int			rc;
+};
+
+static void cifs_flush_worker(struct work_struct *work)
+{
+	struct cifs_flush_work *fw = container_of(work, struct cifs_flush_work,
+						  work);
+
+	fw->rc = filemap_write_and_wait(fw->inode->i_mapping);
+}
+
+static int cifs_flush_inode(struct inode *inode)
+{
+	struct cifs_flush_work fw = { .inode = inode };
+	int rc = 0;
+
+	if (!fatal_signal_pending(current))
+		rc = filemap_write_and_wait(inode->i_mapping);
+	if (!fatal_signal_pending(current))
+		return rc;
+
+	INIT_WORK_ONSTACK(&fw.work, cifs_flush_worker);
+	queue_work(cifs_writeback_wq, &fw.work);
+	flush_work(&fw.work);
+	destroy_work_on_stack(&fw.work);
+	return fw.rc;
+}
+
 int cifs_flush(struct file *file, fl_owner_t id)
 {
 	struct inode *inode = file_inode(file);
 	int rc = 0;
 
 	if (file->f_mode & FMODE_WRITE)
-		rc = filemap_write_and_wait(inode->i_mapping);
+		rc = cifs_flush_inode(inode);
 
 	cifs_dbg(FYI, "Flush inode %p file %p rc %d\n", inode, file, rc);
 	if (rc) {
