@@ -951,6 +951,8 @@ static int hwa742_init(struct omapfb_device *fbdev, int ext_mode,
 	omapfb_conf = dev_get_platdata(fbdev->dev);
 
 	hwa742.sys_ck = clk_get(NULL, "hwa_sys_ck");
+	if (IS_ERR(hwa742.sys_ck))
+		return PTR_ERR(hwa742.sys_ck);
 
 	spin_lock_init(&hwa742.req_lock);
 
@@ -1029,6 +1031,7 @@ err3:
 err2:
 	hwa742.int_ctrl->cleanup();
 err1:
+	clk_put(hwa742.sys_ck);
 	return r;
 }
 
@@ -1038,6 +1041,7 @@ static void hwa742_cleanup(void)
 	hwa742.extif->cleanup();
 	hwa742.int_ctrl->cleanup();
 	clk_disable(hwa742.sys_ck);
+	clk_put(hwa742.sys_ck);
 }
 
 struct lcd_ctrl hwa742_ctrl = {
