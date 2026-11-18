@@ -782,6 +782,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		keys/redhatsecureboot504.cer \
 		uki.sbat.template \
 		uki-addons.sbat.template \
+		uki.cmdline \
 		$(SOURCES)/
 	@changelog_glob="$(SPECPACKAGE_NAME).changelog-*"; \
 	cat $$(ls -1 $$changelog_glob | sort -V -r) \
