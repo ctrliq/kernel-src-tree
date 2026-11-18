@@ -771,15 +771,15 @@ static void restore_stack_args(int nr_stack_args, int args_off, int stk_arg_off,
 	}
 }
 
-static int invoke_bpf_prog(struct bpf_tramp_link *l, int args_off, int retval_off,
+static int invoke_bpf_prog(struct bpf_tramp_node *node, int args_off, int retval_off,
 			   int run_ctx_off, bool save_ret, struct rv_jit_context *ctx)
 {
 	int ret, branch_off;
-	struct bpf_prog *p = l->link.prog;
+	struct bpf_prog *p = node->link->prog;
 	int cookie_off = offsetof(struct bpf_tramp_run_ctx, bpf_cookie);
 
-	if (l->cookie) {
-		emit_imm(RV_REG_T1, l->cookie, ctx);
+	if (node->cookie) {
+		emit_imm(RV_REG_T1, node->cookie, ctx);
 		emit_sd(RV_REG_FP, -run_ctx_off + cookie_off, RV_REG_T1, ctx);
 	} else {
 		emit_sd(RV_REG_FP, -run_ctx_off + cookie_off, RV_REG_ZERO, ctx);
@@ -837,7 +837,7 @@ static int invoke_bpf_prog(struct bpf_tramp_link *l, int args_off, int retval_of
 
 static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im,
 					 const struct btf_func_model *m,
-					 struct bpf_tramp_links *tlinks,
+					 struct bpf_tramp_nodes *tnodes,
 					 void *func_addr, u32 flags,
 					 struct rv_jit_context *ctx)
 {
@@ -845,9 +845,9 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im,
 	int *branches_off = NULL;
 	int stack_size = 0, nr_arg_slots = 0;
 	int retval_off, args_off, nregs_off, ip_off, run_ctx_off, sreg_off, stk_arg_off;
-	struct bpf_tramp_links *fentry = &tlinks[BPF_TRAMP_FENTRY];
-	struct bpf_tramp_links *fexit = &tlinks[BPF_TRAMP_FEXIT];
-	struct bpf_tramp_links *fmod_ret = &tlinks[BPF_TRAMP_MODIFY_RETURN];
+	struct bpf_tramp_nodes *fentry = &tnodes[BPF_TRAMP_FENTRY];
+	struct bpf_tramp_nodes *fexit = &tnodes[BPF_TRAMP_FEXIT];
+	struct bpf_tramp_nodes *fmod_ret = &tnodes[BPF_TRAMP_MODIFY_RETURN];
 	bool is_struct_ops = flags & BPF_TRAMP_F_INDIRECT;
 	void *orig_call = func_addr;
 	bool save_ret;
@@ -989,22 +989,22 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im,
 			return ret;
 	}
 
-	for (i = 0; i < fentry->nr_links; i++) {
-		ret = invoke_bpf_prog(fentry->links[i], args_off, retval_off, run_ctx_off,
+	for (i = 0; i < fentry->nr_nodes; i++) {
+		ret = invoke_bpf_prog(fentry->nodes[i], args_off, retval_off, run_ctx_off,
 				      flags & BPF_TRAMP_F_RET_FENTRY_RET, ctx);
 		if (ret)
 			return ret;
 	}
 
-	if (fmod_ret->nr_links) {
-		branches_off = kzalloc_objs(int, fmod_ret->nr_links, GFP_KERNEL);
+	if (fmod_ret->nr_nodes) {
+		branches_off = kzalloc_objs(int, fmod_ret->nr_nodes, GFP_KERNEL);
 		if (!branches_off)
 			return -ENOMEM;
 
 		/* cleanup to avoid garbage return value confusion */
 		emit_sd(RV_REG_FP, -retval_off, RV_REG_ZERO, ctx);
-		for (i = 0; i < fmod_ret->nr_links; i++) {
-			ret = invoke_bpf_prog(fmod_ret->links[i], args_off, retval_off,
+		for (i = 0; i < fmod_ret->nr_nodes; i++) {
+			ret = invoke_bpf_prog(fmod_ret->nodes[i], args_off, retval_off,
 					      run_ctx_off, true, ctx);
 			if (ret)
 				goto out;
@@ -1030,14 +1030,14 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im,
 	}
 
 	/* update branches saved in invoke_bpf_mod_ret with bnez */
-	for (i = 0; ctx->insns && i < fmod_ret->nr_links; i++) {
+	for (i = 0; ctx->insns && i < fmod_ret->nr_nodes; i++) {
 		offset = ninsns_rvoff(ctx->ninsns - branches_off[i]);
 		insn = rv_bne(RV_REG_T1, RV_REG_ZERO, offset >> 1);
 		*(u32 *)(ctx->insns + branches_off[i]) = insn;
 	}
 
-	for (i = 0; i < fexit->nr_links; i++) {
-		ret = invoke_bpf_prog(fexit->links[i], args_off, retval_off,
+	for (i = 0; i < fexit->nr_nodes; i++) {
+		ret = invoke_bpf_prog(fexit->nodes[i], args_off, retval_off,
 				      run_ctx_off, false, ctx);
 		if (ret)
 			goto out;
@@ -1100,7 +1100,7 @@ out:
 }
 
 int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
-			     struct bpf_tramp_links *tlinks, void *func_addr)
+			     struct bpf_tramp_nodes *tnodes, void *func_addr)
 {
 	struct bpf_tramp_image im;
 	struct rv_jit_context ctx;
@@ -1109,14 +1109,14 @@ int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
 	ctx.ninsns = 0;
 	ctx.insns = NULL;
 	ctx.ro_insns = NULL;
-	ret = __arch_prepare_bpf_trampoline(&im, m, tlinks, func_addr, flags, &ctx);
+	ret = __arch_prepare_bpf_trampoline(&im, m, tnodes, func_addr, flags, &ctx);
 
 	return ret < 0 ? ret : ninsns_rvoff(ctx.ninsns);
 }
 
 void *arch_alloc_bpf_trampoline(unsigned int size)
 {
-	return bpf_prog_pack_alloc(size, bpf_fill_ill_insns);
+	return bpf_prog_pack_alloc(size, bpf_fill_ill_insns, false);
 }
 
 void arch_free_bpf_trampoline(void *image, unsigned int size)
@@ -1126,7 +1126,7 @@ void arch_free_bpf_trampoline(void *image, unsigned int size)
 
 int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *ro_image,
 				void *ro_image_end, const struct btf_func_model *m,
-				u32 flags, struct bpf_tramp_links *tlinks,
+				u32 flags, struct bpf_tramp_nodes *tnodes,
 				void *func_addr)
 {
 	int ret;
@@ -1141,7 +1141,7 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *ro_image,
 	ctx.ninsns = 0;
 	ctx.insns = image;
 	ctx.ro_insns = ro_image;
-	ret = __arch_prepare_bpf_trampoline(im, m, tlinks, func_addr, flags, &ctx);
+	ret = __arch_prepare_bpf_trampoline(im, m, tnodes, func_addr, flags, &ctx);
 	if (ret < 0)
 		goto out;
 
@@ -1601,6 +1601,13 @@ int bpf_jit_emit_insn(const struct bpf_insn *insn, struct rv_jit_context *ctx,
 			/* Load current CPU number in R0 */
 			emit_lw(bpf_to_rv_reg(BPF_REG_0, ctx), offsetof(struct thread_info, cpu),
 				RV_REG_TP, ctx);
+			break;
+		}
+
+		/* Implement helper call to bpf_get_current_task/_btf() inline */
+		if (insn->src_reg == 0 && (insn->imm == BPF_FUNC_get_current_task ||
+					   insn->imm == BPF_FUNC_get_current_task_btf)) {
+			emit_mv(bpf_to_rv_reg(BPF_REG_0, ctx), RV_REG_TP, ctx);
 			break;
 		}
 
@@ -2178,6 +2185,8 @@ bool bpf_jit_inlines_helper_call(s32 imm)
 {
 	switch (imm) {
 	case BPF_FUNC_get_smp_processor_id:
+	case BPF_FUNC_get_current_task:
+	case BPF_FUNC_get_current_task_btf:
 		return true;
 	default:
 		return false;
