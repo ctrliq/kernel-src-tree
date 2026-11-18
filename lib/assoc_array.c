@@ -620,6 +620,14 @@ split_node:
 	new_n1->back_pointer = assoc_array_node_to_ptr(new_n0);
 	new_n1->parent_slot = -1; /* Need to calculate this */
 
+	ptr = node->back_pointer;
+	if (!ptr)
+		edit->set[0].ptr = &edit->array->root;
+	else if (assoc_array_ptr_is_node(ptr))
+		edit->set[0].ptr = &assoc_array_ptr_to_node(ptr)->slots[node->parent_slot];
+	else
+		edit->set[0].ptr = &assoc_array_ptr_to_shortcut(ptr)->next_node;
+
 do_split_node:
 	pr_devel("do_split_node\n");
 
@@ -703,13 +711,6 @@ found_slot_for_multiple_occupancy:
 		}
 	}
 
-	ptr = node->back_pointer;
-	if (!ptr)
-		edit->set[0].ptr = &edit->array->root;
-	else if (assoc_array_ptr_is_node(ptr))
-		edit->set[0].ptr = &assoc_array_ptr_to_node(ptr)->slots[node->parent_slot];
-	else
-		edit->set[0].ptr = &assoc_array_ptr_to_shortcut(ptr)->next_node;
 	edit->excised_meta[0] = assoc_array_node_to_ptr(node);
 	pr_devel("<--%s() = ok [split node]\n", __func__);
 	return true;
@@ -719,7 +720,8 @@ all_leaves_cluster_together:
 	 * in the same slot, so we have to replace this node with a shortcut to
 	 * skip over the identical parts of the key and then place a pair of
 	 * nodes, one inside the other, at the end of the shortcut and
-	 * distribute the keys between them.
+	 * distribute the keys between them.  If the node is the target of a
+	 * shortcut, the new one replaces that shortcut as well.
 	 *
 	 * Firstly we need to work out where the leaves start diverging as a
 	 * bit position into their keys so that we know how big the shortcut
@@ -754,6 +756,29 @@ all_leaves_cluster_together:
 	edit->set[0].to = assoc_array_shortcut_to_ptr(new_s0);
 	new_s0->back_pointer = node->back_pointer;
 	new_s0->parent_slot = node->parent_slot;
+
+	/* A shortcut has to lead to a node, so a node at the end of a shortcut
+	 * is replaced together with that shortcut.  The new one holds the index
+	 * key from the root, so it covers what the old one did.
+	 */
+	if (node->back_pointer &&
+	    assoc_array_ptr_is_shortcut(node->back_pointer)) {
+		struct assoc_array_shortcut *above =
+			assoc_array_ptr_to_shortcut(node->back_pointer);
+
+		new_s0->back_pointer = above->back_pointer;
+		new_s0->parent_slot = above->parent_slot;
+		edit->excised_meta[1] = node->back_pointer;
+	}
+
+	/* The shortcut goes wherever its back pointer says, which may be
+	 * further up than the node.
+	 */
+	if (new_s0->back_pointer)
+		edit->set[0].ptr =
+			&assoc_array_ptr_to_node(new_s0->back_pointer)->slots[new_s0->parent_slot];
+	else
+		edit->set[0].ptr = &edit->array->root;
 	new_s0->next_node = assoc_array_node_to_ptr(new_n0);
 	new_n0->back_pointer = assoc_array_shortcut_to_ptr(new_s0);
 	new_n0->parent_slot = 0;
