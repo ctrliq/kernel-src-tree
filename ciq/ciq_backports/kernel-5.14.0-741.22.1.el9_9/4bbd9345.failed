@@ -1,0 +1,548 @@
+kprobes: kretprobe scalability improvement
+
+jira KERNEL-1922
+Rebuild_History Non-Buildable kernel-5.14.0-741.22.1.el9_9
+commit-author wuqiang.matt <wuqiang.matt@bytedance.com>
+commit 4bbd9345565933823f38a419df65661f12adbe5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.22.1.el9_9/4bbd9345.failed
+
+kretprobe is using freelist to manage return-instances, but freelist,
+as LIFO queue based on singly linked list, scales badly and reduces
+the overall throughput of kretprobed routines, especially for high
+contention scenarios.
+
+Here's a typical throughput test of sys_prctl (counts in 10 seconds,
+measured with perf stat -a -I 10000 -e syscalls:sys_enter_prctl):
+
+OS: Debian 10 X86_64, Linux 6.5rc7 with freelist
+HW: XEON 8336C x 2, 64 cores/128 threads, DDR4 3200MT/s
+
+         1T       2T       4T       8T      16T      24T
+   24150045 29317964 15446741 12494489 18287272 17708768
+        32T      48T      64T      72T      96T     128T
+   16200682 13737658 11645677 11269858 10470118  9931051
+
+This patch introduces objpool to replace freelist. objpool is a
+high performance queue, which can bring near-linear scalability
+to kretprobed routines. Tests of kretprobe throughput show the
+biggest ratio as 159x of original freelist. Here's the result:
+
+                  1T         2T         4T         8T        16T
+native:     41186213   82336866  164250978  328662645  658810299
+freelist:   24150045   29317964   15446741   12494489   18287272
+objpool:    23926730   48010314   96125218  191782984  385091769
+                 32T        48T        64T        96T       128T
+native:   1330338351 1969957941 2512291791 2615754135 2671040914
+freelist:   16200682   13737658   11645677   10470118    9931051
+objpool:   764481096 1147149781 1456220214 1502109662 1579015050
+
+Testings on 96-core ARM64 output similarly, but with the biggest
+ratio up to 448x:
+
+OS: Debian 10 AARCH64, Linux 6.5rc7
+HW: Kunpeng-920 96 cores/2 sockets/4 NUMA nodes, DDR4 2933 MT/s
+
+                  1T         2T         4T         8T        16T
+native: .   30066096   63569843  126194076  257447289  505800181
+freelist:   16152090   11064397   11124068    7215768    5663013
+objpool:    13997541   28032100   55726624  110099926  221498787
+                 24T        32T        48T        64T        96T
+native:    763305277 1015925192 1521075123 2033009392 3021013752
+freelist:    5015810    4602893    3766792    3382478    2945292
+objpool:   328192025  439439564  668534502  887401381 1319972072
+
+Link: https://lore.kernel.org/all/20231017135654.82270-4-wuqiang.matt@bytedance.com/
+
+	Signed-off-by: wuqiang.matt <wuqiang.matt@bytedance.com>
+	Acked-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+	Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+(cherry picked from commit 4bbd9345565933823f38a419df65661f12adbe5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kprobes.c
+diff --cc kernel/kprobes.c
+index e1116ec2198a,075a632e6c7c..000000000000
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@@ -1911,6 -1877,80 +1911,83 @@@ static struct notifier_block kprobe_exc
+  #ifdef CONFIG_KRETPROBES
+  
+  #if !defined(CONFIG_KRETPROBE_ON_RETHOOK)
+++<<<<<<< HEAD
+++=======
++ 
++ /* callbacks for objpool of kretprobe instances */
++ static int kretprobe_init_inst(void *nod, void *context)
++ {
++ 	struct kretprobe_instance *ri = nod;
++ 
++ 	ri->rph = context;
++ 	return 0;
++ }
++ static int kretprobe_fini_pool(struct objpool_head *head, void *context)
++ {
++ 	kfree(context);
++ 	return 0;
++ }
++ 
++ static void free_rp_inst_rcu(struct rcu_head *head)
++ {
++ 	struct kretprobe_instance *ri = container_of(head, struct kretprobe_instance, rcu);
++ 	struct kretprobe_holder *rph = ri->rph;
++ 
++ 	objpool_drop(ri, &rph->pool);
++ }
++ NOKPROBE_SYMBOL(free_rp_inst_rcu);
++ 
++ static void recycle_rp_inst(struct kretprobe_instance *ri)
++ {
++ 	struct kretprobe *rp = get_kretprobe(ri);
++ 
++ 	if (likely(rp))
++ 		objpool_push(ri, &rp->rph->pool);
++ 	else
++ 		call_rcu(&ri->rcu, free_rp_inst_rcu);
++ }
++ NOKPROBE_SYMBOL(recycle_rp_inst);
++ 
++ /*
++  * This function is called from delayed_put_task_struct() when a task is
++  * dead and cleaned up to recycle any kretprobe instances associated with
++  * this task. These left over instances represent probed functions that
++  * have been called but will never return.
++  */
++ void kprobe_flush_task(struct task_struct *tk)
++ {
++ 	struct kretprobe_instance *ri;
++ 	struct llist_node *node;
++ 
++ 	/* Early boot, not yet initialized. */
++ 	if (unlikely(!kprobes_initialized))
++ 		return;
++ 
++ 	kprobe_busy_begin();
++ 
++ 	node = __llist_del_all(&tk->kretprobe_instances);
++ 	while (node) {
++ 		ri = container_of(node, struct kretprobe_instance, llist);
++ 		node = node->next;
++ 
++ 		recycle_rp_inst(ri);
++ 	}
++ 
++ 	kprobe_busy_end();
++ }
++ NOKPROBE_SYMBOL(kprobe_flush_task);
++ 
++ static inline void free_rp_inst(struct kretprobe *rp)
++ {
++ 	struct kretprobe_holder *rph = rp->rph;
++ 
++ 	if (!rph)
++ 		return;
++ 	rp->rph = NULL;
++ 	objpool_fini(&rph->pool);
++ }
++ 
+++>>>>>>> 4bbd93455659 (kprobes: kretprobe scalability improvement)
+  /* This assumes the 'tsk' is the current task or the is not running. */
+  static kprobe_opcode_t *__kretprobe_find_ret_addr(struct task_struct *tsk,
+  						  struct llist_node **cur)
+@@@ -2186,28 -2223,16 +2260,33 @@@ int register_kretprobe(struct kretprob
+  	rp->kp.post_handler = NULL;
+  
+  	/* Pre-allocate memory for max kretprobe instances */
+ -	if (rp->maxactive <= 0)
+ +	if (rp->maxactive <= 0) {
+ +#ifdef CONFIG_PREEMPTION
+  		rp->maxactive = max_t(unsigned int, 10, 2*num_possible_cpus());
+ -
+ +#else
+ +		rp->maxactive = num_possible_cpus();
+ +#endif
+ +	}
+  #ifdef CONFIG_KRETPROBE_ON_RETHOOK
+- 	rp->rh = rethook_alloc((void *)rp, kretprobe_rethook_handler);
+- 	if (!rp->rh)
+- 		return -ENOMEM;
++ 	rp->rh = rethook_alloc((void *)rp, kretprobe_rethook_handler,
++ 				sizeof(struct kretprobe_instance) +
++ 				rp->data_size, rp->maxactive);
++ 	if (IS_ERR(rp->rh))
++ 		return PTR_ERR(rp->rh);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < rp->maxactive; i++) {
+ +		inst = kzalloc(sizeof(struct kretprobe_instance) +
+ +			       rp->data_size, GFP_KERNEL);
+ +		if (inst == NULL) {
+ +			rethook_free(rp->rh);
+ +			rp->rh = NULL;
+ +			return -ENOMEM;
+ +		}
+ +		rethook_add_node(rp->rh, &inst->node);
+ +	}
+++=======
+++>>>>>>> 4bbd93455659 (kprobes: kretprobe scalability improvement)
+  	rp->nmissed = 0;
+  	/* Establish function entry probe point */
+  	ret = register_kprobe(&rp->kp);
+@@@ -2221,20 -2245,14 +2299,28 @@@
+  	if (!rp->rph)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	rp->rph->rp = rp;
+ +	for (i = 0; i < rp->maxactive; i++) {
+ +		inst = kzalloc(sizeof(struct kretprobe_instance) +
+ +			       rp->data_size, GFP_KERNEL);
+ +		if (inst == NULL) {
+ +			refcount_set(&rp->rph->ref, i);
+ +			free_rp_inst(rp);
+ +			return -ENOMEM;
+ +		}
+ +		inst->rph = rp->rph;
+ +		freelist_add(&inst->freelist, &rp->freelist);
+++=======
++ 	if (objpool_init(&rp->rph->pool, rp->maxactive, rp->data_size +
++ 			sizeof(struct kretprobe_instance), GFP_KERNEL,
++ 			rp->rph, kretprobe_init_inst, kretprobe_fini_pool)) {
++ 		kfree(rp->rph);
++ 		rp->rph = NULL;
++ 		return -ENOMEM;
+++>>>>>>> 4bbd93455659 (kprobes: kretprobe scalability improvement)
+  	}
+- 	refcount_set(&rp->rph->ref, i);
+- 
++ 	rp->rph->rp = rp;
+  	rp->nmissed = 0;
+  	/* Establish function entry probe point */
+  	ret = register_kprobe(&rp->kp);
+diff --git a/include/linux/kprobes.h b/include/linux/kprobes.h
+index ea3fdd37d129..d60da987724f 100644
+--- a/include/linux/kprobes.h
++++ b/include/linux/kprobes.h
+@@ -26,8 +26,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/mutex.h>
+ #include <linux/ftrace.h>
+-#include <linux/refcount.h>
+-#include <linux/freelist.h>
++#include <linux/objpool.h>
+ #include <linux/rethook.h>
+ #include <asm/kprobes.h>
+ 
+@@ -141,7 +140,7 @@ static inline bool kprobe_ftrace(struct kprobe *p)
+  */
+ struct kretprobe_holder {
+ 	struct kretprobe	*rp;
+-	refcount_t		ref;
++	struct objpool_head	pool;
+ };
+ 
+ struct kretprobe {
+@@ -154,7 +153,6 @@ struct kretprobe {
+ #ifdef CONFIG_KRETPROBE_ON_RETHOOK
+ 	struct rethook *rh;
+ #else
+-	struct freelist_head freelist;
+ 	struct kretprobe_holder *rph;
+ #endif
+ };
+@@ -165,10 +163,7 @@ struct kretprobe_instance {
+ #ifdef CONFIG_KRETPROBE_ON_RETHOOK
+ 	struct rethook_node node;
+ #else
+-	union {
+-		struct freelist_node freelist;
+-		struct rcu_head rcu;
+-	};
++	struct rcu_head rcu;
+ 	struct llist_node llist;
+ 	struct kretprobe_holder *rph;
+ 	kprobe_opcode_t *ret_addr;
+diff --git a/include/linux/rethook.h b/include/linux/rethook.h
+index 26b6f3c81a76..ce69b2b7bc35 100644
+--- a/include/linux/rethook.h
++++ b/include/linux/rethook.h
+@@ -6,11 +6,10 @@
+ #define _LINUX_RETHOOK_H
+ 
+ #include <linux/compiler.h>
+-#include <linux/freelist.h>
++#include <linux/objpool.h>
+ #include <linux/kallsyms.h>
+ #include <linux/llist.h>
+ #include <linux/rcupdate.h>
+-#include <linux/refcount.h>
+ 
+ struct rethook_node;
+ 
+@@ -30,14 +29,12 @@ typedef void (*rethook_handler_t) (struct rethook_node *, void *, unsigned long,
+ struct rethook {
+ 	void			*data;
+ 	rethook_handler_t	handler;
+-	struct freelist_head	pool;
+-	refcount_t		ref;
++	struct objpool_head	pool;
+ 	struct rcu_head		rcu;
+ };
+ 
+ /**
+  * struct rethook_node - The rethook shadow-stack entry node.
+- * @freelist: The freelist, linked to struct rethook::pool.
+  * @rcu: The rcu_head for deferred freeing.
+  * @llist: The llist, linked to a struct task_struct::rethooks.
+  * @rethook: The pointer to the struct rethook.
+@@ -48,20 +45,16 @@ struct rethook {
+  * on each entry of the shadow stack.
+  */
+ struct rethook_node {
+-	union {
+-		struct freelist_node freelist;
+-		struct rcu_head      rcu;
+-	};
++	struct rcu_head		rcu;
+ 	struct llist_node	llist;
+ 	struct rethook		*rethook;
+ 	unsigned long		ret_addr;
+ 	unsigned long		frame;
+ };
+ 
+-struct rethook *rethook_alloc(void *data, rethook_handler_t handler);
++struct rethook *rethook_alloc(void *data, rethook_handler_t handler, int size, int num);
+ void rethook_stop(struct rethook *rh);
+ void rethook_free(struct rethook *rh);
+-void rethook_add_node(struct rethook *rh, struct rethook_node *node);
+ struct rethook_node *rethook_try_get(struct rethook *rh);
+ void rethook_recycle(struct rethook_node *node);
+ void rethook_hook(struct rethook_node *node, struct pt_regs *regs, bool mcount);
+@@ -98,4 +91,3 @@ void rethook_flush_task(struct task_struct *tk);
+ #endif
+ 
+ #endif
+-
+* Unmerged path kernel/kprobes.c
+diff --git a/kernel/trace/fprobe.c b/kernel/trace/fprobe.c
+index 4fe171bc5184..e15c335dc27b 100644
+--- a/kernel/trace/fprobe.c
++++ b/kernel/trace/fprobe.c
+@@ -181,7 +181,7 @@ static void fprobe_init(struct fprobe *fp)
+ 
+ static int fprobe_init_rethook(struct fprobe *fp, int num)
+ {
+-	int i, size;
++	int size;
+ 
+ 	if (num <= 0)
+ 		return -EINVAL;
+@@ -199,26 +199,18 @@ static int fprobe_init_rethook(struct fprobe *fp, int num)
+ 	if (size <= 0)
+ 		return -EINVAL;
+ 
+-	fp->rethook = rethook_alloc((void *)fp, fprobe_exit_handler);
+-	if (!fp->rethook)
+-		return -ENOMEM;
+-	for (i = 0; i < size; i++) {
+-		struct fprobe_rethook_node *node;
+-
+-		node = kzalloc(sizeof(*node) + fp->entry_data_size, GFP_KERNEL);
+-		if (!node) {
+-			rethook_free(fp->rethook);
+-			fp->rethook = NULL;
+-			return -ENOMEM;
+-		}
+-		rethook_add_node(fp->rethook, &node->node);
+-	}
++	/* Initialize rethook */
++	fp->rethook = rethook_alloc((void *)fp, fprobe_exit_handler,
++				sizeof(struct fprobe_rethook_node), size);
++	if (IS_ERR(fp->rethook))
++		return PTR_ERR(fp->rethook);
++
+ 	return 0;
+ }
+ 
+ static void fprobe_fail_cleanup(struct fprobe *fp)
+ {
+-	if (fp->rethook) {
++	if (!IS_ERR_OR_NULL(fp->rethook)) {
+ 		/* Don't need to cleanup rethook->handler because this is not used. */
+ 		rethook_free(fp->rethook);
+ 		fp->rethook = NULL;
+@@ -366,14 +358,14 @@ int unregister_fprobe(struct fprobe *fp)
+ 		    fp->ops.saved_func != fprobe_kprobe_handler))
+ 		return -EINVAL;
+ 
+-	if (fp->rethook)
++	if (!IS_ERR_OR_NULL(fp->rethook))
+ 		rethook_stop(fp->rethook);
+ 
+ 	ret = unregister_ftrace_function(&fp->ops);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (fp->rethook)
++	if (!IS_ERR_OR_NULL(fp->rethook))
+ 		rethook_free(fp->rethook);
+ 
+ 	ftrace_free_filter(&fp->ops);
+diff --git a/kernel/trace/rethook.c b/kernel/trace/rethook.c
+index 5eb9b598f4e9..13c8e6773892 100644
+--- a/kernel/trace/rethook.c
++++ b/kernel/trace/rethook.c
+@@ -9,6 +9,7 @@
+ #include <linux/rethook.h>
+ #include <linux/slab.h>
+ #include <linux/sort.h>
++#include <linux/smp.h>
+ 
+ /* Return hook list (shadow stack by list) */
+ 
+@@ -36,21 +37,7 @@ void rethook_flush_task(struct task_struct *tk)
+ static void rethook_free_rcu(struct rcu_head *head)
+ {
+ 	struct rethook *rh = container_of(head, struct rethook, rcu);
+-	struct rethook_node *rhn;
+-	struct freelist_node *node;
+-	int count = 1;
+-
+-	node = rh->pool.head;
+-	while (node) {
+-		rhn = container_of(node, struct rethook_node, freelist);
+-		node = node->next;
+-		kfree(rhn);
+-		count++;
+-	}
+-
+-	/* The rh->ref is the number of pooled node + 1 */
+-	if (refcount_sub_and_test(count, &rh->ref))
+-		kfree(rh);
++	objpool_fini(&rh->pool);
+ }
+ 
+ /**
+@@ -83,54 +70,62 @@ void rethook_free(struct rethook *rh)
+ 	call_rcu(&rh->rcu, rethook_free_rcu);
+ }
+ 
++static int rethook_init_node(void *nod, void *context)
++{
++	struct rethook_node *node = nod;
++
++	node->rethook = context;
++	return 0;
++}
++
++static int rethook_fini_pool(struct objpool_head *head, void *context)
++{
++	kfree(context);
++	return 0;
++}
++
+ /**
+  * rethook_alloc() - Allocate struct rethook.
+  * @data: a data to pass the @handler when hooking the return.
+- * @handler: the return hook callback function.
++ * @handler: the return hook callback function, must NOT be NULL
++ * @size: node size: rethook node and additional data
++ * @num: number of rethook nodes to be preallocated
+  *
+  * Allocate and initialize a new rethook with @data and @handler.
+- * Return NULL if memory allocation fails or @handler is NULL.
++ * Return pointer of new rethook, or error codes for failures.
++ *
+  * Note that @handler == NULL means this rethook is going to be freed.
+  */
+-struct rethook *rethook_alloc(void *data, rethook_handler_t handler)
++struct rethook *rethook_alloc(void *data, rethook_handler_t handler,
++			      int size, int num)
+ {
+-	struct rethook *rh = kzalloc(sizeof(struct rethook), GFP_KERNEL);
++	struct rethook *rh;
+ 
+-	if (!rh || !handler) {
+-		kfree(rh);
+-		return NULL;
+-	}
++	if (!handler || num <= 0 || size < sizeof(struct rethook_node))
++		return ERR_PTR(-EINVAL);
++
++	rh = kzalloc(sizeof(struct rethook), GFP_KERNEL);
++	if (!rh)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	rh->data = data;
+ 	rh->handler = handler;
+-	rh->pool.head = NULL;
+-	refcount_set(&rh->ref, 1);
+ 
++	/* initialize the objpool for rethook nodes */
++	if (objpool_init(&rh->pool, num, size, GFP_KERNEL, rh,
++			 rethook_init_node, rethook_fini_pool)) {
++		kfree(rh);
++		return ERR_PTR(-ENOMEM);
++	}
+ 	return rh;
+ }
+ 
+-/**
+- * rethook_add_node() - Add a new node to the rethook.
+- * @rh: the struct rethook.
+- * @node: the struct rethook_node to be added.
+- *
+- * Add @node to @rh. User must allocate @node (as a part of user's
+- * data structure.) The @node fields are initialized in this function.
+- */
+-void rethook_add_node(struct rethook *rh, struct rethook_node *node)
+-{
+-	node->rethook = rh;
+-	freelist_add(&node->freelist, &rh->pool);
+-	refcount_inc(&rh->ref);
+-}
+-
+ static void free_rethook_node_rcu(struct rcu_head *head)
+ {
+ 	struct rethook_node *node = container_of(head, struct rethook_node, rcu);
++	struct rethook *rh = node->rethook;
+ 
+-	if (refcount_dec_and_test(&node->rethook->ref))
+-		kfree(node->rethook);
+-	kfree(node);
++	objpool_drop(node, &rh->pool);
+ }
+ 
+ /**
+@@ -145,7 +140,7 @@ void rethook_recycle(struct rethook_node *node)
+ 	lockdep_assert_preemption_disabled();
+ 
+ 	if (likely(READ_ONCE(node->rethook->handler)))
+-		freelist_add(&node->freelist, &node->rethook->pool);
++		objpool_push(node, &node->rethook->pool);
+ 	else
+ 		call_rcu(&node->rcu, free_rethook_node_rcu);
+ }
+@@ -161,7 +156,6 @@ NOKPROBE_SYMBOL(rethook_recycle);
+ struct rethook_node *rethook_try_get(struct rethook *rh)
+ {
+ 	rethook_handler_t handler = READ_ONCE(rh->handler);
+-	struct freelist_node *fn;
+ 
+ 	lockdep_assert_preemption_disabled();
+ 
+@@ -178,11 +172,7 @@ struct rethook_node *rethook_try_get(struct rethook *rh)
+ 	if (unlikely(!rcu_is_watching()))
+ 		return NULL;
+ 
+-	fn = freelist_try_get(&rh->pool);
+-	if (!fn)
+-		return NULL;
+-
+-	return container_of(fn, struct rethook_node, freelist);
++	return (struct rethook_node *)objpool_pop(&rh->pool);
+ }
+ NOKPROBE_SYMBOL(rethook_try_get);
+ 
