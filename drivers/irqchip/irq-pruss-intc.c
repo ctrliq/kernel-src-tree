@@ -555,7 +555,7 @@ static int pruss_intc_probe(struct platform_device *pdev)
 
 	mutex_init(&intc->lock);
 
-	intc->domain = irq_domain_create_linear(of_fwnode_handle(dev->of_node), max_system_events,
+	intc->domain = irq_domain_create_linear(dev_fwnode(dev), max_system_events,
 						&pruss_intc_irq_domain_ops, intc);
 	if (!intc->domain)
 		return -ENOMEM;
@@ -648,7 +648,7 @@ static struct platform_driver pruss_intc_driver = {
 		.suppress_bind_attrs	= true,
 	},
 	.probe		= pruss_intc_probe,
-	.remove_new	= pruss_intc_remove,
+	.remove		= pruss_intc_remove,
 };
 module_platform_driver(pruss_intc_driver);
 

@@ -150,7 +150,7 @@ static int mvebu_pic_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	pic->domain = irq_domain_create_linear(of_fwnode_handle(node), PIC_MAX_IRQS,
+	pic->domain = irq_domain_create_linear(dev_fwnode(&pdev->dev), PIC_MAX_IRQS,
 					       &mvebu_pic_domain_ops, pic);
 	if (!pic->domain) {
 		dev_err(&pdev->dev, "Failed to allocate irq domain\n");
@@ -183,7 +183,7 @@ MODULE_DEVICE_TABLE(of, mvebu_pic_of_match);
 
 static struct platform_driver mvebu_pic_driver = {
 	.probe		= mvebu_pic_probe,
-	.remove_new	= mvebu_pic_remove,
+	.remove		= mvebu_pic_remove,
 	.driver = {
 		.name		= "mvebu-pic",
 		.of_match_table	= mvebu_pic_of_match,
