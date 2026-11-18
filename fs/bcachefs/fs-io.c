@@ -28,7 +28,7 @@
 #include <linux/falloc.h>
 #include <linux/migrate.h>
 #include <linux/mmu_context.h>
-#include <linux/pagevec.h>
+#include <linux/folio_batch.h>
 #include <linux/rmap.h>
 #include <linux/sched/signal.h>
 #include <linux/task_io_accounting_ops.h>

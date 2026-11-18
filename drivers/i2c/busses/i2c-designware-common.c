@@ -31,6 +31,8 @@
 
 #define DEFAULT_SYMBOL_NAMESPACE	"I2C_DW_COMMON"
 
+#include <linux/designware_i2c.h>
+
 #include "i2c-designware-core.h"
 
 static char *abort_sources[] = {

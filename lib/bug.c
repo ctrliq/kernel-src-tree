@@ -48,6 +48,7 @@
 #include <linux/rculist.h>
 #include <linux/ftrace.h>
 #include <linux/context_tracking.h>
+#include <kunit/test-bug.h>
 
 extern struct bug_entry __start___bug_table[], __stop___bug_table[];
 
@@ -167,13 +168,20 @@ static enum bug_trap_type __report_bug(unsigned long bugaddr, struct pt_regs *re
 	if (!bug)
 		return BUG_TRAP_TYPE_NONE;
 
-	disable_trace_on_warning();
-
 	bug_get_file_line(bug, &file, &line);
 
 	warning = (bug->flags & BUGFLAG_WARNING) != 0;
 	once = (bug->flags & BUGFLAG_ONCE) != 0;
 	done = (bug->flags & BUGFLAG_DONE) != 0;
+
+	/*
+	 * Before the once logic so suppressed warnings do not consume
+	 * the single-fire budget of WARN_ON_ONCE().
+	 */
+	if (warning && kunit_is_suppressed_warning(true))
+		return BUG_TRAP_TYPE_WARN;
+
+	disable_trace_on_warning();
 
 	if (warning && once) {
 		if (done)
