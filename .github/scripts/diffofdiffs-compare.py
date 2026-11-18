@@ -5,6 +5,14 @@ Each PR commit whose message names an upstream commit is compared with
 that commit by diffofdiffs in tree mode. The outcomes are written to
 comparisons.json for the comment workflow, and the HTML reports of the
 backports that differ are embedded in one page with a report selector.
+
+A rolling-release rebase PR ("[RLC-X] Rebase Custom Changes") names the
+previous branch it cherry-picks from. Its commits are additionally
+matched with the commit carrying the same subject on that branch, and
+each pair is compared the same way; commits without a counterpart on
+the previous branch are compared with upstream only. Those outcomes are
+written to comparisons.json under "rebase", and the differing pairs are
+embedded in a second report page.
 """
 import json
 import os
@@ -27,6 +35,28 @@ UPSTREAM_LINES = (
 )
 CHERRY_PICK_LINE = re.compile(
     r"[ \t]*\(cherry picked from commit " + REFERENCE + r"\)[ \t]*")
+
+# A rebase PR names the previous branch its changes were cherry-picked
+# from. The marker form is for the PR template; the prose form is what
+# the rebase process already writes. Branch names keep the shape the
+# workflow itself accepts.
+BRANCH_NAME = r"[a-zA-Z0-9/_.{}-]{1,255}"
+REBASE_MARKER = re.compile(
+    r"<!--\s*diffofdiffs: previous-branch=(" + BRANCH_NAME + r")\s*-->")
+REBASE_LEGACY = re.compile(
+    r"Cherry-pick all code from previous branch `(" + BRANCH_NAME + r")`")
+REBASE_TITLE = re.compile(r"^\[RLC-\d+\]\s+Rebase Custom Changes\b")
+REBASE_TITLE_BRANCH = re.compile(r"^\[RLC-\d+\]\s+Rebase Custom Changes to (\S+)$")
+# The custom changes of a rolling-release branch are the commits above
+# its RHEL import tag, whose name is the branch's version-release with
+# the rlc-N/ prefix replaced by resf_kernel-
+IMPORT_TAG = re.compile(r"^rlc-\d+/(.+)$")
+# When the import tag is unknown, match against a window of this many
+# commits beyond the PR size instead of the exact custom-changes range
+PREV_EXTRA_DEPTH = 100
+# A counterpart that only added a .failed marker recorded a cherry-pick
+# that failed because the fix had already arrived in the RHEL source drop
+MARKER_PATH = re.compile(r"^ciq/ciq_backports/.*\.failed$")
 
 
 class CompareError(Exception):
@@ -68,6 +98,77 @@ def upstream_reference(message):
     return reference
 
 
+def previous_branch(title, body):
+    """Return the previous branch named by a rebase PR, or "" """
+    match = REBASE_MARKER.search(body or "")
+    if not match and REBASE_TITLE.match(title or ""):
+        match = REBASE_LEGACY.search(body or "")
+    if not match:
+        return ""
+    # The name reaches git as one argument, but validate its shape anyway
+    # so a malformed marker cannot spend a fetch on it
+    if not re.fullmatch(BRANCH_NAME, match[1]):
+        print(f"Previous-branch warning: {match[1]!r} is not a branch name; "
+              "not comparing with a previous branch")
+        return ""
+    return match[1]
+
+
+def fetch_previous_branch(repo, url, branch, commits):
+    """Fetch a rebase PR's previous branch and return its tip, the commit
+    of its RHEL import tag ("" when unknown) and whether the fetch had to
+    fall back to a bounded window of recent commits"""
+    tag = IMPORT_TAG.match(branch)
+    boundary = ""
+    if tag and _remote_ref_exists(url, f"refs/tags/resf_kernel-{tag[1]}"):
+        try:
+            # History above the import tag is exactly the branch's custom
+            # changes. The exclusion takes the tag by name: the fetch
+            # negotiation rejects a tag object ID here.
+            run(["git", "-C", repo, "fetch", "--no-tags",
+                 f"--shallow-exclude=resf_kernel-{tag[1]}", url,
+                 f"refs/heads/{branch}:refs/prevbranch"], FETCH_SECONDS)
+            # Fetch the tag itself so the import commit it names is
+            # present: it bounds the subject listing below.
+            run(["git", "-C", repo, "fetch", "--no-tags", "--depth=1", url,
+                 f"refs/tags/resf_kernel-{tag[1]}:refs/tags/resf_kernel-{tag[1]}"],
+                FETCH_SECONDS)
+            # The import commit is also the first parent of the oldest
+            # custom change; deepening one generation reconnects the
+            # shallow graft so tree mode can read that parent.
+            run(["git", "-C", repo, "fetch", "--no-tags", "--deepen=1", url,
+                 f"refs/tags/resf_kernel-{tag[1]}:refs/tags/resf_kernel-{tag[1]}"],
+                FETCH_SECONDS)
+            boundary = run(["git", "-C", repo, "rev-parse",
+                            f"refs/tags/resf_kernel-{tag[1]}^{{commit}}"], 60).strip()
+            return _previous_tip(repo), boundary, False
+        except CompareError:
+            pass  # the import tag is unknown; fall back to the window
+    run(["git", "-C", repo, "fetch", "--no-tags",
+         f"--depth={commits + PREV_EXTRA_DEPTH}", url,
+         f"refs/heads/{branch}:refs/prevbranch"], FETCH_SECONDS)
+    return _previous_tip(repo), boundary, True
+
+
+def _remote_ref_exists(url, ref):
+    """Whether a ref exists on the remote"""
+    try:
+        return bool(run(["git", "ls-remote", url, ref], 60).split())
+    except CompareError:
+        return False
+
+
+def _previous_tip(repo):
+    return run(["git", "-C", repo, "rev-parse", "refs/prevbranch"], 60).strip()
+
+
+def marker_commit(repo, sha):
+    """Whether a previous-branch commit only added a .failed rebuild marker"""
+    listing = run(["git", "-C", repo, "diff-tree", "--no-commit-id",
+                   "--name-only", "-r", sha], 60)
+    return any(MARKER_PATH.match(path) for path in listing.splitlines())
+
+
 def fetch(repo, url, commits, depth):
     """Fetch commits with just enough history for diffofdiffs to diff each one"""
     run(["git", "-C", repo, "fetch", "--no-tags", f"--depth={depth}", url,
@@ -80,15 +181,48 @@ def fail(result, error):
     result["error"] = str(error)[:4000]
 
 
-def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary, reports):
-    """Compare every backport and return the result list plus the embedded reports"""
+def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary, reports,
+            title="", body="", base_ref=""):
+    """Compare every backport, and for a rebase PR each previous-branch
+    counterpart; return the upstream results, the rebase summary (None
+    for a PR that names no previous branch) and the previous-branch
+    report entries"""
     commits = gh_api(f"repos/{repository}/pulls/{pr_number}/commits",
                      "--paginate", "--jq", ".[].sha").split()
     if len(commits) != pr_commits:
         raise CompareError(f"The PR has {pr_commits} commits, but GitHub lists "
-                           f"{len(commits)} of them (the limit is {MAX_COMMITS})")
+                          f"{len(commits)} of them (the limit is {MAX_COMMITS})")
     run(["git", "init", "-q", "--bare", repo], 60)
     fetch(repo, head_url, [head_sha], len(commits) + 1)
+
+    # A rebase PR names the previous branch its changes were cherry-picked
+    # from. Fetching that branch gives its custom changes, which each PR
+    # commit's subject is matched against below.
+    rebase = None
+    prev_index = {}
+    previous = previous_branch(title, body)
+    if previous:
+        rebase = {"previous_branch": previous}
+        # The title and the base should name the same new branch
+        titled = REBASE_TITLE_BRANCH.match(title or "")
+        if titled and base_ref and titled[1] != base_ref:
+            print(f"Previous-branch warning: the PR title names {titled[1]} "
+                  f"but the PR base is {base_ref}")
+        try:
+            rebase["previous_sha"], boundary, rebase["partial"] = \
+                fetch_previous_branch(repo, f"https://github.com/{repository}.git",
+                                      previous, pr_commits)
+            prev_range = (f"{boundary}..refs/prevbranch" if boundary
+                          else "refs/prevbranch")
+            listing = run(["git", "-C", repo, "log", "--format=%H|%s",
+                           prev_range], 60)
+            for line in listing.splitlines():
+                sha, _, subject = line.partition("|")
+                # The listing is newest first; the newest commit with a
+                # duplicated subject wins
+                prev_index.setdefault(subject, sha)
+        except CompareError as error:
+            rebase["error"] = str(error)[:4000]
 
     results = []
     for sha in commits:
@@ -125,6 +259,7 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
             fail(result, error)
         pending = []
 
+    html_by_backport = {}
     for result in pending:
         report = Path(repo).with_name("report.html")
         report.unlink(missing_ok=True)
@@ -140,9 +275,69 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
         size = report.stat().st_size if report.exists() else 0
         result["status"] = "differs" if size else "matches"
         if size:
+            html = report.read_text(encoding="utf-8")
             reports.append({"backport": result["backport"], "subject": result["subject"],
-                            "html": report.read_text(encoding="utf-8")})
-    return results
+                            "html": html})
+            html_by_backport[result["backport"]] = html
+
+    prev_reports = []
+    if rebase is not None and "error" not in rebase:
+        # The commits without a counterpart keep their upstream comparison
+        # as their only reference view; the ones with a counterpart are
+        # compared against the previous branch, where matching the shipped
+        # history matters more than matching upstream
+        counterparts = {result["backport"]: prev_index.get(result["subject"])
+                        for result in results}
+        entries = []
+        for result in results:
+            counterpart = counterparts[result["backport"]]
+            if not counterpart:
+                continue
+            entry = {"backport": result["backport"], "subject": result["subject"],
+                     "counterpart": counterpart,
+                     "marker": marker_commit(repo, counterpart)}
+            entries.append(entry)
+            report = Path(repo).with_name("report.html")
+            report.unlink(missing_ok=True)
+            try:
+                run([binary, "--html", "--backport-labels", f"--git-tree={repo}",
+                     "-o", str(report), result["backport"], counterpart],
+                    COMPARE_SECONDS)
+            except CompareError as error:
+                entry["status"] = "failed"
+                entry["error"] = str(error)[:4000]
+                continue
+            size = report.stat().st_size if report.exists() else 0
+            entry["status"] = "differs" if size else "matches"
+            if size:
+                prev_reports.append({"backport": result["backport"],
+                                      "subject": result["subject"],
+                                      "html": report.read_text(encoding="utf-8")})
+        rebase["matches"] = entries
+        rebase["fallback"] = [{"backport": result["backport"], "subject": result["subject"]}
+                              for result in results
+                              if not counterparts[result["backport"]]]
+        # Fallback backports that differ from upstream belong in the
+        # previous-branch report too, so one artifact serves both tables
+        for result in results:
+            if (counterparts[result["backport"]] is None
+                    and result["status"] == "differs"):
+                prev_reports.append({"backport": result["backport"],
+                                     "subject": result["subject"],
+                                     "html": html_by_backport[result["backport"]]})
+
+        # Previous-branch changes no PR commit carries were either replaced
+        # by their revert ("skipping unneeded code") or dropped entirely
+        pr_subjects = {result["subject"] for result in results}
+        skipped = []
+        for subject, sha in prev_index.items():
+            if subject in pr_subjects:
+                continue
+            kind = ("revert-carried" if f'Revert "{subject}"' in pr_subjects
+                    else "dropped")
+            skipped.append({"sha": sha, "subject": subject, "kind": kind})
+        rebase["skipped"] = skipped
+    return results, rebase, prev_reports
 
 
 def write_page(reports, path):
@@ -171,17 +366,25 @@ def main():
     summary = {"head_sha": head_sha, "base_sha": base_sha, "run_attempt": attempt,
                "results": []}
     reports = []
+    prev_reports = []
     try:
-        summary["results"] = compare(repository, int(os.environ["PR_NUMBER"]),
-                                     int(os.environ["PR_COMMITS"]), head_url, head_sha,
-                                     str(output / "repo.git"), os.environ["DIFFOFDIFFS"],
-                                     reports)
+        summary["results"], rebase, prev_reports = compare(
+            repository, int(os.environ["PR_NUMBER"]), int(os.environ["PR_COMMITS"]),
+            head_url, head_sha, str(output / "repo.git"), os.environ["DIFFOFDIFFS"],
+            reports, title=os.environ.get("PR_TITLE", ""),
+            body=os.environ.get("PR_BODY", ""),
+            base_ref=os.environ.get("PR_BASE_REF", ""))
         if not summary["results"]:
             raise CompareError("No comparison results were produced for this pull request")
+        if rebase is not None:
+            summary["rebase"] = rebase
     except CompareError as error:
         summary["error"] = str(error)[:4000]
     if reports:
         write_page(reports, output / f"diffofdiffs-report-{attempt}.html")
+    if prev_reports:
+        write_page(prev_reports,
+                   output / f"diffofdiffs-report-prevbranch-{attempt}.html")
     (output / "comparisons.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
 
     failed = "error" in summary
@@ -190,6 +393,17 @@ def main():
         if "error" in result:
             failed = True
             print("              " + result["error"].replace("\n", "\n              "))
+    rebase = summary.get("rebase")
+    if rebase is not None:
+        if "error" in rebase:
+            print(f"previous-branch comparison error: {rebase['error']}")
+        else:
+            for entry in rebase["matches"]:
+                print(f"{entry['status']:>12}  {entry['backport'][:12]}  "
+                      f"(previous branch)  {entry['subject']}")
+                if "error" in entry:
+                    failed = True
+                    print("              " + entry["error"].replace("\n", "\n              "))
     if "error" in summary:
         print(f"Comparison incomplete: {summary['error']}", file=sys.stderr)
     return int(failed)
