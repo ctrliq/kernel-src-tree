@@ -1,0 +1,84 @@
+lib: objpool: fix head overrun on RK3588 SBC
+
+jira KERNEL-1922
+Rebuild_History Non-Buildable kernel-5.14.0-741.22.1.el9_9
+commit-author wuqiang.matt <wuqiang.matt@bytedance.com>
+commit d67f39d2b81b6a8259944d2400c1ff4fe283ff72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.22.1.el9_9/d67f39d2.failed
+
+objpool overrun stress with test_objpool on OrangePi5+ SBC triggered the
+following kernel warnings:
+
+    WARNING: CPU: 6 PID: 3115 at lib/objpool.c:168 objpool_push+0xc0/0x100
+
+This message is from objpool.c:168:
+
+    WARN_ON_ONCE(tail - head > pool->nr_objs);
+
+The overrun test case is to validate the case that pre-allocated objects
+are insufficient: 8 objects are pre-allocated for each node and consumer
+thread per node tries to grab 16 objects in a row. The testing system is
+OrangePI 5+, with RK3588, a big.LITTLE SOC with 4x A76 and 4x A55. When
+disabling either all 4 big or 4 little cores, the overrun tests run well,
+and once with big and little cores mixed together, the overrun test would
+always cause an overrun loop. It's likely the memory timing differences
+of big and little cores cause this trouble. Here are the debugging data
+of objpool_try_get_slot after try_cmpxchg_release:
+
+    objpool_pop: cpu: 4/0 0:0 head: 278/279 tail:278 last:276/278
+
+The local copies of 'head' and 'last' were 278 and 276, and reloading of
+'slot->head' and 'slot->last' got 279 and 278. After try_cmpxchg_release
+'slot->head' became 'head + 1', which is correct. But what's wrong here
+is the stale value of 'last', and that stale value of 'last' finally led
+the overrun of 'head'.
+
+Memory updating of 'last' and 'head' are performed in push() and pop()
+independently, which could be the culprit leading this out of order
+visibility of 'last' and 'head'. So for objpool_try_get_slot(), it's
+not enough only checking the condition of 'head != slot', the implicit
+condition 'last - head <= nr_objs' must also be explicitly asserted to
+guarantee 'last' is always behind 'head' before the object retrieving.
+
+This patch will check and try reloading of 'head' and 'last' to ensure
+'last' is behind 'head' at the time of object retrieving. Performance
+testings show the average impact is about 0.1% for X86_64 and 1.12% for
+ARM64. Here are the results:
+
+    OS: Debian 10 X86_64, Linux 6.6rc
+    HW: XEON 8336C x 2, 64 cores/128 threads, DDR4 3200MT/s
+                      1T         2T         4T         8T        16T
+    native:     49543304   99277826  199017659  399070324  795185848
+    objpool:    29909085   59865637  119692073  239750369  478005250
+    objpool+:   29879313   59230743  119609856  239067773  478509029
+                     32T        48T        64T        96T       128T
+    native:   1596927073 2390099988 2929397330 3183875848 3257546602
+    objpool:   957553042 1435814086 1680872925 2043126796 2165424198
+    objpool+:  956476281 1434491297 1666055740 2041556569 2157415622
+
+    OS: Debian 11 AARCH64, Linux 6.6rc
+    HW: Kunpeng-920 96 cores/2 sockets/4 NUMA nodes, DDR4 2933 MT/s
+                      1T         2T         4T         8T        16T
+    native:     30890508   60399915  123111980  242257008  494002946
+    objpool:    14742531   28883047   57739948  115886644  232455421
+    objpool+:   14107220   29032998   57286084  113730493  232232850
+                     24T        32T        48T        64T        96T
+    native:    746406039 1000174750 1493236240 1998318364 2942911180
+    objpool:   349164852  467284332  702296756  934459713 1387898285
+    objpool+:  348388180  462750976  696606096  927865887 1368402195
+
+Link: https://lore.kernel.org/all/20231114115148.298821-1-wuqiang.matt@bytedance.com/
+
+Fixes: b4edb8d2d464 ("lib: objpool added: ring-array based lockless MPMC")
+	Signed-off-by: wuqiang.matt <wuqiang.matt@bytedance.com>
+	Acked-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+	Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+(cherry picked from commit d67f39d2b81b6a8259944d2400c1ff4fe283ff72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/objpool.c
+* Unmerged path lib/objpool.c
+* Unmerged path lib/objpool.c
