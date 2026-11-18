@@ -92,8 +92,8 @@ static bool fd_configure_unmap(struct se_device *dev)
 	struct inode *inode = file->f_mapping->host;
 
 	if (S_ISBLK(inode->i_mode))
-		return target_configure_unmap_from_queue(&dev->dev_attrib,
-							 I_BDEV(inode));
+		return target_configure_unmap_from_bdev(&dev->dev_attrib,
+							I_BDEV(inode));
 
 	/* Limit UNMAP emulation to 8k Number of LBAs (NoLB) */
 	dev->dev_attrib.max_unmap_lba_count = 0x2000;
@@ -516,7 +516,7 @@ fd_do_prot_unmap(struct se_cmd *cmd, sector_t lba, sector_t nolb)
 	void *buf;
 	int rc;
 
-	buf = (void *)__get_free_page(GFP_KERNEL);
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!buf) {
 		pr_err("Unable to allocate FILEIO prot buf\n");
 		return -ENOMEM;
@@ -524,7 +524,7 @@ fd_do_prot_unmap(struct se_cmd *cmd, sector_t lba, sector_t nolb)
 
 	rc = fd_do_prot_fill(cmd->se_dev, lba, nolb, buf, PAGE_SIZE);
 
-	free_page((unsigned long)buf);
+	kfree(buf);
 
 	return rc;
 }
