@@ -264,11 +264,12 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 	}
 
 	ret = crypto_get_rng(rngp);
-	rng = *rngp;
-	put_cpu();
-
-	if (ret)
+	if (ret) {
+		put_cpu();
 		return ret;
+	}
+
+	rng = *rngp;
 
 	if (flags)
 		crypto_tfm_set_flags(crypto_rng_tfm(rng), flags);
@@ -298,6 +299,7 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 		}
 	}
 
+	put_cpu();
 	memzero_explicit(tmp, sizeof(tmp));
 	return ret ? ret : -EFAULT;
 }
