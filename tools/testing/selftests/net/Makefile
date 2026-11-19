@@ -181,7 +181,7 @@ TEST_FILES := \
 # end of TEST_FILES
 
 # YNL files, must be before "include ..lib.mk"
-YNL_GEN_FILES := ncdevmem busy_poller netlink-dumps
+YNL_GEN_FILES := busy_poller netlink-dumps
 TEST_GEN_FILES += $(YNL_GEN_FILES)
 
 TEST_GEN_FILES += $(patsubst %.c,%.o,$(wildcard *.bpf.c))
@@ -191,7 +191,7 @@ TEST_INCLUDES := forwarding/lib.sh
 include ../lib.mk
 
 # YNL build
-YNL_GENS := netdev
+YNL_GENS := ethtool netdev
 include ynl.mk
 
 $(OUTPUT)/epoll_busy_poll: LDLIBS += -lcap
