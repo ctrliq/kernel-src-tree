@@ -65,14 +65,13 @@ void nft_lookup_eval(const struct nft_expr *expr,
 	const struct net *net = nft_net(pkt);
 	bool found;
 
-	found =	nft_set_do_lookup(net, set, &regs->data[priv->sreg], &ext) ^
-				  priv->invert;
-	if (!found) {
+	if (!nft_set_do_lookup(net, set, &regs->data[priv->sreg], &ext))
 		ext = nft_set_catchall_lookup(net, set);
-		if (!ext) {
-			regs->verdict.code = NFT_BREAK;
-			return;
-		}
+
+	found = !!ext ^ priv->invert;
+	if (!found) {
+		regs->verdict.code = NFT_BREAK;
+		return;
 	}
 
 	if (ext) {
