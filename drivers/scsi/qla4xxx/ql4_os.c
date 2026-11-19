@@ -155,7 +155,8 @@ static int qla4xxx_get_host_stats(struct Scsi_Host *shost, char *buf, int len);
 /*
  * SCSI host template entry points
  */
-static int qla4xxx_queuecommand(struct Scsi_Host *h, struct scsi_cmnd *cmd);
+static enum scsi_qc_status qla4xxx_queuecommand(struct Scsi_Host *h,
+						struct scsi_cmnd *cmd);
 static int qla4xxx_eh_abort(struct scsi_cmnd *cmd);
 static int qla4xxx_eh_device_reset(struct scsi_cmnd *cmd);
 static int qla4xxx_eh_target_reset(struct scsi_cmnd *cmd);
@@ -4107,7 +4108,8 @@ void qla4xxx_srb_compl(struct kref *ref)
  * completion handling). Unfortunately, it sometimes calls the scheduler
  * in interrupt context which is a big NO! NO!.
  **/
-static int qla4xxx_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
+static enum scsi_qc_status qla4xxx_queuecommand(struct Scsi_Host *host,
+						struct scsi_cmnd *cmd)
 {
 	struct scsi_qla_host *ha = to_qla_host(host);
 	struct ddb_entry *ddb_entry = cmd->device->hostdata;
@@ -9409,11 +9411,9 @@ static int qla4xxx_eh_target_reset(struct scsi_cmnd *cmd)
  * This routine finds that if reset host is called in EH
  * scenario or from some application like sg_reset
  **/
-static int qla4xxx_is_eh_active(struct Scsi_Host *shost)
+static bool qla4xxx_is_eh_active(struct Scsi_Host *shost)
 {
-	if (shost->shost_state == SHOST_RECOVERY)
-		return 1;
-	return 0;
+	return scsi_get_host_state(shost) == SHOST_RECOVERY;
 }
 
 /**

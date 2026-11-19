@@ -2,6 +2,7 @@
 #ifndef _SCSI_SCSI_HOST_H
 #define _SCSI_SCSI_HOST_H
 
+#include <linux/cleanup.h>
 #include <linux/device.h>
 #include <linux/list.h>
 #include <linux/types.h>
@@ -84,13 +85,15 @@ struct scsi_host_template {
 	 *
 	 * STATUS: REQUIRED
 	 */
-	int (* queuecommand)(struct Scsi_Host *, struct scsi_cmnd *);
+	enum scsi_qc_status (*queuecommand)(struct Scsi_Host *,
+					    struct scsi_cmnd *);
 
 	/*
 	 * Queue a reserved command (BLK_MQ_REQ_RESERVED). The .queuecommand()
 	 * documentation also applies to the .queue_reserved_command() callback.
 	 */
-	int (*queue_reserved_command)(struct Scsi_Host *, struct scsi_cmnd *);
+	enum scsi_qc_status (*queue_reserved_command)(struct Scsi_Host *,
+						      struct scsi_cmnd *);
 
 	/*
 	 * The commit_rqs function is used to trigger a hardware
@@ -525,10 +528,12 @@ struct scsi_host_template {
  *
  */
 #define DEF_SCSI_QCMD(func_name) \
-	int func_name(struct Scsi_Host *shost, struct scsi_cmnd *cmd)	\
+	enum scsi_qc_status func_name(struct Scsi_Host *shost,		\
+				      struct scsi_cmnd *cmd)		\
 	{								\
 		unsigned long irq_flags;				\
-		int rc;							\
+		enum scsi_qc_status rc;					\
+									\
 		spin_lock_irqsave(shost->host_lock, irq_flags);		\
 		rc = func_name##_lck(cmd);				\
 		spin_unlock_irqrestore(shost->host_lock, irq_flags);	\
@@ -656,6 +661,13 @@ struct Scsi_Host {
 	 */
 	unsigned nr_hw_queues;
 	unsigned nr_maps;
+
+	/* Asynchronous scan in progress */
+	bool async_scan;
+
+	/* Don't resume host in EH */
+	bool eh_noresume;
+
 	unsigned active_mode:2;
 
 	/*
@@ -673,12 +685,6 @@ struct Scsi_Host {
 
 	/* Task mgmt function in progress */
 	unsigned tmf_in_progress:1;
-
-	/* Asynchronous scan in progress */
-	unsigned async_scan:1;
-
-	/* Don't resume host in EH */
-	unsigned eh_noresume:1;
 
 	/* The controller does not support WRITE SAME */
 	unsigned no_write_same:1;
@@ -783,11 +789,18 @@ static inline struct Scsi_Host *dev_to_shost(struct device *dev)
 	return container_of(dev, struct Scsi_Host, shost_gendev);
 }
 
+static inline enum scsi_host_state scsi_get_host_state(struct Scsi_Host *shost)
+{
+	return READ_ONCE(shost->shost_state);
+}
+
 static inline int scsi_host_in_recovery(struct Scsi_Host *shost)
 {
-	return shost->shost_state == SHOST_RECOVERY ||
-		shost->shost_state == SHOST_CANCEL_RECOVERY ||
-		shost->shost_state == SHOST_DEL_RECOVERY ||
+	enum scsi_host_state state = scsi_get_host_state(shost);
+
+	return state == SHOST_RECOVERY ||
+		state == SHOST_CANCEL_RECOVERY ||
+		state == SHOST_DEL_RECOVERY ||
 		shost->tmf_in_progress;
 }
 
@@ -833,8 +846,9 @@ static inline struct device *scsi_get_device(struct Scsi_Host *shost)
  **/
 static inline int scsi_host_scan_allowed(struct Scsi_Host *shost)
 {
-	return shost->shost_state == SHOST_RUNNING ||
-	       shost->shost_state == SHOST_RECOVERY;
+	enum scsi_host_state state = scsi_get_host_state(shost);
+
+	return state == SHOST_RUNNING || state == SHOST_RECOVERY;
 }
 
 extern void scsi_unblock_requests(struct Scsi_Host *);
@@ -938,6 +952,7 @@ static inline unsigned char scsi_host_get_guard(struct Scsi_Host *shost)
 	return shost->prot_guard_type;
 }
 
-extern int scsi_host_set_state(struct Scsi_Host *, enum scsi_host_state);
+int scsi_host_set_state(struct Scsi_Host *shost, enum scsi_host_state state)
+	__must_hold(shost->host_lock);
 
 #endif /* _SCSI_SCSI_HOST_H */
