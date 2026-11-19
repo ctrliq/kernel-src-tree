@@ -520,28 +520,48 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
 
 
 def comment_body(summary, results, links, report):
-    # Shorten diagnostics, then lists, until the comment fits GitHub's limit
+    """Return the upstream comment body, shrunk to fit GitHub's limit"""
     for error_chars, limit in ((2000, 250), (300, 250), (0, 250), (0, 25)):
         body, problem = render(summary, results, links, report, error_chars, limit)
         if len(body) <= MAX_COMMENT_CHARS:
-            break
-    return body, problem
+            return body, problem
+    # Not even the smallest rendering fits: a pointer is still better
+    # than a comment GitHub refuses to accept
+    run_log = f"[workflow run log]({links['run']})"
+    return (f"## \u274c Diffofdiffs: results too large for a comment\n\n"
+            f"The comparison results exceed GitHub's comment limit even "
+            f"truncated. See the {run_log}.\n"), True
 
 
 def rebase_comment_body(summary, rebase, results, links, report):
+    """Return the previous-branch comment body, shrunk to fit GitHub's limit"""
     for error_chars, limit in ((2000, 250), (300, 250), (0, 250), (0, 25)):
         body, problem = render_rebase(summary, rebase, results, links, report,
                                       error_chars, limit)
         if len(body) <= MAX_COMMENT_CHARS:
-            break
-    return body, problem
+            return body, problem
+    run_log = f"[workflow run log]({links['run']})"
+    return (f"## \u274c Diffofdiffs: previous-branch results too large for "
+            f"a comment\n\n"
+            f"The previous-branch results exceed GitHub's comment limit "
+            f"even truncated. See the {run_log}.\n"), True
 
 
 def post_comment(pr_number, repository, body):
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete_on_close=False) as file:
         file.write(body)
         file.close()
-        gh("pr", "comment", str(pr_number), "-R", repository, "--body-file", file.name)
+        try:
+            gh("pr", "comment", str(pr_number), "-R", repository,
+               "--body-file", file.name)
+        except subprocess.CalledProcessError as error:
+            # A comment GitHub refuses must not die as a traceback: the
+            # entry point only reports CommentError cleanly
+            detail = (error.stderr or error.stdout or "").strip()
+            raise CommentError(f"GitHub rejected the comment: {detail or error}") from None
+        except subprocess.TimeoutExpired:
+            raise CommentError("Posting the comment exceeded the GitHub "
+                               "timeout") from None
 
 
 def main():
