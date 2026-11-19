@@ -246,10 +246,15 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
         result = {"backport": sha, "subject": "", "status": "no_reference"}
         results.append(result)
         try:
-            message = run(["git", "-C", repo, "log", "-1", "--format=%B", sha], 60)
+            # %s folds a wrapped subject into one line the way the
+            # previous-branch index keys do; %B keeps the raw message for
+            # the upstream-reference lookup, and the NUL separates them
+            subject, _, message = run(
+                ["git", "-C", repo, "log", "-1", "--format=%s%x00%B", sha],
+                60).partition("\0")
             # The full subject matches the previous-branch index below;
             # the comment workflow truncates it for display
-            result["subject"] = message.split("\n", 1)[0]
+            result["subject"] = subject
             reference = upstream_reference(message)
             if not reference:
                 continue
@@ -428,6 +433,11 @@ def main():
                 if "error" in entry:
                     failed = True
                     print("              " + entry["error"].replace("\n", "\n              "))
+            # The skipped list is only fully visible here: the comment
+            # workflow truncates it and points the rest here
+            for entry in rebase["skipped"]:
+                print(f"{entry['kind']:>12}  {entry['sha'][:12]}  "
+                      f"(previous branch)  {entry['subject']}")
     if "error" in summary:
         print(f"Comparison incomplete: {summary['error']}", file=sys.stderr)
     return int(failed)

@@ -350,7 +350,11 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
     fallback_unreferenced = [entry for entry in fallback
                              if upstream_status(entry) not in ("matches", "differs",
                                                                "failed")]
-    problem = bool(error or failures or fallback_failures)
+    # A table showing differences needs its inspectable report: the
+    # previous-branch artifact carries both the differing pairs and the
+    # fallback commits that differ from upstream
+    report_missing = bool(differs or fallback_differs) and report is None
+    problem = bool(error or failures or fallback_failures or report_missing)
 
     def backport(entry):
         sha = entry["backport"]
@@ -500,7 +504,9 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
             lines.append(f"| {number} | {code_span(entry['subject'])}{mark} | "
                          f"{backport(entry)} | {upstream} |")
         if len(fallback) > limit:
-            lines.append(f"| ... | {len(fallback) - limit} more in the report | | |")
+            # The report holds only the fallback commits that differ from
+            # upstream; the run log lists every fallback comparison
+            lines.append(f"| ... | {len(fallback) - limit} more in the {run_log} | | |")
         lines.append("")
 
     previous = f"previous branch {code_span(rebase['previous_branch'])}"
