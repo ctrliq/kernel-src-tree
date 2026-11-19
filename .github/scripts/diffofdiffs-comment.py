@@ -195,7 +195,9 @@ def checked_rebase(value):
                 entry = {"backport": checked_sha(item.get("backport")),
                          "subject": checked_subject(item.get("subject", ""))}
             else:  # skipped
-                if item.get("kind") not in SKIP_KINDS:
+                # kind must be a string before the set lookup, like status
+                if (not isinstance(item.get("kind"), str)
+                        or item["kind"] not in SKIP_KINDS):
                     raise CommentError("A skipped previous-branch commit has a malformed kind")
                 entry = {"sha": checked_sha(item.get("sha")),
                          "subject": checked_subject(item.get("subject", "")),
@@ -329,10 +331,26 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
     differs = [entry for entry in matches if entry["status"] == "differs"]
     failures = [entry for entry in matches if entry["status"] == "failed"]
     identical = sum(1 for entry in matches if entry["status"] == "matches")
-    problem = bool(error or failures)
     run_log = f"[workflow run log]({links['run']})"
 
     results_by_backport = {result["backport"]: result for result in results}
+
+    def upstream_status(entry):
+        # A fallback commit was compared with upstream instead; that
+        # comparison's outcome is the one the first comment already reports
+        return results_by_backport.get(entry["backport"], {}).get("status")
+
+    # A fallback commit with no upstream differences has not necessarily
+    # matched upstream: its comparison may have failed, or the commit may
+    # have no upstream reference at all and never been compared
+    fallback_differs = [entry for entry in fallback
+                       if upstream_status(entry) == "differs"]
+    fallback_failures = [entry for entry in fallback
+                         if upstream_status(entry) == "failed"]
+    fallback_unreferenced = [entry for entry in fallback
+                             if upstream_status(entry) not in ("matches", "differs",
+                                                               "failed")]
+    problem = bool(error or failures or fallback_failures)
 
     def backport(entry):
         sha = entry["backport"]
@@ -357,6 +375,9 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
         title = "1 backport matches the previous branch"
     else:
         title = f"All {len(matches)} backports match the previous branch"
+    if not error and fallback_failures:
+        title += (f", {plural(len(fallback_failures), 'unmatched commit')} couldn't "
+                  "be compared with upstream")
     icon = "\u274c" if problem else "\U0001f50d" if differs else "\u2705"
     lines = [f"## {icon} Diffofdiffs: {title}", "",
              "Matched by subject against the previous branch "
@@ -437,10 +458,26 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
     if not fallback:
         lines += ["Every backport matched the previous branch.", ""]
     else:
-        fallback_differs = [entry for entry in fallback
-                            if results_by_backport.get(entry["backport"], {}).get("status") == "differs"]
+        # No differences among the fallback commits only means their
+        # upstream comparisons matched when every one of them ran: failed
+        # and unreferenced comparisons found no differences either
         if fallback_differs:
             lines += report_link()
+        elif fallback_failures:
+            lines += [f"{plural(len(fallback_failures), 'comparison')} couldn't be "
+                      "completed; the errors are in the standard diffofdiffs comment "
+                      f"and the {run_log}.", ""]
+        elif fallback_unreferenced:
+            compared = len(fallback) - len(fallback_unreferenced)
+            if compared:
+                lines += [f"No differences were found among the {plural(compared, 'comparison')}; "
+                          f"{plural(len(fallback_unreferenced), 'commit')} "
+                          f"{'has' if len(fallback_unreferenced) == 1 else 'have'} "
+                          "no upstream reference. No report was generated.", ""]
+            else:
+                lines += [f"None of the {plural(len(fallback_unreferenced), 'commit')} has "
+                          "an upstream reference, so none were compared with upstream. "
+                          "No report was generated.", ""]
         else:
             lines += ["No differences were found; no report was generated.", ""]
         lines += ["| # | Subject | Backport | Upstream |", "| ---: | --- | --- | --- |"]
@@ -530,6 +567,9 @@ def main():
             summary["error"] = f"The comparison job ended with {job['conclusion']}."
     except CommentError as error:
         summary["error"] = str(error)
+        # A rejected artifact must not supply rebase results either: its
+        # head SHA and run attempt were never confirmed to be this run's
+        raw = {}
     else:
         html = find_artifact(artifacts, f"diffofdiffs-report-{attempt}.html")
         if html:

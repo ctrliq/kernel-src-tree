@@ -163,10 +163,16 @@ def _previous_tip(repo):
 
 
 def marker_commit(repo, sha):
-    """Whether a previous-branch commit only added a .failed rebuild marker"""
+    """Whether a previous-branch commit only added .failed rebuild markers"""
+    # A counterpart counts as marker-only when every changed path is a
+    # marker addition: a commit that also changed code, removed a stale
+    # marker or renamed one is a real change
     listing = run(["git", "-C", repo, "diff-tree", "--no-commit-id",
-                   "--name-only", "-r", sha], 60)
-    return any(MARKER_PATH.match(path) for path in listing.splitlines())
+                   "--name-status", "-r", sha], 60)
+    changes = [line.split("\t") for line in listing.splitlines()]
+    return bool(changes) and all(len(change) == 2 and change[0] == "A"
+                                 and MARKER_PATH.match(change[1])
+                                 for change in changes)
 
 
 def fetch(repo, url, commits, depth):
@@ -230,7 +236,9 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
         results.append(result)
         try:
             message = run(["git", "-C", repo, "log", "-1", "--format=%B", sha], 60)
-            result["subject"] = message.split("\n", 1)[0][:300]
+            # The full subject matches the previous-branch index below;
+            # the comment workflow truncates it for display
+            result["subject"] = message.split("\n", 1)[0]
             reference = upstream_reference(message)
             if not reference:
                 continue
@@ -396,6 +404,9 @@ def main():
     rebase = summary.get("rebase")
     if rebase is not None:
         if "error" in rebase:
+            # A previous-branch comparison that could not run at all is
+            # at least as much a failure as one that failed per commit
+            failed = True
             print(f"previous-branch comparison error: {rebase['error']}")
         else:
             for entry in rebase["matches"]:
