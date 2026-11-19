@@ -163,7 +163,12 @@ def checked_rebase(value):
             raise CommentError("The rebase summary has a malformed partial flag")
         rebase["partial"] = value["partial"]
     if "error" in value:
-        rebase["error"] = checked_text(value["error"], 4000)
+        error = checked_text(value["error"], 4000)
+        if not error.strip():
+            # An empty error would let a summary with no result lists
+            # through as a successful comparison, like checked_results rejects
+            raise CommentError("The rebase summary contains an empty error message")
+        rebase["error"] = error
     for key in ("matches", "fallback", "skipped"):
         if key not in value:
             if "error" not in rebase:
