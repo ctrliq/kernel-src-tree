@@ -1545,6 +1545,7 @@ static int nf_tables_newchain(struct net *net, struct sock *nlsk,
 err2:
 	nf_tables_unregister_hooks(table, chain, afi->nops);
 err1:
+	synchronize_rcu();
 	nf_tables_chain_destroy(chain);
 	return err;
 }
