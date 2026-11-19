@@ -314,6 +314,7 @@ $(addprefix test_kmods/,$(subst .ko,%ko,$(TEST_KMODS))): $(VMLINUX_BTF) $(RESOLV
 		$(if $(O),O=$(abspath $(O)))					\
 		$(if $(KBUILD_OUTPUT),KBUILD_OUTPUT=$(abspath $(KBUILD_OUTPUT)))\
 		RESOLVE_BTFIDS=$(RESOLVE_BTFIDS)				\
+		ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE)			\
 		EXTRA_CFLAGS='' EXTRA_LDFLAGS=''
 
 $(TEST_KMOD_TARGETS): $(addprefix test_kmods/,$(TEST_KMODS))
