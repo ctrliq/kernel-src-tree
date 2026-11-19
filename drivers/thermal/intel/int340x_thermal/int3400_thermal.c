@@ -356,8 +356,10 @@ static void cleanup_odvp(struct int3400_thermal_priv *priv)
 			kfree(priv->odvp_attrs[i].attr.attr.name);
 		}
 		kfree(priv->odvp_attrs);
+		priv->odvp_attrs = NULL;
 	}
 	kfree(priv->odvp);
+	priv->odvp = NULL;
 	priv->odvp_count = 0;
 }
 
@@ -382,8 +384,7 @@ static int evaluate_odvp(struct int3400_thermal_priv *priv)
 
 	if (priv->odvp == NULL) {
 		priv->odvp_count = obj->package.count;
-		priv->odvp = kmalloc_array(priv->odvp_count, sizeof(int),
-				     GFP_KERNEL);
+		priv->odvp = kmalloc_objs(int, priv->odvp_count);
 		if (!priv->odvp) {
 			ret = -ENOMEM;
 			goto out_err;
@@ -391,9 +392,8 @@ static int evaluate_odvp(struct int3400_thermal_priv *priv)
 	}
 
 	if (priv->odvp_attrs == NULL) {
-		priv->odvp_attrs = kcalloc(priv->odvp_count,
-					   sizeof(struct odvp_attr),
-					   GFP_KERNEL);
+		priv->odvp_attrs = kzalloc_objs(struct odvp_attr,
+						priv->odvp_count, GFP_KERNEL);
 		if (!priv->odvp_attrs) {
 			ret = -ENOMEM;
 			goto out_err;
@@ -563,7 +563,7 @@ static int int3400_thermal_probe(struct platform_device *pdev)
 	if (!adev)
 		return -ENODEV;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
 
@@ -637,7 +637,6 @@ free_notify:
 	acpi_remove_notify_handler(priv->adev->handle, ACPI_DEVICE_NOTIFY,
 				   int3400_notify);
 free_sysfs:
-	cleanup_odvp(priv);
 	if (!ZERO_OR_NULL_PTR(priv->data_vault)) {
 		device_remove_bin_file(&pdev->dev, &bin_attr_data_vault);
 		kfree(priv->data_vault);
@@ -651,6 +650,7 @@ free_rel_misc:
 		acpi_thermal_rel_misc_device_remove(priv->adev->handle);
 	thermal_zone_device_unregister(priv->thermal);
 free_art_trt:
+	cleanup_odvp(priv);
 	kfree(priv->trts);
 	kfree(priv->arts);
 free_priv:
