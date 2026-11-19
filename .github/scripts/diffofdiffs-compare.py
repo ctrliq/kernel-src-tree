@@ -144,8 +144,11 @@ def fetch_previous_branch(repo, url, branch, commits):
             return _previous_tip(repo), boundary, False
         except CompareError:
             pass  # the import tag is unknown; fall back to the window
+    # The window reaches one generation beyond the commits the subject
+    # listing indexes, so the oldest windowed commit's first parent, which
+    # tree mode reads, is present
     run(["git", "-C", repo, "fetch", "--no-tags",
-         f"--depth={commits + PREV_EXTRA_DEPTH}", url,
+         f"--depth={commits + PREV_EXTRA_DEPTH + 1}", url,
          f"refs/heads/{branch}:refs/prevbranch"], FETCH_SECONDS)
     return _previous_tip(repo), boundary, True
 
@@ -218,10 +221,18 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
             rebase["previous_sha"], boundary, rebase["partial"] = \
                 fetch_previous_branch(repo, f"https://github.com/{repository}.git",
                                       previous, pr_commits)
-            prev_range = (f"{boundary}..refs/prevbranch" if boundary
-                          else "refs/prevbranch")
-            listing = run(["git", "-C", repo, "log", "--format=%H|%s",
-                           prev_range], 60)
+            if boundary:
+                # Exactly the branch's custom changes, bounded by the import
+                listing = run(["git", "-C", repo, "log", "--format=%H|%s",
+                               f"{boundary}..refs/prevbranch"], 60)
+            else:
+                # The fallback window: the fetch reaches one generation
+                # beyond it, so the listing keeps to the window and the
+                # shallow boundary commit stays out of the index while
+                # every windowed commit keeps a readable first parent
+                listing = run(["git", "-C", repo, "log", "--format=%H|%s",
+                               "-n", str(pr_commits + PREV_EXTRA_DEPTH),
+                               "refs/prevbranch"], 60)
             for line in listing.splitlines():
                 sha, _, subject = line.partition("|")
                 # The listing is newest first; the newest commit with a
@@ -302,12 +313,14 @@ def compare(repository, pr_number, pr_commits, head_url, head_sha, repo, binary,
             if not counterpart:
                 continue
             entry = {"backport": result["backport"], "subject": result["subject"],
-                     "counterpart": counterpart,
-                     "marker": marker_commit(repo, counterpart)}
+                     "counterpart": counterpart}
             entries.append(entry)
             report = Path(repo).with_name("report.html")
             report.unlink(missing_ok=True)
             try:
+                # A probe failure is this pair's failure, not a reason to
+                # discard the completed results of the whole comparison
+                entry["marker"] = marker_commit(repo, counterpart)
                 run([binary, "--html", "--backport-labels", f"--git-tree={repo}",
                      "-o", str(report), result["backport"], counterpart],
                     COMPARE_SECONDS)

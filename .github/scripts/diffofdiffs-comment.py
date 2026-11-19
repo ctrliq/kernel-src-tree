@@ -455,7 +455,14 @@ def render_rebase(summary, rebase, results, links, report, error_chars, limit):
         lines.append("")
 
     lines += ["### Against Upstream", ""]
-    if not fallback:
+    if error:
+        # Matching never ran, so claiming every backport matched would
+        # overstate the outcome; the upstream comparisons are in the
+        # first comment
+        lines += ["The previous-branch comparison could not run, so no commits "
+                  "were matched against it. The upstream comparisons are in "
+                  "the standard diffofdiffs comment.", ""]
+    elif not fallback:
         lines += ["Every backport matched the previous branch.", ""]
     else:
         # No differences among the fallback commits only means their
