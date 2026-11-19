@@ -222,7 +222,7 @@ static int __must_check compute_sizes(const struct uds_configuration *config,
 				      struct save_layout_sizes *sls)
 {
 	int result;
-	struct index_geometry *geometry = config->geometry;
+	const struct index_geometry *geometry = &config->geometry;
 
 	memset(sls, 0, sizeof(*sls));
 	sls->save_count = MAX_SAVES;
@@ -282,7 +282,7 @@ static void create_unique_nonce_data(u8 *buffer)
 	u32 rand;
 	size_t offset = 0;
 
-	get_random_bytes(&rand, sizeof(u32));
+	rand = get_random_u32();
 	memcpy(buffer + offset, &now, sizeof(now));
 	offset += sizeof(now);
 	memcpy(buffer + offset, &rand, sizeof(rand));
