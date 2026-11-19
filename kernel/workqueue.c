@@ -109,6 +109,11 @@ enum {
 	WQ_NAME_LEN		= 24,
 };
 
+enum work_cancel_flags {
+	WORK_CANCEL_DELAYED	= 1 << 0,	/* canceling a delayed_work */
+	WORK_CANCEL_DISABLE	= 1 << 1,	/* canceling to disable */
+};
+
 /*
  * Structure fields follow one of the following exclusion rules.
  *
@@ -191,7 +196,7 @@ struct worker_pool {
 };
 
 /*
- * The per-pool workqueue.  While queued, the lower WORK_STRUCT_FLAG_BITS
+ * The per-pool workqueue.  While queued, bits below WORK_PWQ_SHIFT
  * of work_struct->data are used for flags and the remaining high bits
  * point to the pwq; thus, pwqs need to be aligned at two's power of the
  * number of flag bits.
@@ -235,7 +240,7 @@ struct pool_workqueue {
 	 */
 	struct work_struct	unbound_release_work;
 	struct rcu_head		rcu;
-} __aligned(1 << WORK_STRUCT_FLAG_BITS);
+} __aligned(1 << WORK_STRUCT_PWQ_SHIFT);
 
 /*
  * Structure used to wait for workqueue flush.
@@ -298,6 +303,12 @@ struct workqueue_struct {
 
 static struct kmem_cache *pwq_cache;
 
+struct work_offq_data {
+	u32			pool_id;
+	u32			disable;
+	u32			flags;
+};
+
 static cpumask_var_t *wq_numa_possible_cpumask;
 					/* possible CPUs of each node */
 
@@ -355,6 +366,12 @@ static struct workqueue_attrs *unbound_std_wq_attrs[NR_STD_WORKER_POOLS];
 
 /* I: attributes used when instantiating ordered pools on demand */
 static struct workqueue_attrs *ordered_wq_attrs[NR_STD_WORKER_POOLS];
+
+/*
+ * Used to synchronize multiple cancel_sync attempts on the same work item. See
+ * work_grab_pending() and __cancel_work_sync().
+ */
+static DECLARE_WAIT_QUEUE_HEAD(wq_cancel_waitq);
 
 struct workqueue_struct *system_wq __read_mostly;
 EXPORT_SYMBOL(system_wq);
@@ -612,10 +629,9 @@ static int work_next_color(int color)
  * contain the pointer to the queued pwq.  Once execution starts, the flag
  * is cleared and the high bits contain OFFQ flags and pool ID.
  *
- * set_work_pwq(), set_work_pool_and_clear_pending(), mark_work_canceling()
- * and clear_work_data() can be used to set the pwq, pool or clear
- * work->data.  These functions should only be called while the work is
- * owned - ie. while the PENDING bit is set.
+ * set_work_pwq(), set_work_pool_and_clear_pending() and mark_work_canceling()
+ * can be used to set the pwq, pool or clear work->data. These functions should
+ * only be called while the work is owned - ie. while the PENDING bit is set.
  *
  * get_work_pool() and get_work_pwq() can be used to obtain the pool or pwq
  * corresponding to a work.  Pool is available once the work has been
@@ -627,29 +643,28 @@ static int work_next_color(int color)
  * but stay off timer and worklist for arbitrarily long and nobody should
  * try to steal the PENDING bit.
  */
-static inline void set_work_data(struct work_struct *work, unsigned long data,
-				 unsigned long flags)
+static inline void set_work_data(struct work_struct *work, unsigned long data)
 {
 	WARN_ON_ONCE(!work_pending(work));
-	atomic_long_set(&work->data, data | flags | work_static(work));
+	atomic_long_set(&work->data, data | work_static(work));
 }
 
 static void set_work_pwq(struct work_struct *work, struct pool_workqueue *pwq,
-			 unsigned long extra_flags)
+			 unsigned long flags)
 {
-	set_work_data(work, (unsigned long)pwq,
-		      WORK_STRUCT_PENDING | WORK_STRUCT_PWQ | extra_flags);
+	set_work_data(work, (unsigned long)pwq | WORK_STRUCT_PENDING |
+		      WORK_STRUCT_PWQ | flags);
 }
 
 static void set_work_pool_and_keep_pending(struct work_struct *work,
-					   int pool_id)
+					   int pool_id, unsigned long flags)
 {
-	set_work_data(work, (unsigned long)pool_id << WORK_OFFQ_POOL_SHIFT,
-		      WORK_STRUCT_PENDING);
+	set_work_data(work, ((unsigned long)pool_id << WORK_OFFQ_POOL_SHIFT) |
+		      WORK_STRUCT_PENDING | flags);
 }
 
 static void set_work_pool_and_clear_pending(struct work_struct *work,
-					    int pool_id)
+					    int pool_id, unsigned long flags)
 {
 	/*
 	 * The following wmb is paired with the implied mb in
@@ -658,7 +673,8 @@ static void set_work_pool_and_clear_pending(struct work_struct *work,
 	 * owner.
 	 */
 	smp_wmb();
-	set_work_data(work, (unsigned long)pool_id << WORK_OFFQ_POOL_SHIFT, 0);
+	set_work_data(work, ((unsigned long)pool_id << WORK_OFFQ_POOL_SHIFT) |
+		      flags);
 	/*
 	 * The following mb guarantees that previous clear of a PENDING bit
 	 * will not be reordered with any speculative LOADS or STORES from
@@ -690,18 +706,12 @@ static void set_work_pool_and_clear_pending(struct work_struct *work,
 	smp_mb();
 }
 
-static void clear_work_data(struct work_struct *work)
-{
-	smp_wmb();	/* see set_work_pool_and_clear_pending() */
-	set_work_data(work, WORK_STRUCT_NO_POOL, 0);
-}
-
 static struct pool_workqueue *get_work_pwq(struct work_struct *work)
 {
 	unsigned long data = atomic_long_read(&work->data);
 
 	if (data & WORK_STRUCT_PWQ)
-		return (void *)(data & WORK_STRUCT_WQ_DATA_MASK);
+		return (void *)(data & WORK_STRUCT_PWQ_MASK);
 	else
 		return NULL;
 }
@@ -730,39 +740,35 @@ static struct worker_pool *get_work_pool(struct work_struct *work)
 
 	if (data & WORK_STRUCT_PWQ)
 		return ((struct pool_workqueue *)
-			(data & WORK_STRUCT_WQ_DATA_MASK))->pool;
+			(data & WORK_STRUCT_PWQ_MASK))->pool;
 
-	pool_id = data >> WORK_OFFQ_POOL_SHIFT;
+	pool_id = (data >> WORK_OFFQ_POOL_SHIFT) & WORK_OFFQ_POOL_NONE;
 	if (pool_id == WORK_OFFQ_POOL_NONE)
 		return NULL;
 
 	return idr_find(&worker_pool_idr, pool_id);
 }
 
-/**
- * get_work_pool_id - return the worker pool ID a given work is associated with
- * @work: the work item of interest
- *
- * Return: The worker_pool ID @work was last associated with.
- * %WORK_OFFQ_POOL_NONE if none.
- */
-static int get_work_pool_id(struct work_struct *work)
+static unsigned long shift_and_mask(unsigned long v, u32 shift, u32 bits)
 {
-	unsigned long data = atomic_long_read(&work->data);
-
-	if (data & WORK_STRUCT_PWQ)
-		return ((struct pool_workqueue *)
-			(data & WORK_STRUCT_WQ_DATA_MASK))->pool->id;
-
-	return data >> WORK_OFFQ_POOL_SHIFT;
+	return (v >> shift) & ((1U << bits) - 1);
 }
 
-static void mark_work_canceling(struct work_struct *work)
+static void work_offqd_unpack(struct work_offq_data *offqd, unsigned long data)
 {
-	unsigned long pool_id = get_work_pool_id(work);
+	WARN_ON_ONCE(data & WORK_STRUCT_PWQ);
 
-	pool_id <<= WORK_OFFQ_POOL_SHIFT;
-	set_work_data(work, pool_id | WORK_OFFQ_CANCELING, WORK_STRUCT_PENDING);
+	offqd->pool_id = shift_and_mask(data, WORK_OFFQ_POOL_SHIFT,
+					WORK_OFFQ_POOL_BITS);
+	offqd->disable = shift_and_mask(data, WORK_OFFQ_DISABLE_SHIFT,
+					WORK_OFFQ_DISABLE_BITS);
+	offqd->flags = data & WORK_OFFQ_FLAG_MASK;
+}
+
+static unsigned long work_offqd_pack_flags(struct work_offq_data *offqd)
+{
+	return ((unsigned long)offqd->disable << WORK_OFFQ_DISABLE_SHIFT) |
+		((unsigned long)offqd->flags);
 }
 
 static bool work_is_canceling(struct work_struct *work)
@@ -1230,8 +1236,8 @@ out_put:
 /**
  * try_to_grab_pending - steal work item from worklist and disable irq
  * @work: work item to steal
- * @is_dwork: @work is a delayed_work
- * @flags: place to store irq state
+ * @cflags: %WORK_CANCEL_ flags
+ * @irq_flags: place to store irq state
  *
  * Try to grab PENDING bit of @work.  This function can handle @work in any
  * stable state - idle, on timer or on worklist.
@@ -1253,20 +1259,20 @@ out_put:
  * irqsafe, ensures that we return -EAGAIN for finite short period of time.
  *
  * On successful return, >= 0, irq is disabled and the caller is
- * responsible for releasing it using local_irq_restore(*@flags).
+ * responsible for releasing it using local_irq_restore(*@irq_flags).
  *
  * This function is safe to call from any context including IRQ handler.
  */
-static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
-			       unsigned long *flags)
+static int try_to_grab_pending(struct work_struct *work, u32 cflags,
+			       unsigned long *irq_flags)
 {
 	struct worker_pool *pool;
 	struct pool_workqueue *pwq;
 
-	local_irq_save(*flags);
+	local_irq_save(*irq_flags);
 
 	/* try to steal the timer if it exists */
-	if (is_dwork) {
+	if (cflags & WORK_CANCEL_DELAYED) {
 		struct delayed_work *dwork = to_delayed_work(work);
 
 		/*
@@ -1322,7 +1328,7 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 		pwq_dec_nr_in_flight(pwq, *work_data_bits(work));
 
 		/* work->data points to pwq iff queued, point to pool */
-		set_work_pool_and_keep_pending(work, pool->id);
+		set_work_pool_and_keep_pending(work, pool->id, 0);
 
 		raw_spin_unlock(&pool->lock);
 		rcu_read_unlock();
@@ -1331,11 +1337,80 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
 	raw_spin_unlock(&pool->lock);
 fail:
 	rcu_read_unlock();
-	local_irq_restore(*flags);
+	local_irq_restore(*irq_flags);
 	if (work_is_canceling(work))
 		return -ENOENT;
 	cpu_relax();
 	return -EAGAIN;
+}
+
+struct cwt_wait {
+	wait_queue_entry_t	wait;
+	struct work_struct	*work;
+};
+
+static int cwt_wakefn(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
+{
+	struct cwt_wait *cwait = container_of(wait, struct cwt_wait, wait);
+
+	if (cwait->work != key)
+		return 0;
+	return autoremove_wake_function(wait, mode, sync, key);
+}
+
+/**
+ * work_grab_pending - steal work item from worklist and disable irq
+ * @work: work item to steal
+ * @cflags: %WORK_CANCEL_ flags
+ * @irq_flags: place to store IRQ state
+ *
+ * Grab PENDING bit of @work. @work can be in any stable state - idle, on timer
+ * or on worklist.
+ *
+ * Must be called in process context. IRQ is disabled on return with IRQ state
+ * stored in *@irq_flags. The caller is responsible for re-enabling it using
+ * local_irq_restore().
+ *
+ * Returns %true if @work was pending. %false if idle.
+ */
+static bool work_grab_pending(struct work_struct *work, u32 cflags,
+			      unsigned long *irq_flags)
+{
+	struct cwt_wait cwait;
+	int ret;
+
+	might_sleep();
+repeat:
+	ret = try_to_grab_pending(work, cflags, irq_flags);
+	if (likely(ret >= 0))
+		return ret;
+	if (ret != -ENOENT)
+		goto repeat;
+
+	/*
+	 * Someone is already canceling. Wait for it to finish. flush_work()
+	 * doesn't work for PREEMPT_NONE because we may get woken up between
+	 * @work's completion and the other canceling task resuming and clearing
+	 * CANCELING - flush_work() will return false immediately as @work is no
+	 * longer busy, try_to_grab_pending() will return -ENOENT as @work is
+	 * still being canceled and the other canceling task won't be able to
+	 * clear CANCELING as we're hogging the CPU.
+	 *
+	 * Let's wait for completion using a waitqueue. As this may lead to the
+	 * thundering herd problem, use a custom wake function which matches
+	 * @work along with exclusive wait and wakeup.
+	 */
+	init_wait(&cwait.wait);
+	cwait.wait.func = cwt_wakefn;
+	cwait.work = work;
+
+	prepare_to_wait_exclusive(&wq_cancel_waitq, &cwait.wait,
+				  TASK_UNINTERRUPTIBLE);
+	if (work_is_canceling(work))
+		schedule();
+	finish_wait(&wq_cancel_waitq, &cwait.wait);
+
+	goto repeat;
 }
 
 /**
@@ -1523,6 +1598,21 @@ out:
 	rcu_read_unlock();
 }
 
+static bool clear_pending_if_disabled(struct work_struct *work)
+{
+	unsigned long data = *work_data_bits(work);
+	struct work_offq_data offqd;
+
+	if (likely((data & WORK_STRUCT_PWQ) ||
+		   !(data & WORK_OFFQ_DISABLE_MASK)))
+		return false;
+
+	work_offqd_unpack(&offqd, data);
+	set_work_pool_and_clear_pending(work, offqd.pool_id,
+					work_offqd_pack_flags(&offqd));
+	return true;
+}
+
 /**
  * queue_work_on - queue work on specific cpu
  * @cpu: CPU number to execute work on
@@ -1538,16 +1628,17 @@ bool queue_work_on(int cpu, struct workqueue_struct *wq,
 		   struct work_struct *work)
 {
 	bool ret = false;
-	unsigned long flags;
+	unsigned long irq_flags;
 
-	local_irq_save(flags);
+	local_irq_save(irq_flags);
 
-	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
+	    !clear_pending_if_disabled(work)) {
 		__queue_work(cpu, wq, work);
 		ret = true;
 	}
 
-	local_irq_restore(flags);
+	local_irq_restore(irq_flags);
 	return ret;
 }
 EXPORT_SYMBOL(queue_work_on);
@@ -1608,7 +1699,7 @@ static int workqueue_select_cpu_near(int node)
 bool queue_work_node(int node, struct workqueue_struct *wq,
 		     struct work_struct *work)
 {
-	unsigned long flags;
+	unsigned long irq_flags;
 	bool ret = false;
 
 	/*
@@ -1622,16 +1713,17 @@ bool queue_work_node(int node, struct workqueue_struct *wq,
 	 */
 	WARN_ON_ONCE(!(wq->flags & WQ_UNBOUND));
 
-	local_irq_save(flags);
+	local_irq_save(irq_flags);
 
-	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
+	    !clear_pending_if_disabled(work)) {
 		int cpu = workqueue_select_cpu_near(node);
 
 		__queue_work(cpu, wq, work);
 		ret = true;
 	}
 
-	local_irq_restore(flags);
+	local_irq_restore(irq_flags);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(queue_work_node);
@@ -1693,17 +1785,18 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
 {
 	struct work_struct *work = &dwork->work;
 	bool ret = false;
-	unsigned long flags;
+	unsigned long irq_flags;
 
 	/* read the comment in __queue_work() */
-	local_irq_save(flags);
+	local_irq_save(irq_flags);
 
-	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
+	    !clear_pending_if_disabled(work)) {
 		__queue_delayed_work(cpu, wq, dwork, delay);
 		ret = true;
 	}
 
-	local_irq_restore(flags);
+	local_irq_restore(irq_flags);
 	return ret;
 }
 EXPORT_SYMBOL(queue_delayed_work_on);
@@ -1729,16 +1822,17 @@ EXPORT_SYMBOL(queue_delayed_work_on);
 bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
 			 struct delayed_work *dwork, unsigned long delay)
 {
-	unsigned long flags;
+	unsigned long irq_flags;
 	int ret;
 
 	do {
-		ret = try_to_grab_pending(&dwork->work, true, &flags);
+		ret = try_to_grab_pending(&dwork->work, WORK_CANCEL_DELAYED,
+					  &irq_flags);
 	} while (unlikely(ret == -EAGAIN));
 
 	if (likely(ret >= 0)) {
 		__queue_delayed_work(cpu, wq, dwork, delay);
-		local_irq_restore(flags);
+		local_irq_restore(irq_flags);
 	}
 
 	/* -ENOENT from try_to_grab_pending() becomes %true */
@@ -1770,7 +1864,12 @@ bool queue_rcu_work(struct workqueue_struct *wq, struct rcu_work *rwork)
 {
 	struct work_struct *work = &rwork->work;
 
-	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+	/*
+	 * rcu_work can't be canceled or disabled. Warn if the user reached
+	 * inside @rwork and disabled the inner work.
+	 */
+	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)) &&
+	    !WARN_ON_ONCE(clear_pending_if_disabled(work))) {
 		rwork->wq = wq;
 		call_rcu(&rwork->rcu, rcu_work_rcufn);
 		return true;
@@ -2353,7 +2452,7 @@ __acquires(&pool->lock)
 	 * PENDING and queued state changes happen together while IRQ is
 	 * disabled.
 	 */
-	set_work_pool_and_clear_pending(work, pool->id);
+	set_work_pool_and_clear_pending(work, pool->id, 0);
 
 	raw_spin_unlock_irq(&pool->lock);
 
@@ -3191,108 +3290,6 @@ bool flush_work(struct work_struct *work)
 }
 EXPORT_SYMBOL_GPL(flush_work);
 
-struct cwt_wait {
-	wait_queue_entry_t		wait;
-	struct work_struct	*work;
-};
-
-static int cwt_wakefn(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
-{
-	struct cwt_wait *cwait = container_of(wait, struct cwt_wait, wait);
-
-	if (cwait->work != key)
-		return 0;
-	return autoremove_wake_function(wait, mode, sync, key);
-}
-
-static bool __cancel_work_timer(struct work_struct *work, bool is_dwork)
-{
-	static DECLARE_WAIT_QUEUE_HEAD(cancel_waitq);
-	unsigned long flags;
-	int ret;
-
-	do {
-		ret = try_to_grab_pending(work, is_dwork, &flags);
-		/*
-		 * If someone else is already canceling, wait for it to
-		 * finish.  flush_work() doesn't work for PREEMPT_NONE
-		 * because we may get scheduled between @work's completion
-		 * and the other canceling task resuming and clearing
-		 * CANCELING - flush_work() will return false immediately
-		 * as @work is no longer busy, try_to_grab_pending() will
-		 * return -ENOENT as @work is still being canceled and the
-		 * other canceling task won't be able to clear CANCELING as
-		 * we're hogging the CPU.
-		 *
-		 * Let's wait for completion using a waitqueue.  As this
-		 * may lead to the thundering herd problem, use a custom
-		 * wake function which matches @work along with exclusive
-		 * wait and wakeup.
-		 */
-		if (unlikely(ret == -ENOENT)) {
-			struct cwt_wait cwait;
-
-			init_wait(&cwait.wait);
-			cwait.wait.func = cwt_wakefn;
-			cwait.work = work;
-
-			prepare_to_wait_exclusive(&cancel_waitq, &cwait.wait,
-						  TASK_UNINTERRUPTIBLE);
-			if (work_is_canceling(work))
-				schedule();
-			finish_wait(&cancel_waitq, &cwait.wait);
-		}
-	} while (unlikely(ret < 0));
-
-	/* tell other tasks trying to grab @work to back off */
-	mark_work_canceling(work);
-	local_irq_restore(flags);
-
-	/*
-	 * This allows canceling during early boot.  We know that @work
-	 * isn't executing.
-	 */
-	if (wq_online)
-		__flush_work(work, true);
-
-	clear_work_data(work);
-
-	/*
-	 * Paired with prepare_to_wait() above so that either
-	 * waitqueue_active() is visible here or !work_is_canceling() is
-	 * visible there.
-	 */
-	smp_mb();
-	if (waitqueue_active(&cancel_waitq))
-		__wake_up(&cancel_waitq, TASK_NORMAL, 1, work);
-
-	return ret;
-}
-
-/**
- * cancel_work_sync - cancel a work and wait for it to finish
- * @work: the work to cancel
- *
- * Cancel @work and wait for its execution to finish.  This function
- * can be used even if the work re-queues itself or migrates to
- * another workqueue.  On return from this function, @work is
- * guaranteed to be not pending or executing on any CPU.
- *
- * cancel_work_sync(&delayed_work->work) must not be used for
- * delayed_work's.  Use cancel_delayed_work_sync() instead.
- *
- * The caller must ensure that the workqueue on which @work was last
- * queued can't be destroyed before this function returns.
- *
- * Return:
- * %true if @work was pending, %false otherwise.
- */
-bool cancel_work_sync(struct work_struct *work)
-{
-	return __cancel_work_timer(work, false);
-}
-EXPORT_SYMBOL_GPL(cancel_work_sync);
-
 /**
  * flush_delayed_work - wait for a dwork to finish executing the last queueing
  * @dwork: the delayed work to flush
@@ -3335,20 +3332,92 @@ bool flush_rcu_work(struct rcu_work *rwork)
 }
 EXPORT_SYMBOL(flush_rcu_work);
 
-static bool __cancel_work(struct work_struct *work, bool is_dwork)
+static void work_offqd_disable(struct work_offq_data *offqd)
 {
-	unsigned long flags;
+	const unsigned long max = (1lu << WORK_OFFQ_DISABLE_BITS) - 1;
+
+	if (likely(offqd->disable < max))
+		offqd->disable++;
+	else
+		WARN_ONCE(true, "workqueue: work disable count overflowed\n");
+}
+
+static void work_offqd_enable(struct work_offq_data *offqd)
+{
+	if (likely(offqd->disable > 0))
+		offqd->disable--;
+	else
+		WARN_ONCE(true, "workqueue: work disable count underflowed\n");
+}
+
+static bool __cancel_work(struct work_struct *work, u32 cflags)
+{
+	struct work_offq_data offqd;
+	unsigned long irq_flags;
 	int ret;
 
-	do {
-		ret = try_to_grab_pending(work, is_dwork, &flags);
-	} while (unlikely(ret == -EAGAIN));
+	if (cflags & WORK_CANCEL_DISABLE) {
+		ret = work_grab_pending(work, cflags, &irq_flags);
+	} else {
+		do {
+			ret = try_to_grab_pending(work, cflags, &irq_flags);
+		} while (unlikely(ret == -EAGAIN));
 
-	if (unlikely(ret < 0))
-		return false;
+		if (unlikely(ret < 0))
+			return false;
+	}
 
-	set_work_pool_and_clear_pending(work, get_work_pool_id(work));
-	local_irq_restore(flags);
+	work_offqd_unpack(&offqd, *work_data_bits(work));
+
+	if (cflags & WORK_CANCEL_DISABLE)
+		work_offqd_disable(&offqd);
+
+	set_work_pool_and_clear_pending(work, offqd.pool_id,
+					work_offqd_pack_flags(&offqd));
+	local_irq_restore(irq_flags);
+	return ret;
+}
+
+static bool __cancel_work_sync(struct work_struct *work, u32 cflags)
+{
+	struct work_offq_data offqd;
+	unsigned long irq_flags;
+	bool ret;
+
+	/* claim @work and tell other tasks trying to grab @work to back off */
+	ret = work_grab_pending(work, cflags, &irq_flags);
+
+	work_offqd_unpack(&offqd, *work_data_bits(work));
+
+	if (cflags & WORK_CANCEL_DISABLE)
+		work_offqd_disable(&offqd);
+
+	offqd.flags |= WORK_OFFQ_CANCELING;
+	set_work_pool_and_keep_pending(work, offqd.pool_id,
+				       work_offqd_pack_flags(&offqd));
+	local_irq_restore(irq_flags);
+
+	/*
+	 * This allows canceling during early boot.  We know that @work
+	 * isn't executing.
+	 */
+	if (wq_online)
+		__flush_work(work, true);
+
+	work_offqd_unpack(&offqd, *work_data_bits(work));
+
+	/*
+	 * smp_mb() at the end of set_work_pool_and_clear_pending() is paired
+	 * with prepare_to_wait() above so that either waitqueue_active() is
+	 * visible here or !work_is_canceling() is visible there.
+	 */
+	offqd.flags &= ~WORK_OFFQ_CANCELING;
+	set_work_pool_and_clear_pending(work, WORK_OFFQ_POOL_NONE,
+					work_offqd_pack_flags(&offqd));
+
+	if (waitqueue_active(&wq_cancel_waitq))
+		__wake_up(&wq_cancel_waitq, TASK_NORMAL, 1, work);
+
 	return ret;
 }
 
@@ -3357,9 +3426,33 @@ static bool __cancel_work(struct work_struct *work, bool is_dwork)
  */
 bool cancel_work(struct work_struct *work)
 {
-	return __cancel_work(work, false);
+	return __cancel_work(work, 0);
 }
 EXPORT_SYMBOL(cancel_work);
+
+/**
+ * cancel_work_sync - cancel a work and wait for it to finish
+ * @work: the work to cancel
+ *
+ * Cancel @work and wait for its execution to finish.  This function
+ * can be used even if the work re-queues itself or migrates to
+ * another workqueue.  On return from this function, @work is
+ * guaranteed to be not pending or executing on any CPU.
+ *
+ * cancel_work_sync(&delayed_work->work) must not be used for
+ * delayed_work's.  Use cancel_delayed_work_sync() instead.
+ *
+ * The caller must ensure that the workqueue on which @work was last
+ * queued can't be destroyed before this function returns.
+ *
+ * Return:
+ * %true if @work was pending, %false otherwise.
+ */
+bool cancel_work_sync(struct work_struct *work)
+{
+	return __cancel_work_sync(work, 0);
+}
+EXPORT_SYMBOL_GPL(cancel_work_sync);
 
 /**
  * cancel_delayed_work - cancel a delayed work
@@ -3379,7 +3472,7 @@ EXPORT_SYMBOL(cancel_work);
  */
 bool cancel_delayed_work(struct delayed_work *dwork)
 {
-	return __cancel_work(&dwork->work, true);
+	return __cancel_work(&dwork->work, WORK_CANCEL_DELAYED);
 }
 EXPORT_SYMBOL(cancel_delayed_work);
 
@@ -3394,9 +3487,108 @@ EXPORT_SYMBOL(cancel_delayed_work);
  */
 bool cancel_delayed_work_sync(struct delayed_work *dwork)
 {
-	return __cancel_work_timer(&dwork->work, true);
+	return __cancel_work_sync(&dwork->work, WORK_CANCEL_DELAYED);
 }
 EXPORT_SYMBOL(cancel_delayed_work_sync);
+
+/**
+ * disable_work - Disable and cancel a work item
+ * @work: work item to disable
+ *
+ * Disable @work by incrementing its disable count and cancel it if currently
+ * pending. As long as the disable count is non-zero, any attempt to queue @work
+ * will fail and return %false. The maximum supported disable depth is 2 to the
+ * power of %WORK_OFFQ_DISABLE_BITS, currently 65536.
+ *
+ * Must be called from a sleepable context. Returns %true if @work was pending,
+ * %false otherwise.
+ */
+bool disable_work(struct work_struct *work)
+{
+	return __cancel_work(work, WORK_CANCEL_DISABLE);
+}
+EXPORT_SYMBOL_GPL(disable_work);
+
+/**
+ * disable_work_sync - Disable, cancel and drain a work item
+ * @work: work item to disable
+ *
+ * Similar to disable_work() but also wait for @work to finish if currently
+ * executing.
+ *
+ * Must be called from a sleepable context. Returns %true if @work was pending,
+ * %false otherwise.
+ */
+bool disable_work_sync(struct work_struct *work)
+{
+	return __cancel_work_sync(work, WORK_CANCEL_DISABLE);
+}
+EXPORT_SYMBOL_GPL(disable_work_sync);
+
+/**
+ * enable_work - Enable a work item
+ * @work: work item to enable
+ *
+ * Undo disable_work[_sync]() by decrementing @work's disable count. @work can
+ * only be queued if its disable count is 0.
+ *
+ * Must be called from a sleepable context. Returns %true if the disable count
+ * reached 0. Otherwise, %false.
+ */
+bool enable_work(struct work_struct *work)
+{
+	struct work_offq_data offqd;
+	unsigned long irq_flags;
+
+	work_grab_pending(work, 0, &irq_flags);
+
+	work_offqd_unpack(&offqd, *work_data_bits(work));
+	work_offqd_enable(&offqd);
+	set_work_pool_and_clear_pending(work, offqd.pool_id,
+					work_offqd_pack_flags(&offqd));
+	local_irq_restore(irq_flags);
+
+	return !offqd.disable;
+}
+EXPORT_SYMBOL_GPL(enable_work);
+
+/**
+ * disable_delayed_work - Disable and cancel a delayed work item
+ * @dwork: delayed work item to disable
+ *
+ * disable_work() for delayed work items.
+ */
+bool disable_delayed_work(struct delayed_work *dwork)
+{
+	return __cancel_work(&dwork->work,
+			     WORK_CANCEL_DELAYED | WORK_CANCEL_DISABLE);
+}
+EXPORT_SYMBOL_GPL(disable_delayed_work);
+
+/**
+ * disable_delayed_work_sync - Disable, cancel and drain a delayed work item
+ * @dwork: delayed work item to disable
+ *
+ * disable_work_sync() for delayed work items.
+ */
+bool disable_delayed_work_sync(struct delayed_work *dwork)
+{
+	return __cancel_work_sync(&dwork->work,
+				  WORK_CANCEL_DELAYED | WORK_CANCEL_DISABLE);
+}
+EXPORT_SYMBOL_GPL(disable_delayed_work_sync);
+
+/**
+ * enable_delayed_work - Enable a delayed work item
+ * @dwork: delayed work item to enable
+ *
+ * enable_work() for delayed work items.
+ */
+bool enable_delayed_work(struct delayed_work *dwork)
+{
+	return enable_work(&dwork->work);
+}
+EXPORT_SYMBOL_GPL(enable_delayed_work);
 
 /**
  * schedule_on_each_cpu - execute a function synchronously on each online CPU
@@ -3857,7 +4049,7 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 {
 	struct workqueue_struct *wq = pwq->wq;
 	bool freezable = wq->flags & WQ_FREEZABLE;
-	unsigned long flags;
+	unsigned long irq_flags;
 
 	/* for @wq->saved_max_active */
 	lockdep_assert_held(&wq->mutex);
@@ -3867,7 +4059,7 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 		return;
 
 	/* this function can be called during early boot w/ irq disabled */
-	raw_spin_lock_irqsave(&pwq->pool->lock, flags);
+	raw_spin_lock_irqsave(&pwq->pool->lock, irq_flags);
 
 	/*
 	 * During [un]freezing, the caller is responsible for ensuring that
@@ -3897,14 +4089,14 @@ static void pwq_adjust_max_active(struct pool_workqueue *pwq)
 		pwq->max_active = 0;
 	}
 
-	raw_spin_unlock_irqrestore(&pwq->pool->lock, flags);
+	raw_spin_unlock_irqrestore(&pwq->pool->lock, irq_flags);
 }
 
 /* initialize newly allocated @pwq which is associated with @wq and @pool */
 static void init_pwq(struct pool_workqueue *pwq, struct workqueue_struct *wq,
 		     struct worker_pool *pool)
 {
-	BUG_ON((unsigned long)pwq & WORK_STRUCT_FLAG_MASK);
+	BUG_ON((unsigned long)pwq & ~WORK_STRUCT_PWQ_MASK);
 
 	memset(pwq, 0, sizeof(*pwq));
 
@@ -4719,7 +4911,7 @@ EXPORT_SYMBOL_GPL(workqueue_congested);
 unsigned int work_busy(struct work_struct *work)
 {
 	struct worker_pool *pool;
-	unsigned long flags;
+	unsigned long irq_flags;
 	unsigned int ret = 0;
 
 	if (work_pending(work))
@@ -4728,10 +4920,10 @@ unsigned int work_busy(struct work_struct *work)
 	rcu_read_lock();
 	pool = get_work_pool(work);
 	if (pool) {
-		raw_spin_lock_irqsave(&pool->lock, flags);
+		raw_spin_lock_irqsave(&pool->lock, irq_flags);
 		if (find_worker_executing_work(pool, work))
 			ret |= WORK_BUSY_RUNNING;
-		raw_spin_unlock_irqrestore(&pool->lock, flags);
+		raw_spin_unlock_irqrestore(&pool->lock, irq_flags);
 	}
 	rcu_read_unlock();
 
@@ -4913,7 +5105,7 @@ void show_one_workqueue(struct workqueue_struct *wq)
 {
 	struct pool_workqueue *pwq;
 	bool idle = true;
-	unsigned long flags;
+	unsigned long irq_flags;
 
 	for_each_pwq(pwq, wq) {
 		if (pwq->nr_active || !list_empty(&pwq->inactive_works)) {
@@ -4927,7 +5119,7 @@ void show_one_workqueue(struct workqueue_struct *wq)
 	pr_info("workqueue %s: flags=0x%x\n", wq->name, wq->flags);
 
 	for_each_pwq(pwq, wq) {
-		raw_spin_lock_irqsave(&pwq->pool->lock, flags);
+		raw_spin_lock_irqsave(&pwq->pool->lock, irq_flags);
 		if (pwq->nr_active || !list_empty(&pwq->inactive_works)) {
 			/*
 			 * Defer printing to avoid deadlocks in console
@@ -4938,7 +5130,7 @@ void show_one_workqueue(struct workqueue_struct *wq)
 			show_pwq(pwq);
 			printk_deferred_exit();
 		}
-		raw_spin_unlock_irqrestore(&pwq->pool->lock, flags);
+		raw_spin_unlock_irqrestore(&pwq->pool->lock, irq_flags);
 		/*
 		 * We could be printing a lot from atomic context, e.g.
 		 * sysrq-t -> show_all_workqueues(). Avoid triggering
@@ -4957,9 +5149,9 @@ static void show_one_worker_pool(struct worker_pool *pool)
 {
 	struct worker *worker;
 	bool first = true;
-	unsigned long flags;
+	unsigned long irq_flags;
 
-	raw_spin_lock_irqsave(&pool->lock, flags);
+	raw_spin_lock_irqsave(&pool->lock, irq_flags);
 	if (pool->nr_workers == pool->nr_idle)
 		goto next_pool;
 	/*
@@ -4984,7 +5176,7 @@ static void show_one_worker_pool(struct worker_pool *pool)
 	pr_cont("\n");
 	printk_deferred_exit();
 next_pool:
-	raw_spin_unlock_irqrestore(&pool->lock, flags);
+	raw_spin_unlock_irqrestore(&pool->lock, irq_flags);
 	/*
 	 * We could be printing a lot from atomic context, e.g.
 	 * sysrq-t -> show_all_workqueues(). Avoid triggering
@@ -6095,6 +6287,8 @@ void __init workqueue_init_early(void)
 	int i, cpu;
 
 	BUILD_BUG_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
+	/* the kABI OFFQ layout puts the disable depth above the pool ID */
+	BUILD_BUG_ON(WORK_OFFQ_DISABLE_SHIFT + WORK_OFFQ_DISABLE_BITS > BITS_PER_LONG);
 
 	BUG_ON(!alloc_cpumask_var(&wq_unbound_cpumask, GFP_KERNEL));
 	cpumask_copy(wq_unbound_cpumask, housekeeping_cpumask(HK_TYPE_WQ));
