@@ -280,9 +280,6 @@ static inline bool ktime_get_aux_ts64(clockid_t id, struct timespec64 *kt) { ret
  *				 a selected CLOCK_* and the clocksource counter value
  * @cycles:		Clocksource counter value to produce the system times
  * @systime:		The system time of the selected CLOCK ID
- * @real:		Realtime system time
- * @boot:		Boot time
- * @raw:		Monotonic raw system time
  * @monoraw:		Monotonic raw system time
  * @cs_id:		Clocksource ID
  * @clock_was_set_seq:	The sequence number of clock-was-set events
@@ -292,29 +289,11 @@ static inline bool ktime_get_aux_ts64(clockid_t id, struct timespec64 *kt) { ret
 struct system_time_snapshot {
 	u64			cycles;
 	ktime_t			systime;
-	ktime_t			real;
-	ktime_t			boot;
-	union {
-		ktime_t		raw;
-		ktime_t		monoraw;
-	};
+	ktime_t			monoraw;
 	enum clocksource_ids	cs_id;
 	unsigned int		clock_was_set_seq;
 	u8			cs_was_changed_seq;
 	u8			valid;
-};
-
-/**
- * struct system_device_crosststamp - system/device cross-timestamp
- *				      (synchronized capture)
- * @device:		Device time
- * @sys_realtime:	Realtime simultaneous with device time
- * @sys_monoraw:	Monotonic raw simultaneous with device time
- */
-struct system_device_crosststamp {
-	ktime_t device;
-	ktime_t sys_realtime;
-	ktime_t sys_monoraw;
 };
 
 /**
@@ -331,6 +310,23 @@ struct system_counterval_t {
 	u64			cycles;
 	enum clocksource_ids	cs_id;
 	bool			use_nsecs;
+};
+
+/**
+ * struct system_device_crosststamp - system/device cross-timestamp
+ *				      (synchronized capture)
+ * @clock_id:		System time Clock ID to capture
+ * @device:		Device time
+ * @sys_counter:	Clocksource counter value simultaneous with device time
+ * @sys_realtime:	Realtime simultaneous with device time
+ * @sys_monoraw:	Monotonic raw simultaneous with device time
+ */
+struct system_device_crosststamp {
+	clockid_t			clock_id;
+	ktime_t				device;
+	struct system_counterval_t	sys_counter;
+	ktime_t				sys_realtime;
+	ktime_t				sys_monoraw;
 };
 
 extern bool ktime_real_to_base_clock(ktime_t treal,
