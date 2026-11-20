@@ -21,6 +21,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include "vm_util.h"
+#include "thp_settings.h"
 
 /*
  * Ignore the checkpatch warning, as per the C99 standard, section 7.14.1.1:
@@ -2202,6 +2203,9 @@ TEST_F(guard_regions, collapse)
 	const unsigned long num_pages = size / page_size;
 	char *ptr;
 	int i;
+
+	if (!thp_available())
+		SKIP(return, "Transparent Hugepages not available\n");
 
 	/* Need file to be correct size for tests for non-anon. */
 	if (variant->backing != ANON_BACKED)
