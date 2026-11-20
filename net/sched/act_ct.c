@@ -685,8 +685,15 @@ static int tcf_ct_ipv6_is_fragment(struct sk_buff *skb, bool *frag)
 	return 0;
 }
 
+/* On error, tells the caller whether it still owns @skb and must free it
+ * itself.  @skb is ours only when the header checks below reject the packet
+ * before it is handed to the defragmentation engine; once nf_ct_handle_
+ * fragments() has been called the skb is either queued (-EINPROGRESS) or has
+ * already been freed by it.
+ */
 static int tcf_ct_handle_fragments(struct net *net, struct sk_buff *skb,
-				   u8 family, u16 zone, bool *defrag)
+				   u8 family, u16 zone, bool *defrag,
+				   bool *skb_is_ours)
 {
 	enum ip_conntrack_info ctinfo;
 	struct nf_conn *ct;
@@ -703,10 +710,13 @@ static int tcf_ct_handle_fragments(struct net *net, struct sk_buff *skb,
 		err = tcf_ct_ipv4_is_fragment(skb, &frag);
 	else
 		err = tcf_ct_ipv6_is_fragment(skb, &frag);
-	if (err || !frag)
+	if (err) {
+		*skb_is_ours = true;
 		return err;
+	}
+	if (!frag)
+		return 0;
 
-	skb_get(skb);
 	mru = tc_skb_cb(skb)->mru;
 
 	if (family == NFPROTO_IPV4) {
@@ -716,41 +726,36 @@ static int tcf_ct_handle_fragments(struct net *net, struct sk_buff *skb,
 		local_bh_disable();
 		err = ip_defrag(net, skb, user);
 		local_bh_enable();
-		if (err && err != -EINPROGRESS)
+		if (err)
 			return err;
 
-		if (!err) {
-			*defrag = true;
-			mru = IPCB(skb)->frag_max_size;
-		}
+		mru = IPCB(skb)->frag_max_size;
 	} else { /* NFPROTO_IPV6 */
 #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
 		enum ip6_defrag_users user = IP6_DEFRAG_CONNTRACK_IN + zone;
 
 		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
 		err = nf_ct_frag6_gather(net, skb, user);
-		if (err && err != -EINPROGRESS)
-			goto out_free;
-
-		if (!err) {
-			*defrag = true;
-			mru = IP6CB(skb)->frag_max_size;
+		if (err) {
+			if (err != -EINPROGRESS)
+				kfree_skb(skb);
+			return err;
 		}
+
+		mru = IP6CB(skb)->frag_max_size;
 #else
-		err = -EOPNOTSUPP;
-		goto out_free;
+		kfree_skb(skb);
+		return -EPFNOSUPPORT;
 #endif
 	}
 
-	if (err != -EINPROGRESS)
-		tc_skb_cb(skb)->mru = mru;
+	*defrag = true;
+	tc_skb_cb(skb)->mru = mru;
+
 	skb_clear_hash(skb);
 	skb->ignore_df = 1;
-	return err;
 
-out_free:
-	kfree_skb(skb);
-	return err;
+	return 0;
 }
 
 static void tcf_ct_params_free(struct rcu_head *head)
@@ -951,6 +956,7 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 	struct nf_hook_state state;
 	int nh_ofs, err, retval;
 	struct tcf_ct_params *p;
+	bool skb_is_ours = false;
 	bool skip_add = false;
 	bool defrag = false;
 	struct nf_conn *ct;
@@ -987,13 +993,18 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 	 */
 	nh_ofs = skb_network_offset(skb);
 	skb_pull_rcsum(skb, nh_ofs);
-	err = tcf_ct_handle_fragments(net, skb, family, p->zone, &defrag);
-	if (err == -EINPROGRESS) {
-		retval = TC_ACT_STOLEN;
-		goto out_clear;
+	err = tcf_ct_handle_fragments(net, skb, family, p->zone, &defrag,
+				      &skb_is_ours);
+	if (err) {
+		/* The skb is still ours only when the header checks rejected
+		 * it; returning TC_ACT_CONSUMED for such a packet would leak
+		 * it, since no caller frees an skb it was told it no longer
+		 * owns.
+		 */
+		if (skb_is_ours)
+			goto drop;
+		goto out_frag;
 	}
-	if (err)
-		goto drop;
 
 	err = tcf_ct_skb_network_trim(skb, family);
 	if (err)
@@ -1059,6 +1070,11 @@ out_clear:
 	if (defrag)
 		qdisc_skb_cb(skb)->pkt_len = skb->len;
 	return retval;
+
+out_frag:
+	if (err != -EINPROGRESS)
+		tcf_action_inc_drop_qstats(&c->common);
+	return TC_ACT_CONSUMED;
 
 drop:
 	tcf_action_inc_drop_qstats(&c->common);
@@ -1257,6 +1273,12 @@ static int tcf_ct_init(struct net *net, struct nlattr *nla,
 	if (!nla) {
 		NL_SET_ERR_MSG_MOD(extack, "Ct requires attributes to be passed");
 		return -EINVAL;
+	}
+
+	if (bind && !(flags & TCA_ACT_FLAGS_AT_INGRESS_OR_CLSACT)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Attaching ct to a non ingress/clsact qdisc is unsupported");
+		return -EOPNOTSUPP;
 	}
 
 	err = nla_parse_nested(tb, TCA_CT_MAX, nla, ct_policy, extack);
