@@ -1562,6 +1562,17 @@ static inline u32 iwl_mvm_get_scd_ssn(struct iwl_mvm *mvm,
 			    tx_resp->frame_count) & 0xfff;
 }
 
+static inline size_t iwl_mvm_tx_resp_min_len(struct iwl_mvm *mvm,
+					     struct iwl_mvm_tx_resp *tx_resp)
+{
+	struct agg_tx_status *agg_status =
+		iwl_mvm_get_agg_status(mvm, tx_resp);
+
+	/* The aggregate response ends with a trailing SCD SSN __le32 word. */
+	return (u8 *)(agg_status + tx_resp->frame_count) - (u8 *)tx_resp +
+		sizeof(__le32);
+}
+
 static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
 				     struct iwl_rx_packet *pkt)
 {
@@ -1866,6 +1877,9 @@ static void iwl_mvm_rx_tx_cmd_agg(struct iwl_mvm *mvm,
 	int queue = SEQ_TO_QUEUE(sequence);
 	struct ieee80211_sta *sta;
 
+	if (WARN_ON_ONCE(iwl_mvm_has_new_tx_api(mvm)))
+		return;
+
 	if (WARN_ON_ONCE(queue < IWL_MVM_DQA_MIN_DATA_QUEUE &&
 			 (queue != IWL_MVM_DQA_BSS_CLIENT_QUEUE)))
 		return;
@@ -1900,6 +1914,26 @@ void iwl_mvm_rx_tx_cmd(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 {
 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
 	struct iwl_mvm_tx_resp *tx_resp = (void *)pkt->data;
+	size_t min_len;
+
+	if (IWL_FW_CHECK(mvm, !tx_resp->frame_count,
+			 "invalid TX_CMD frame_count %u\n",
+			 tx_resp->frame_count))
+		return;
+
+	if (IWL_FW_CHECK(mvm,
+			 iwl_mvm_has_new_tx_api(mvm) &&
+			 tx_resp->frame_count != 1,
+			 "invalid TX_CMD frame_count %u for new TX API\n",
+			 tx_resp->frame_count))
+		return;
+
+	min_len = iwl_mvm_tx_resp_min_len(mvm, tx_resp);
+	if (IWL_FW_CHECK(mvm, iwl_rx_packet_payload_len(pkt) < min_len,
+			 "invalid TX_CMD len %u (frame_count %u, min %zu)\n",
+			 iwl_rx_packet_payload_len(pkt), tx_resp->frame_count,
+			 min_len))
+		return;
 
 	if (tx_resp->frame_count == 1)
 		iwl_mvm_rx_tx_cmd_single(mvm, pkt);
@@ -2067,7 +2101,8 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 		u16 tfd_cnt;
 		int i;
 
-		if (unlikely(sizeof(*ba_res) > pkt_len))
+		if (IWL_FW_CHECK(mvm, sizeof(*ba_res) > pkt_len,
+				 "short BA notification (%d)\n", pkt_len))
 			return;
 
 		sta_id = ba_res->sta_id;
@@ -2079,7 +2114,13 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 			(void *)(uintptr_t)ba_res->reduced_txp;
 
 		tfd_cnt = le16_to_cpu(ba_res->tfd_cnt);
-		if (!tfd_cnt || struct_size(ba_res, tfd, tfd_cnt) > pkt_len)
+		if (!tfd_cnt)
+			return;
+
+		if (IWL_FW_CHECK(mvm,
+				 struct_size(ba_res, tfd, tfd_cnt) > pkt_len,
+				 "short BA notification (tfds:%d, size:%d)\n",
+				 tfd_cnt, pkt_len))
 			return;
 
 		rcu_read_lock();
@@ -2103,8 +2144,14 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 			if (tid == IWL_MGMT_TID)
 				tid = IWL_MAX_TID_COUNT;
 
+			if (IWL_FW_CHECK(mvm, tid >=
+					 ARRAY_SIZE(mvmsta->tid_data),
+					 "invalid TID %d in compressed BA\n",
+					 tid))
+				continue;
+
 			if (mvmsta)
-				mvmsta->tid_data[i].lq_color = lq_color;
+				mvmsta->tid_data[tid].lq_color = lq_color;
 
 			iwl_mvm_tx_reclaim(mvm, sta_id, tid,
 					   (int)(le16_to_cpu(ba_tfd->q_num)),
@@ -2137,7 +2184,9 @@ void iwl_mvm_rx_ba_notif(struct iwl_mvm *mvm, struct iwl_rx_cmd_buffer *rxb)
 
 	rcu_read_lock();
 	mvmsta = iwl_mvm_sta_from_staid_rcu(mvm, sta_id);
-	if (WARN_ON_ONCE(!mvmsta)) {
+	if (IWL_FW_CHECK(mvm, !mvmsta,
+			 "invalid STA ID %d in BA notif\n",
+			 sta_id)) {
 		rcu_read_unlock();
 		return;
 	}

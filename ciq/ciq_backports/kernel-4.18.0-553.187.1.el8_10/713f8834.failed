@@ -1,0 +1,206 @@
+gfs2: Get rid of demote_ok checks
+
+jira KERNEL-1940
+Rebuild_History Non-Buildable kernel-4.18.0-553.187.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 713f8834389f4b34bc8b449412202543c8b32214
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.187.1.el8_10/713f8834.failed
+
+The demote_ok glock operation is only still used to prevent the inode
+glocks of the "jindex" and "rindex" directories from getting recycled
+while they are still referenced by sdp->sd_jindex and sdp->sd_rindex.
+However, the LRU walking code will no longer recycle glocks which are
+referenced, so the demote_ok glock operation is obsolete and can be
+removed.
+
+Each of a glock's holders in the gl_holders list is holding a reference
+on the glock, so when the list of holders isn't empty in demote_ok(),
+the existing reference count check will already prevent the glock from
+getting released.  This means that demote_ok() is obsolete as well.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 713f8834389f4b34bc8b449412202543c8b32214)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/gfs2-glocks.txt
+diff --cc Documentation/filesystems/gfs2-glocks.txt
+index 49d69cadfe9a,adc0d4c4d979..000000000000
+--- a/Documentation/filesystems/gfs2-glocks.txt
++++ b/Documentation/filesystems/gfs2-glocks.txt
+@@@ -48,21 -55,22 +48,40 @@@ all the modes. Only inode glocks use th
+  
+  Table of glock operations and per type constants:
+  
+++<<<<<<< HEAD:Documentation/filesystems/gfs2-glocks.txt
+ +Field            | Purpose
+ +----------------------------------------------------------------------------
+ +go_xmote_th      | Called before remote state change (e.g. to sync dirty data)
+ +go_xmote_bh      | Called after remote state change (e.g. to refill cache)
+ +go_inval         | Called if remote state change requires invalidating the cache
+ +go_demote_ok     | Returns boolean value of whether its ok to demote a glock
+ +                 | (e.g. checks timeout, and that there is no cached data)
+ +go_lock          | Called for the first local holder of a lock
+ +go_unlock        | Called on the final local unlock of a lock
+ +go_dump          | Called to print content of object for debugfs file, or on
+ +                 | error to dump glock to the log.
+ +go_type          | The type of the glock, LM_TYPE_.....
+ +go_callback	 | Called if the DLM sends a callback to drop this lock
+ +go_flags	 | GLOF_ASPACE is set, if the glock has an address space
+ +                 | associated with it
+++=======
++ ==============     =============================================================
++ Field              Purpose
++ ==============     =============================================================
++ go_sync            Called before remote state change (e.g. to sync dirty data)
++ go_xmote_bh        Called after remote state change (e.g. to refill cache)
++ go_inval           Called if remote state change requires invalidating the cache
++ go_instantiate     Called when a glock has been acquired
++ go_held            Called every time a glock holder is acquired
++ go_dump            Called to print content of object for debugfs file, or on
++                    error to dump glock to the log.
++ go_callback	   Called if the DLM sends a callback to drop this lock
++ go_unlocked        Called when a glock is unlocked (dlm_unlock())
++ go_type            The type of the glock, ``LM_TYPE_*``
++ go_flags	   GLOF_ASPACE is set, if the glock has an address space
++                    associated with it
++ ==============     =============================================================
+++>>>>>>> 713f8834389f (gfs2: Get rid of demote_ok checks):Documentation/filesystems/gfs2-glocks.rst
+  
+  The minimum hold time for each lock is the time after a remote lock
+  grant for which we ignore remote demote requests. This is in order to
+@@@ -81,21 -87,25 +100,36 @@@ rather than via the glock
+  
+  Locking rules for glock operations:
+  
+++<<<<<<< HEAD:Documentation/filesystems/gfs2-glocks.txt
+ +Operation     |  GLF_LOCK bit lock held |  gl_lockref.lock spinlock held
+ +-------------------------------------------------------------------------
+ +go_xmote_th   |       Yes               |       No
+ +go_xmote_bh   |       Yes               |       No
+ +go_inval      |       Yes               |       No
+ +go_demote_ok  |       Sometimes         |       Yes
+ +go_lock       |       Yes               |       No
+ +go_unlock     |       Yes               |       No
+ +go_dump       |       Sometimes         |       Yes
+ +go_callback   |       Sometimes (N/A)   |       Yes
+++=======
++ ==============   ======================    =============================
++ Operation        GLF_LOCK bit lock held    gl_lockref.lock spinlock held
++ ==============   ======================    =============================
++ go_sync               Yes                       No
++ go_xmote_bh           Yes                       No
++ go_inval              Yes                       No
++ go_instantiate        No                        No
++ go_held               No                        No
++ go_dump               Sometimes                 Yes
++ go_callback           Sometimes (N/A)           Yes
++ go_unlocked           Yes                       No
++ ==============   ======================    =============================
+++>>>>>>> 713f8834389f (gfs2: Get rid of demote_ok checks):Documentation/filesystems/gfs2-glocks.rst
+  
+ -.. Note::
+ -
+ -   Operations must not drop either the bit lock or the spinlock
+ -   if its held on entry. go_dump and do_demote_ok must never block.
+ -   Note that go_dump will only be called if the glock's state
+ -   indicates that it is caching uptodate data.
+ +N.B. Operations must not drop either the bit lock or the spinlock
+ +if its held on entry. go_dump and do_demote_ok must never block.
+ +Note that go_dump will only be called if the glock's state
+ +indicates that it is caching uptodate data.
+  
+  Glock locking order within GFS2:
+  
+* Unmerged path Documentation/filesystems/gfs2-glocks.txt
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 199dcd67066d..0cba6d0e8e36 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -205,27 +205,6 @@ void gfs2_glock_hold(struct gfs2_glock *gl)
+ 		GLOCK_BUG_ON(gl, 1);
+ }
+ 
+-/**
+- * demote_ok - Check to see if it's ok to unlock a glock
+- * @gl: the glock
+- *
+- * Returns: 1 if it's ok
+- */
+-
+-static int demote_ok(const struct gfs2_glock *gl)
+-{
+-	const struct gfs2_glock_operations *glops = gl->gl_ops;
+-
+-	if (gl->gl_state == LM_ST_UNLOCKED)
+-		return 0;
+-	if (!list_empty(&gl->gl_holders))
+-		return 0;
+-	if (glops->go_demote_ok)
+-		return glops->go_demote_ok(gl);
+-	return 1;
+-}
+-
+-
+ static void gfs2_glock_add_to_lru(struct gfs2_glock *gl)
+ {
+ 	spin_lock(&lru_lock);
+@@ -1932,7 +1911,7 @@ __acquires(&lru_lock)
+ 		clear_bit(GLF_LRU, &gl->gl_flags);
+ 		freed++;
+ 		gl->gl_lockref.count++;
+-		if (demote_ok(gl))
++		if (gl->gl_state != LM_ST_UNLOCKED)
+ 			request_demote(gl, LM_ST_UNLOCKED, 0, false);
+ 		gfs2_glock_queue_work(gl, 0);
+ 		spin_unlock(&gl->gl_lockref.lock);
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 57fa4f3490a7..46b2e1e5fd39 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -381,23 +381,6 @@ static void inode_go_inval(struct gfs2_glock *gl, int flags)
+ 	gfs2_clear_glop_pending(ip);
+ }
+ 
+-/**
+- * inode_go_demote_ok - Check to see if it's ok to unlock an inode glock
+- * @gl: the glock
+- *
+- * Returns: 1 if it's ok
+- */
+-
+-static int inode_go_demote_ok(const struct gfs2_glock *gl)
+-{
+-	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+-
+-	if (sdp->sd_jindex == gl->gl_object || sdp->sd_rindex == gl->gl_object)
+-		return 0;
+-
+-	return 1;
+-}
+-
+ static int gfs2_dinode_in(struct gfs2_inode *ip, const void *buf)
+ {
+ 	const struct gfs2_dinode *str = buf;
+@@ -647,7 +630,6 @@ const struct gfs2_glock_operations gfs2_meta_glops = {
+ const struct gfs2_glock_operations gfs2_inode_glops = {
+ 	.go_sync = inode_go_sync,
+ 	.go_inval = inode_go_inval,
+-	.go_demote_ok = inode_go_demote_ok,
+ 	.go_instantiate = inode_go_instantiate,
+ 	.go_held = inode_go_held,
+ 	.go_dump = inode_go_dump,
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index ec87bcb111a8..85bd19e38f4b 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -221,7 +221,6 @@ struct gfs2_glock_operations {
+ 	int (*go_sync) (struct gfs2_glock *gl);
+ 	int (*go_xmote_bh)(struct gfs2_glock *gl);
+ 	void (*go_inval) (struct gfs2_glock *gl, int flags);
+-	int (*go_demote_ok) (const struct gfs2_glock *gl);
+ 	int (*go_instantiate) (struct gfs2_glock *gl);
+ 	int (*go_held)(struct gfs2_holder *gh);
+ 	void (*go_dump)(struct seq_file *seq, struct gfs2_glock *gl,

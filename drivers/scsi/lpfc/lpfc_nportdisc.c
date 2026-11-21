@@ -208,6 +208,11 @@ lpfc_els_abort(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp)
 	struct lpfc_sli_ring *pring;
 	struct lpfc_iocbq *iocb, *next_iocb;
 
+	/* Exit early to prevent race with queue teardown. */
+	if (unlikely(phba->sli_rev == LPFC_SLI_REV4 &&
+		     !(phba->hba_flag & HBA_SETUP)))
+		return;
+
 	pring = lpfc_phba_elsring(phba);
 
 	/* In case of error recovery path, we might have a NULL pring here */
@@ -2899,6 +2904,20 @@ lpfc_device_rm_npr_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		spin_unlock_irq(&ndlp->lock);
 		return ndlp->nlp_state;
 	}
+
+	/* It is an error to drop a node while either of its transport
+	 * registrations have not completed.
+	 */
+	if (ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) {
+		lpfc_printf_vlog(vport, KERN_WARNING,
+				 LOG_ELS | LOG_NODE | LOG_DISCOVERY,
+				 "3423 Not dropping ndlp x%px, DID x%x xflags x%x "
+				 "with dev_loss pending. ref_cnt %d\n",
+				 ndlp, ndlp->nlp_DID, ndlp->fc4_xpt_flags,
+				 kref_read(&ndlp->kref));
+		return ndlp->nlp_state;
+	}
+
 	lpfc_drop_node(vport, ndlp);
 	return NLP_STE_FREED_NODE;
 }

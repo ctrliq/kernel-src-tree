@@ -1,0 +1,462 @@
+kprobe/ftrace: bail out if ftrace was killed
+
+jira KERNEL-1940
+Rebuild_History Non-Buildable kernel-4.18.0-553.187.1.el8_10
+commit-author Stephen Brennan <stephen.s.brennan@oracle.com>
+commit 1a7d0890dd4a502a202aaec792a6c04e6e049547
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.187.1.el8_10/1a7d0890.failed
+
+If an error happens in ftrace, ftrace_kill() will prevent disarming
+kprobes. Eventually, the ftrace_ops associated with the kprobes will be
+freed, yet the kprobes will still be active, and when triggered, they
+will use the freed memory, likely resulting in a page fault and panic.
+
+This behavior can be reproduced quite easily, by creating a kprobe and
+then triggering a ftrace_kill(). For simplicity, we can simulate an
+ftrace error with a kernel module like [1]:
+
+[1]: https://github.com/brenns10/kernel_stuff/tree/master/ftrace_killer
+
+  sudo perf probe --add commit_creds
+  sudo perf trace -e probe:commit_creds
+  # In another terminal
+  make
+  sudo insmod ftrace_killer.ko  # calls ftrace_kill(), simulating bug
+  # Back to perf terminal
+  # ctrl-c
+  sudo perf probe --del commit_creds
+
+After a short period, a page fault and panic would occur as the kprobe
+continues to execute and uses the freed ftrace_ops. While ftrace_kill()
+is supposed to be used only in extreme circumstances, it is invoked in
+FTRACE_WARN_ON() and so there are many places where an unexpected bug
+could be triggered, yet the system may continue operating, possibly
+without the administrator noticing. If ftrace_kill() does not panic the
+system, then we should do everything we can to continue operating,
+rather than leave a ticking time bomb.
+
+Link: https://lore.kernel.org/all/20240501162956.229427-1-stephen.s.brennan@oracle.com/
+
+	Signed-off-by: Stephen Brennan <stephen.s.brennan@oracle.com>
+	Acked-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+	Acked-by: Guo Ren <guoren@kernel.org>
+	Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+	Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+(cherry picked from commit 1a7d0890dd4a502a202aaec792a6c04e6e049547)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/csky/kernel/probes/ftrace.c
+#	arch/loongarch/kernel/ftrace_dyn.c
+#	arch/parisc/kernel/ftrace.c
+#	arch/powerpc/kernel/kprobes-ftrace.c
+#	arch/riscv/kernel/probes/ftrace.c
+#	arch/s390/kernel/ftrace.c
+#	arch/x86/kernel/kprobes/ftrace.c
+#	include/linux/kprobes.h
+diff --cc arch/parisc/kernel/ftrace.c
+index 6fa8535d3cce,c91f9c2e61ed..000000000000
+--- a/arch/parisc/kernel/ftrace.c
++++ b/arch/parisc/kernel/ftrace.c
+@@@ -87,3 -78,177 +87,180 @@@ void notrace __hot ftrace_function_tram
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_DYNAMIC_FTRACE) && defined(CONFIG_FUNCTION_GRAPH_TRACER)
++ int ftrace_enable_ftrace_graph_caller(void)
++ {
++ 	static_key_enable(&ftrace_graph_enable.key);
++ 	return 0;
++ }
++ 
++ int ftrace_disable_ftrace_graph_caller(void)
++ {
++ 	static_key_enable(&ftrace_graph_enable.key);
++ 	return 0;
++ }
++ #endif
++ 
++ #ifdef CONFIG_DYNAMIC_FTRACE
++ int ftrace_update_ftrace_func(ftrace_func_t func)
++ {
++ 	ftrace_func = func;
++ 	return 0;
++ }
++ 
++ int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
++ 			unsigned long addr)
++ {
++ 	return 0;
++ }
++ 
++ unsigned long ftrace_call_adjust(unsigned long addr)
++ {
++ 	return addr+(FTRACE_PATCHABLE_FUNCTION_SIZE-1)*4;
++ }
++ 
++ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
++ {
++ 	u32 insn[FTRACE_PATCHABLE_FUNCTION_SIZE];
++ 	u32 *tramp;
++ 	int size, ret, i;
++ 	void *ip;
++ 
++ #ifdef CONFIG_64BIT
++ 	unsigned long addr2 =
++ 		(unsigned long)dereference_function_descriptor((void *)addr);
++ 
++ 	u32 ftrace_trampoline[] = {
++ 		0x73c10208, /* std,ma r1,100(sp) */
++ 		0x0c2110c1, /* ldd -10(r1),r1 */
++ 		0xe820d002, /* bve,n (r1) */
++ 		addr2 >> 32,
++ 		addr2 & 0xffffffff,
++ 		0xe83f1fd7, /* b,l,n .-14,r1 */
++ 	};
++ 
++ 	u32 ftrace_trampoline_unaligned[] = {
++ 		addr2 >> 32,
++ 		addr2 & 0xffffffff,
++ 		0x37de0200, /* ldo 100(sp),sp */
++ 		0x73c13e01, /* std r1,-100(sp) */
++ 		0x34213ff9, /* ldo -4(r1),r1 */
++ 		0x50213fc1, /* ldd -20(r1),r1 */
++ 		0xe820d002, /* bve,n (r1) */
++ 		0xe83f1fcf, /* b,l,n .-20,r1 */
++ 	};
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(ftrace_trampoline_unaligned) >
++ 				FTRACE_PATCHABLE_FUNCTION_SIZE);
++ #else
++ 	u32 ftrace_trampoline[] = {
++ 		(u32)addr,
++ 		0x6fc10080, /* stw,ma r1,40(sp) */
++ 		0x48213fd1, /* ldw -18(r1),r1 */
++ 		0xe820c002, /* bv,n r0(r1) */
++ 		0xe83f1fdf, /* b,l,n .-c,r1 */
++ 	};
++ #endif
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(ftrace_trampoline) >
++ 				FTRACE_PATCHABLE_FUNCTION_SIZE);
++ 
++ 	size = sizeof(ftrace_trampoline);
++ 	tramp = ftrace_trampoline;
++ 
++ #ifdef CONFIG_64BIT
++ 	if (rec->ip & 0x4) {
++ 		size = sizeof(ftrace_trampoline_unaligned);
++ 		tramp = ftrace_trampoline_unaligned;
++ 	}
++ #endif
++ 
++ 	ip = (void *)(rec->ip + 4 - size);
++ 
++ 	ret = copy_from_kernel_nofault(insn, ip, size);
++ 	if (ret)
++ 		return ret;
++ 
++ 	for (i = 0; i < size / 4; i++) {
++ 		if (insn[i] != INSN_NOP)
++ 			return -EINVAL;
++ 	}
++ 
++ 	__patch_text_multiple(ip, tramp, size);
++ 	return 0;
++ }
++ 
++ int ftrace_make_nop(struct module *mod, struct dyn_ftrace *rec,
++ 		    unsigned long addr)
++ {
++ 	u32 insn[FTRACE_PATCHABLE_FUNCTION_SIZE];
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(insn); i++)
++ 		insn[i] = INSN_NOP;
++ 
++ 	__patch_text((void *)rec->ip, INSN_NOP);
++ 	__patch_text_multiple((void *)rec->ip + 4 - sizeof(insn),
++ 			      insn, sizeof(insn)-4);
++ 	return 0;
++ }
++ #endif
++ 
++ #ifdef CONFIG_KPROBES_ON_FTRACE
++ void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
++ 			   struct ftrace_ops *ops, struct ftrace_regs *fregs)
++ {
++ 	struct kprobe_ctlblk *kcb;
++ 	struct pt_regs *regs;
++ 	struct kprobe *p;
++ 	int bit;
++ 
++ 	if (unlikely(kprobe_ftrace_disabled))
++ 		return;
++ 
++ 	bit = ftrace_test_recursion_trylock(ip, parent_ip);
++ 	if (bit < 0)
++ 		return;
++ 
++ 	regs = ftrace_get_regs(fregs);
++ 	p = get_kprobe((kprobe_opcode_t *)ip);
++ 	if (unlikely(!p) || kprobe_disabled(p))
++ 		goto out;
++ 
++ 	if (kprobe_running()) {
++ 		kprobes_inc_nmissed_count(p);
++ 		goto out;
++ 	}
++ 
++ 	__this_cpu_write(current_kprobe, p);
++ 
++ 	kcb = get_kprobe_ctlblk();
++ 	kcb->kprobe_status = KPROBE_HIT_ACTIVE;
++ 
++ 	regs->iaoq[0] = ip;
++ 	regs->iaoq[1] = ip + 4;
++ 
++ 	if (!p->pre_handler || !p->pre_handler(p, regs)) {
++ 		regs->iaoq[0] = ip + 4;
++ 		regs->iaoq[1] = ip + 8;
++ 
++ 		if (unlikely(p->post_handler)) {
++ 			kcb->kprobe_status = KPROBE_HIT_SSDONE;
++ 			p->post_handler(p, regs, 0);
++ 		}
++ 	}
++ 	__this_cpu_write(current_kprobe, NULL);
++ out:
++ 	ftrace_test_recursion_unlock(bit);
++ }
++ NOKPROBE_SYMBOL(kprobe_ftrace_handler);
++ 
++ int arch_prepare_kprobe_ftrace(struct kprobe *p)
++ {
++ 	p->ainsn.insn = NULL;
++ 	return 0;
++ }
++ #endif
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+diff --cc arch/powerpc/kernel/kprobes-ftrace.c
+index e4a49c051325,f8208c027148..000000000000
+--- a/arch/powerpc/kernel/kprobes-ftrace.c
++++ b/arch/powerpc/kernel/kprobes-ftrace.c
+@@@ -31,10 -18,20 +31,21 @@@ void kprobe_ftrace_handler(unsigned lon
+  {
+  	struct kprobe *p;
+  	struct kprobe_ctlblk *kcb;
+ -	struct pt_regs *regs;
+ -	int bit;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(kprobe_ftrace_disabled))
++ 		return;
++ 
++ 	bit = ftrace_test_recursion_trylock(nip, parent_nip);
++ 	if (bit < 0)
++ 		return;
++ 
++ 	regs = ftrace_get_regs(fregs);
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+  	p = get_kprobe((kprobe_opcode_t *)nip);
+  	if (unlikely(!p) || kprobe_disabled(p))
+ -		goto out;
+ +		return;
+  
+  	kcb = get_kprobe_ctlblk();
+  	if (kprobe_running()) {
+diff --cc arch/s390/kernel/ftrace.c
+index 522cdef5c356,7f6f8c438c26..000000000000
+--- a/arch/s390/kernel/ftrace.c
++++ b/arch/s390/kernel/ftrace.c
+@@@ -222,17 -289,28 +222,25 @@@ int ftrace_disable_ftrace_graph_caller(
+  
+  #ifdef CONFIG_KPROBES_ON_FTRACE
+  void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+ -		struct ftrace_ops *ops, struct ftrace_regs *fregs)
+ +		struct ftrace_ops *ops, struct pt_regs *regs)
+  {
+  	struct kprobe_ctlblk *kcb;
+ -	struct pt_regs *regs;
+ -	struct kprobe *p;
+ -	int bit;
+ +	struct kprobe *p = get_kprobe((kprobe_opcode_t *)ip);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!p) || kprobe_disabled(p))
+++=======
++ 	if (unlikely(kprobe_ftrace_disabled))
++ 		return;
++ 
++ 	bit = ftrace_test_recursion_trylock(ip, parent_ip);
++ 	if (bit < 0)
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+  		return;
+  
+ -	regs = ftrace_get_regs(fregs);
+ -	p = get_kprobe((kprobe_opcode_t *)ip);
+ -	if (!regs || unlikely(!p) || kprobe_disabled(p))
+ -		goto out;
+ -
+  	if (kprobe_running()) {
+  		kprobes_inc_nmissed_count(p);
+ -		goto out;
+ +		return;
+  	}
+  
+  	__this_cpu_write(current_kprobe, p);
+diff --cc arch/x86/kernel/kprobes/ftrace.c
+index ef819e19650b,15af7e98e161..000000000000
+--- a/arch/x86/kernel/kprobes/ftrace.c
++++ b/arch/x86/kernel/kprobes/ftrace.c
+@@@ -25,17 -12,25 +25,28 @@@
+  
+  #include "common.h"
+  
+ -/* Ftrace callback handler for kprobes -- called under preempt disabled */
+ +/* Ftrace callback handler for kprobes -- called under preepmt disabed */
+  void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+ -			   struct ftrace_ops *ops, struct ftrace_regs *fregs)
+ +			   struct ftrace_ops *ops, struct pt_regs *regs)
+  {
+ -	struct pt_regs *regs = ftrace_get_regs(fregs);
+  	struct kprobe *p;
+  	struct kprobe_ctlblk *kcb;
+++<<<<<<< HEAD
+++=======
++ 	int bit;
++ 
++ 	if (unlikely(kprobe_ftrace_disabled))
++ 		return;
++ 
++ 	bit = ftrace_test_recursion_trylock(ip, parent_ip);
++ 	if (bit < 0)
++ 		return;
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+  
+ +	/* Preempt is disabled by ftrace */
+  	p = get_kprobe((kprobe_opcode_t *)ip);
+  	if (unlikely(!p) || kprobe_disabled(p))
+ -		goto out;
+ +		return;
+  
+  	kcb = get_kprobe_ctlblk();
+  	if (kprobe_running()) {
+diff --cc include/linux/kprobes.h
+index 1997cee97382,5fcbc254d186..000000000000
+--- a/include/linux/kprobes.h
++++ b/include/linux/kprobes.h
+@@@ -318,23 -367,27 +318,36 @@@ extern void opt_pre_handler(struct kpro
+  
+  DEFINE_INSN_CACHE_OPS(optinsn);
+  
+ +#ifdef CONFIG_SYSCTL
+ +extern int sysctl_kprobes_optimization;
+ +extern int proc_kprobes_optimization_handler(struct ctl_table *table,
+ +					     int write, void __user *buffer,
+ +					     size_t *length, loff_t *ppos);
+ +#endif
+  extern void wait_for_kprobe_optimizer(void);
+ -bool optprobe_queued_unopt(struct optimized_kprobe *op);
+ -bool kprobe_disarmed(struct kprobe *p);
+ -#else /* !CONFIG_OPTPROBES */
+ +#else
+  static inline void wait_for_kprobe_optimizer(void) { }
+  #endif /* CONFIG_OPTPROBES */
+ -
+  #ifdef CONFIG_KPROBES_ON_FTRACE
+  extern void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+ -				  struct ftrace_ops *ops, struct ftrace_regs *fregs);
+ +				  struct ftrace_ops *ops, struct pt_regs *regs);
+  extern int arch_prepare_kprobe_ftrace(struct kprobe *p);
+++<<<<<<< HEAD
+ +#endif
+ +
+ +int arch_check_ftrace_location(struct kprobe *p);
+++=======
++ /* Set when ftrace has been killed: kprobes on ftrace must be disabled for safety */
++ extern bool kprobe_ftrace_disabled __read_mostly;
++ extern void kprobe_ftrace_kill(void);
++ #else
++ static inline int arch_prepare_kprobe_ftrace(struct kprobe *p)
++ {
++ 	return -EINVAL;
++ }
++ static inline void kprobe_ftrace_kill(void) {}
++ #endif /* CONFIG_KPROBES_ON_FTRACE */
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+  
+  /* Get the kprobe at this addr (if any) - called with preemption disabled */
+  struct kprobe *get_kprobe(void *addr);
+@@@ -432,9 -496,15 +445,18 @@@ static inline void unregister_kretprobe
+  static inline void kprobe_flush_task(struct task_struct *tk)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ static inline void kprobe_free_init_mem(void)
++ {
++ }
++ static inline void kprobe_ftrace_kill(void)
++ {
++ }
+++>>>>>>> 1a7d0890dd4a (kprobe/ftrace: bail out if ftrace was killed)
+  static inline int disable_kprobe(struct kprobe *kp)
+  {
+ -	return -EOPNOTSUPP;
+ +	return -ENOSYS;
+  }
+  static inline int enable_kprobe(struct kprobe *kp)
+  {
+* Unmerged path arch/csky/kernel/probes/ftrace.c
+* Unmerged path arch/loongarch/kernel/ftrace_dyn.c
+* Unmerged path arch/riscv/kernel/probes/ftrace.c
+* Unmerged path arch/csky/kernel/probes/ftrace.c
+* Unmerged path arch/loongarch/kernel/ftrace_dyn.c
+* Unmerged path arch/parisc/kernel/ftrace.c
+* Unmerged path arch/powerpc/kernel/kprobes-ftrace.c
+* Unmerged path arch/riscv/kernel/probes/ftrace.c
+* Unmerged path arch/s390/kernel/ftrace.c
+* Unmerged path arch/x86/kernel/kprobes/ftrace.c
+* Unmerged path include/linux/kprobes.h
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index 6ab9490f5fd6..011e0d12f123 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -993,6 +993,7 @@ static struct ftrace_ops kprobe_ipmodify_ops __read_mostly = {
+ 
+ static int kprobe_ipmodify_enabled;
+ static int kprobe_ftrace_enabled;
++bool kprobe_ftrace_disabled;
+ 
+ /* Must ensure p->addr is really on ftrace */
+ static int prepare_kprobe(struct kprobe *p)
+@@ -1073,6 +1074,11 @@ static int disarm_kprobe_ftrace(struct kprobe *p)
+ 		ipmodify ? &kprobe_ipmodify_ops : &kprobe_ftrace_ops,
+ 		ipmodify ? &kprobe_ipmodify_enabled : &kprobe_ftrace_enabled);
+ }
++
++void kprobe_ftrace_kill()
++{
++	kprobe_ftrace_disabled = true;
++}
+ #else	/* !CONFIG_KPROBES_ON_FTRACE */
+ #define prepare_kprobe(p)	arch_prepare_kprobe(p)
+ #define arm_kprobe_ftrace(p)	(-ENODEV)
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 30bc44843dee..92cc88c67c54 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -7194,6 +7194,7 @@ void ftrace_kill(void)
+ 	ftrace_disabled = 1;
+ 	ftrace_enabled = 0;
+ 	ftrace_trace_function = ftrace_stub;
++	kprobe_ftrace_kill();
+ }
+ 
+ /**
