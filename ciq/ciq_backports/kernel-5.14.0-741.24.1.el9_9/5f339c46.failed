@@ -1,0 +1,174 @@
+printk: Postpone kthread startup
+
+jira KERNEL-1930
+Rebuild_History Non-Buildable kernel-5.14.0-741.24.1.el9_9
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 5f339c46f153184570f16c8e789c9709b14cbe8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.24.1.el9_9/5f339c46.failed
+
+There have been various bug reports related to SMP systems hanging
+on boot. The reports vary but seem to have some overlap with regard
+to missed IPI's during SMP setup. The reports also show that
+reverting NBCON console usage allows the bugs to disappear.
+
+The NBCON kthreads for console printing are started very early
+during boot using early_initcall(). Since these kthreads are
+asynchronously enabling/disabling interrupts during early boot, they
+may be interfering with early SMP setup on some hardware platforms.
+
+Starting the console printing kthreads later has shown to avoid the
+hanging on systems that could previously reproduce the issue.
+
+Postpone kthread starting until after all arch initcalls have
+completed.
+
+	Reported-by: Derek Barbosa <debarbos@redhat.com>
+Closes: https://lore.kernel.org/linux-rt-users/arPmYPbFLf2EldIl@debarbos-thinkpadt14gen5.rmtusma.csb
+Fixes: 76f258bf3f2a ("printk: nbcon: Introduce printer kthreads")
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Tested-by: Derek Barbosa <debarbos@redhat.com>
+Link: https://patch.msgid.link/20261016085441.857695-1-john.ogness@linutronix.de
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+(cherry picked from commit 5f339c46f153184570f16c8e789c9709b14cbe8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index d17ab23af839,bc3b9f6e404b..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -3504,8 -3743,126 +3504,127 @@@ void nbcon_legacy_kthread_create(void
+  	 * It is important that console printing threads are scheduled
+  	 * shortly after a printk call and with generous runtime budgets.
+  	 */
+ -	sched_set_normal(printk_legacy_kthread, -20);
+ -
+ -	return true;
+ +	sched_set_normal(nbcon_legacy_kthread, -20);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * printk_kthreads_shutdown - shutdown all threaded printers
++  * @data: syscore context
++  *
++  * On system shutdown all threaded printers are stopped. This allows printk
++  * to transition back to atomic printing, thus providing a robust mechanism
++  * for the final shutdown/reboot messages to be output.
++  */
++ static void printk_kthreads_shutdown(void *data)
++ {
++ 	struct console *con;
++ 
++ 	console_list_lock();
++ 	if (printk_kthreads_running) {
++ 		printk_kthreads_running = false;
++ 
++ 		for_each_console(con) {
++ 			if (con->flags & CON_NBCON)
++ 				nbcon_kthread_stop(con);
++ 		}
++ 
++ 		/*
++ 		 * The threads may have been stopped while printing a
++ 		 * backlog. Flush any records left over.
++ 		 */
++ 		nbcon_atomic_flush_pending();
++ 	}
++ 	console_list_unlock();
++ }
++ 
++ static const struct syscore_ops printk_syscore_ops = {
++ 	.shutdown = printk_kthreads_shutdown,
++ };
++ 
++ static struct syscore printk_syscore = {
++ 	.ops = &printk_syscore_ops,
++ };
++ 
++ /*
++  * If appropriate, start nbcon kthreads and set @printk_kthreads_running.
++  * If any kthreads fail to start, those consoles are unregistered.
++  *
++  * Must be called under console_list_lock().
++  */
++ static void printk_kthreads_check_locked(void)
++ {
++ 	struct hlist_node *tmp;
++ 	struct console *con;
++ 
++ 	lockdep_assert_console_list_lock_held();
++ 
++ 	if (!printk_kthreads_ready)
++ 		return;
++ 
++ 	/* Start or stop the legacy kthread when needed. */
++ 	if (have_legacy_console || have_boot_console) {
++ 		if (!printk_legacy_kthread &&
++ 		    force_legacy_kthread() &&
++ 		    !legacy_kthread_create()) {
++ 			/*
++ 			 * All legacy consoles must be unregistered. If there
++ 			 * are any nbcon consoles, they will set up their own
++ 			 * kthread.
++ 			 */
++ 			hlist_for_each_entry_safe(con, tmp, &console_list, node) {
++ 				if (con->flags & CON_NBCON)
++ 					continue;
++ 
++ 				unregister_console_locked(con);
++ 			}
++ 		}
++ 	} else if (printk_legacy_kthread) {
++ 		kthread_stop(printk_legacy_kthread);
++ 		printk_legacy_kthread = NULL;
++ 	}
++ 
++ 	/*
++ 	 * Printer threads cannot be started as long as any boot console is
++ 	 * registered because there is no way to synchronize the hardware
++ 	 * registers between boot console code and regular console code.
++ 	 * It can only be known that there will be no new boot consoles when
++ 	 * an nbcon console is registered.
++ 	 */
++ 	if (have_boot_console || !have_nbcon_console) {
++ 		/* Clear flag in case all nbcon consoles unregistered. */
++ 		printk_kthreads_running = false;
++ 		return;
++ 	}
++ 
++ 	if (printk_kthreads_running)
++ 		return;
++ 
++ 	hlist_for_each_entry_safe(con, tmp, &console_list, node) {
++ 		if (!(con->flags & CON_NBCON))
++ 			continue;
++ 
++ 		if (!nbcon_kthread_create(con))
++ 			unregister_console_locked(con);
++ 	}
++ 
++ 	printk_kthreads_running = true;
++ }
++ 
++ static int __init printk_set_kthreads_ready(void)
++ {
++ 	register_syscore(&printk_syscore);
++ 
++ 	console_list_lock();
++ 	printk_kthreads_ready = true;
++ 	printk_kthreads_check_locked();
++ 	console_list_unlock();
++ 
++ 	return 0;
++ }
++ subsys_initcall(printk_set_kthreads_ready);
+++>>>>>>> 5f339c46f153 (printk: Postpone kthread startup)
+  #endif /* CONFIG_PRINTK */
+  
+  static int __read_mostly keep_bootcon;
+* Unmerged path kernel/printk/printk.c
