@@ -1,0 +1,165 @@
+tracing: Add ustring operation to filtering string pointers
+
+jira KERNEL-1930
+Rebuild_History Non-Buildable kernel-5.14.0-741.24.1.el9_9
+commit-author Steven Rostedt <rostedt@goodmis.org>
+commit f37c3bbc635994eda203a6da4ba0f9d05165a8d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.24.1.el9_9/f37c3bbc.failed
+
+Since referencing user space pointers is special, if the user wants to
+filter on a field that is a pointer to user space, then they need to
+specify it.
+
+Add a ".ustring" attribute to the field name for filters to state that the
+field is pointing to user space such that the kernel can take the
+appropriate action to read that pointer.
+
+Link: https://lore.kernel.org/all/yt9d8rvmt2jq.fsf@linux.ibm.com/
+
+Fixes: 77360f9bbc7e ("tracing: Add test for user space strings when filtering on string pointers")
+	Tested-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit f37c3bbc635994eda203a6da4ba0f9d05165a8d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_events_filter.c
+diff --cc kernel/trace/trace_events_filter.c
+index c9124038b140,b458a9afa2c0..000000000000
+--- a/kernel/trace/trace_events_filter.c
++++ b/kernel/trace/trace_events_filter.c
+@@@ -654,6 -655,52 +654,55 @@@ DEFINE_EQUALITY_PRED(32)
+  DEFINE_EQUALITY_PRED(16);
+  DEFINE_EQUALITY_PRED(8);
+  
+++<<<<<<< HEAD
+++=======
++ /* user space strings temp buffer */
++ #define USTRING_BUF_SIZE	1024
++ 
++ struct ustring_buffer {
++ 	char		buffer[USTRING_BUF_SIZE];
++ };
++ 
++ static __percpu struct ustring_buffer *ustring_per_cpu;
++ 
++ static __always_inline char *test_string(char *str)
++ {
++ 	struct ustring_buffer *ubuf;
++ 	char *kstr;
++ 
++ 	if (!ustring_per_cpu)
++ 		return NULL;
++ 
++ 	ubuf = this_cpu_ptr(ustring_per_cpu);
++ 	kstr = ubuf->buffer;
++ 
++ 	/* For safety, do not trust the string pointer */
++ 	if (!strncpy_from_kernel_nofault(kstr, str, USTRING_BUF_SIZE))
++ 		return NULL;
++ 	return kstr;
++ }
++ 
++ static __always_inline char *test_ustring(char *str)
++ {
++ 	struct ustring_buffer *ubuf;
++ 	char __user *ustr;
++ 	char *kstr;
++ 
++ 	if (!ustring_per_cpu)
++ 		return NULL;
++ 
++ 	ubuf = this_cpu_ptr(ustring_per_cpu);
++ 	kstr = ubuf->buffer;
++ 
++ 	/* user space address? */
++ 	ustr = (char __user *)str;
++ 	if (!strncpy_from_user_nofault(kstr, ustr, USTRING_BUF_SIZE))
++ 		return NULL;
++ 
++ 	return kstr;
++ }
++ 
+++>>>>>>> f37c3bbc6359 (tracing: Add ustring operation to filtering string pointers)
+  /* Filter predicate for fixed sized arrays of characters */
+  static int filter_pred_string(struct filter_pred *pred, void *event)
+  {
+@@@ -667,14 -714,13 +716,21 @@@
+  	return match;
+  }
+  
+- /* Filter predicate for char * pointers */
+- static int filter_pred_pchar(struct filter_pred *pred, void *event)
++ static __always_inline int filter_pchar(struct filter_pred *pred, char *str)
+  {
+++<<<<<<< HEAD
+ +	char **addr = (char **)(event + pred->offset);
+++=======
+++>>>>>>> f37c3bbc6359 (tracing: Add ustring operation to filtering string pointers)
+  	int cmp, match;
+ -	int len;
+ +	int len = strlen(*addr) + 1;	/* including tailing '\0' */
+  
+++<<<<<<< HEAD
+ +	cmp = pred->regex.match(*addr, &pred->regex, len);
+++=======
++ 	len = strlen(str) + 1;	/* including tailing '\0' */
++ 	cmp = pred->regex.match(str, &pred->regex, len);
+++>>>>>>> f37c3bbc6359 (tracing: Add ustring operation to filtering string pointers)
+  
+  	match = cmp ^ pred->not;
+  
+@@@ -1318,10 -1422,24 +1406,29 @@@ static int parse_pred(const char *str, 
+  			pred->fn = filter_pred_string;
+  			pred->regex.field_len = field->size;
+  
+ -		} else if (field->filter_type == FILTER_DYN_STRING) {
+ +		} else if (field->filter_type == FILTER_DYN_STRING)
+  			pred->fn = filter_pred_strloc;
+++<<<<<<< HEAD
+ +		else
+ +			pred->fn = filter_pred_pchar;
+++=======
++ 		} else if (field->filter_type == FILTER_RDYN_STRING)
++ 			pred->fn = filter_pred_strrelloc;
++ 		else {
++ 
++ 			if (!ustring_per_cpu) {
++ 				/* Once allocated, keep it around for good */
++ 				ustring_per_cpu = alloc_percpu(struct ustring_buffer);
++ 				if (!ustring_per_cpu)
++ 					goto err_mem;
++ 			}
++ 
++ 			if (ustring)
++ 				pred->fn = filter_pred_pchar_user;
++ 			else
++ 				pred->fn = filter_pred_pchar;
++ 		}
+++>>>>>>> f37c3bbc6359 (tracing: Add ustring operation to filtering string pointers)
+  		/* go past the last quote */
+  		i++;
+  
+diff --git a/Documentation/trace/events.rst b/Documentation/trace/events.rst
+index 8ddb9b09451c..6042f5efa6c8 100644
+--- a/Documentation/trace/events.rst
++++ b/Documentation/trace/events.rst
+@@ -198,6 +198,15 @@ The glob (~) accepts a wild card character (\*,?) and character classes
+   prev_comm ~ "*sh*"
+   prev_comm ~ "ba*sh"
+ 
++If the field is a pointer that points into user space (for example
++"filename" from sys_enter_openat), then you have to append ".ustring" to the
++field name::
++
++  filename.ustring ~ "password"
++
++As the kernel will have to know how to retrieve the memory that the pointer
++is at from user space.
++
+ 5.2 Setting filters
+ -------------------
+ 
+* Unmerged path kernel/trace/trace_events_filter.c
