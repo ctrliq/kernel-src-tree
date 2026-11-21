@@ -935,7 +935,7 @@ static bool nft_nh_write_ok_bridge(const struct nft_pktinfo *pkt,
 				   const u32 *src)
 {
 #if IS_ENABLED(CONFIG_NF_TABLES_BRIDGE)
-	switch (pkt->ethertype) {
+	switch (pkt->skb->protocol) {
 	case htons(ETH_P_ARP):
 		return nft_nh_write_ok_arp(priv);
 	case htons(ETH_P_IP):
@@ -1025,7 +1025,7 @@ static bool nft_payload_csum_nh_write_ok(const struct nft_payload_set *priv,
 	case NFPROTO_IPV6:
 		return false;
 	case NFPROTO_BRIDGE:
-		return pkt->ethertype == htons(ETH_P_IP) &&
+		return pkt->skb->protocol == htons(ETH_P_IP) &&
 		       priv->csum_offset == offsetof(struct iphdr, check);
 	case NFPROTO_NETDEV:
 		return pkt->skb->protocol == htons(ETH_P_IP) &&
