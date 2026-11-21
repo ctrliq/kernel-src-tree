@@ -1,0 +1,90 @@
+ipvs: do not keep dest_dst if dev is going down
+
+jira KERNEL-1930
+cve CVE-2026-45917
+Rebuild_History Non-Buildable kernel-5.14.0-741.24.1.el9_9
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 8fde939b0206afc1d5846217a01a16b9bc8c7896
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.24.1.el9_9/8fde939b.failed
+
+There is race between the netdev notifier ip_vs_dst_event()
+and the code that caches dst with dev that is going down.
+As the FIB can be notified for the closed device after our
+handler finishes, it is possible valid route to be returned
+and cached resuling in a leaked dev reference until the dest
+is not removed.
+
+To prevent new dest_dst to be attached to dest just after the
+handler dropped the old one, add a netif_running() check
+to make sure the notifier handler is not currently running
+for device that is closing.
+
+Fixes: 7a4f0761fce3 ("IPVS: init and cleanup restructuring")
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 8fde939b0206afc1d5846217a01a16b9bc8c7896)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_xmit.c
+diff --cc net/netfilter/ipvs/ip_vs_xmit.c
+index bd92ea7b3db9,4389bfe3050d..000000000000
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@@ -310,9 -315,11 +316,17 @@@ __ip_vs_get_out_rt(struct netns_ipvs *i
+  
+  	if (dest) {
+  		dest_dst = __ip_vs_dst_check(dest);
+++<<<<<<< HEAD
+ +		if (likely(dest_dst))
+ +			rt = (struct rtable *) dest_dst->dst_cache;
+ +		else {
+++=======
++ 		if (likely(dest_dst)) {
++ 			rt = dst_rtable(dest_dst->dst_cache);
++ 			if (ret_saddr)
++ 				*ret_saddr = dest_dst->dst_saddr.ip;
++ 		} else {
+++>>>>>>> 8fde939b0206 (ipvs: do not keep dest_dst if dev is going down)
+  			dest_dst = ip_vs_dest_dst_alloc();
+  			spin_lock_bh(&dest->dst_lock);
+  			if (!dest_dst) {
+@@@ -472,9 -487,11 +494,17 @@@ __ip_vs_get_out_rt_v6(struct netns_ipv
+  
+  	if (dest) {
+  		dest_dst = __ip_vs_dst_check(dest);
+++<<<<<<< HEAD
+ +		if (likely(dest_dst))
+ +			rt = (struct rt6_info *) dest_dst->dst_cache;
+ +		else {
+++=======
++ 		if (likely(dest_dst)) {
++ 			rt = dst_rt6_info(dest_dst->dst_cache);
++ 			if (ret_saddr)
++ 				*ret_saddr = dest_dst->dst_saddr.in6;
++ 		} else {
+++>>>>>>> 8fde939b0206 (ipvs: do not keep dest_dst if dev is going down)
+  			u32 cookie;
+  
+  			dest_dst = ip_vs_dest_dst_alloc();
+@@@ -493,9 -510,15 +523,15 @@@
+  				ip_vs_dest_dst_free(dest_dst);
+  				goto err_unreach;
+  			}
+ -			rt = dst_rt6_info(dst);
+ +			rt = (struct rt6_info *) dst;
+  			cookie = rt6_get_cookie(rt);
+- 			__ip_vs_dst_set(dest, dest_dst, &rt->dst, cookie);
++ 			/* It is forbidden to attach dest->dest_dst if
++ 			 * device is going down.
++ 			 */
++ 			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)))
++ 				__ip_vs_dst_set(dest, dest_dst, &rt->dst, cookie);
++ 			else
++ 				noref = 0;
+  			spin_unlock_bh(&dest->dst_lock);
+  			IP_VS_DBG(10, "new dst %pI6, src %pI6, refcnt=%d\n",
+  				  &dest->addr.in6, &dest_dst->dst_saddr.in6,
+* Unmerged path net/netfilter/ipvs/ip_vs_xmit.c
