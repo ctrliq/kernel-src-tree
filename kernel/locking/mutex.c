@@ -48,7 +48,7 @@ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 {
 	atomic_long_set(&lock->owner, 0);
 	raw_spin_lock_init(&lock->wait_lock);
-	INIT_LIST_HEAD(&lock->wait_list);
+	lock->first_waiter = NULL;
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
 	osq_lock_init(&lock->osq);
 #endif
@@ -56,31 +56,6 @@ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 	debug_mutex_init(lock, name, key);
 }
 EXPORT_SYMBOL(__mutex_init);
-
-/*
- * @owner: contains: 'struct task_struct *' to the current lock owner,
- * NULL means not owned. Since task_struct pointers are aligned at
- * at least L1_CACHE_BYTES, we have low bits to store extra state.
- *
- * Bit0 indicates a non-empty waiter list; unlock must issue a wakeup.
- * Bit1 indicates unlock needs to hand the lock to the top-waiter
- * Bit2 indicates handoff has been done and we're waiting for pickup.
- */
-#define MUTEX_FLAG_WAITERS	0x01
-#define MUTEX_FLAG_HANDOFF	0x02
-#define MUTEX_FLAG_PICKUP	0x04
-
-#define MUTEX_FLAGS		0x07
-
-/*
- * Internal helper function; C doesn't allow us to hide it :/
- *
- * DO NOT USE (outside of mutex code).
- */
-static inline struct task_struct *__mutex_owner(struct mutex *lock)
-{
-	return (struct task_struct *)(atomic_long_read(&lock->owner) & ~MUTEX_FLAGS);
-}
 
 static inline struct task_struct *__owner_task(unsigned long owner)
 {
@@ -201,35 +176,57 @@ static inline void __mutex_clear_flag(struct mutex *lock, unsigned long flag)
 	atomic_long_andnot(flag, &lock->owner);
 }
 
-static inline bool __mutex_waiter_is_first(struct mutex *lock, struct mutex_waiter *waiter)
-{
-	return list_first_entry(&lock->wait_list, struct mutex_waiter, list) == waiter;
-}
-
 /*
- * Add @waiter to a given location in the lock wait_list and set the
- * FLAG_WAITERS flag if it's the first waiter.
+ * Add @waiter to the @lock wait_list and set the FLAG_WAITERS flag if it's
+ * the first waiter.
+ *
+ * When @pos, @waiter is added before the waiter indicated by @pos. Otherwise
+ * @waiter will be added to the tail of the list.
  */
 static void
 __mutex_add_waiter(struct mutex *lock, struct mutex_waiter *waiter,
-		   struct list_head *list)
+		   struct mutex_waiter *pos)
 {
+	struct mutex_waiter *first = lock->first_waiter;
 #ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
 	hung_task_set_blocker(lock, BLOCKER_TYPE_MUTEX);
 #endif
 	debug_mutex_add_waiter(lock, waiter, current);
 
-	list_add_tail(&waiter->list, list);
-	if (__mutex_waiter_is_first(lock, waiter))
-		__mutex_set_flag(lock, MUTEX_FLAG_WAITERS);
+	if (pos) {
+		/*
+		 * Insert @waiter before @pos.
+		 */
+		list_add_tail(&waiter->list, &pos->list);
+		/*
+		 * If @pos == @first, then @waiter will be the new first.
+		 */
+		if (pos == first)
+			lock->first_waiter = waiter;
+		return;
+	}
+
+	if (first) {
+		list_add_tail(&waiter->list, &first->list);
+		return;
+	}
+
+	INIT_LIST_HEAD(&waiter->list);
+	lock->first_waiter = waiter;
+	__mutex_set_flag(lock, MUTEX_FLAG_WAITERS);
 }
 
 static void
 __mutex_remove_waiter(struct mutex *lock, struct mutex_waiter *waiter)
 {
-	list_del(&waiter->list);
-	if (likely(list_empty(&lock->wait_list)))
+	if (list_empty(&waiter->list)) {
 		__mutex_clear_flag(lock, MUTEX_FLAGS);
+		lock->first_waiter = NULL;
+	} else {
+		if (lock->first_waiter == waiter)
+			lock->first_waiter = list_next_entry(waiter, list);
+		list_del(&waiter->list);
+	}
 
 	debug_mutex_remove_waiter(lock, waiter, current);
 #ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
@@ -351,7 +348,7 @@ bool ww_mutex_spin_on_owner(struct mutex *lock, struct ww_acquire_ctx *ww_ctx,
 	 * Similarly, stop spinning if we are no longer the
 	 * first waiter.
 	 */
-	if (waiter && !__mutex_waiter_is_first(lock, waiter))
+	if (waiter && lock->first_waiter != waiter)
 		return false;
 
 	return true;
@@ -656,7 +653,7 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 
 	if (!use_ww_ctx) {
 		/* add waiting tasks to the end of the waitqueue (FIFO): */
-		__mutex_add_waiter(lock, &waiter, &lock->wait_list);
+		__mutex_add_waiter(lock, &waiter, NULL);
 	} else {
 		/*
 		 * Add in stamp order, waking up waiters that must kill
@@ -667,8 +664,8 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 			goto err_early_kill;
 	}
 
-	WARN_ON(current->blocked_on);
-	current->blocked_on = lock;
+	raw_spin_lock(&current->blocked_lock);
+	__set_task_blocked_on(current, lock);
 	set_current_state(state);
 	trace_contention_begin(lock, LCB_F_MUTEX);
 	for (;;) {
@@ -681,8 +678,9 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 		 * the handoff.
 		 */
 		if (__mutex_trylock(lock))
-			goto acquired;
+			break;
 
+		raw_spin_unlock(&current->blocked_lock);
 		/*
 		 * Check for signals and kill conditions while holding
 		 * wait_lock. This ensures the lock cancellation is ordered
@@ -703,14 +701,16 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 
 		schedule_preempt_disabled();
 
-		first = __mutex_waiter_is_first(lock, &waiter);
+		first = lock->first_waiter == &waiter;
 
+		raw_spin_lock_irqsave(&lock->wait_lock, flags);
+		raw_spin_lock(&current->blocked_lock);
 		/*
 		 * As we likely have been woken up by task
 		 * that has cleared our blocked_on state, re-set
-		 * it to the lock we are trying to aquire.
+		 * it to the lock we are trying to acquire.
 		 */
-		current->blocked_on = lock;
+		__set_task_blocked_on(current, lock);
 		set_current_state(state);
 		/*
 		 * Here we order against unlock; we must either see it change
@@ -721,29 +721,40 @@ __mutex_lock_common(struct mutex *lock, unsigned int state, unsigned int subclas
 			break;
 
 		if (first) {
+			bool opt_acquired;
+
+			/*
+			 * mutex_optimistic_spin() can call schedule(), so
+			 * we need to release these locks before calling it,
+			 * and clear blocked on so we don't become unselectable
+			 * to run.
+			 */
+			__clear_task_blocked_on(current, lock);
+			raw_spin_unlock(&current->blocked_lock);
+			raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+
 			trace_contention_begin(lock, LCB_F_MUTEX | LCB_F_SPIN);
-			/* clear blocked_on as mutex_optimistic_spin may schedule() */
-			current->blocked_on = NULL;
-			if (mutex_optimistic_spin(lock, ww_ctx, &waiter))
+			opt_acquired = mutex_optimistic_spin(lock, ww_ctx, &waiter);
+
+			raw_spin_lock_irqsave(&lock->wait_lock, flags);
+			raw_spin_lock(&current->blocked_lock);
+			__set_task_blocked_on(current, lock);
+
+			if (opt_acquired)
 				break;
-			current->blocked_on = lock;
 			trace_contention_begin(lock, LCB_F_MUTEX);
 		}
-
-		raw_spin_lock_irqsave(&lock->wait_lock, flags);
 	}
-	raw_spin_lock_irqsave(&lock->wait_lock, flags);
-acquired:
-	current->blocked_on = NULL;
+	__clear_task_blocked_on(current, lock);
 	__set_current_state(TASK_RUNNING);
+	raw_spin_unlock(&current->blocked_lock);
 
 	if (ww_ctx) {
 		/*
 		 * Wound-Wait; we stole the lock (!first_waiter), check the
 		 * waiters as anyone might want to wound us.
 		 */
-		if (!ww_ctx->is_wait_die &&
-		    !__mutex_waiter_is_first(lock, &waiter))
+		if (!ww_ctx->is_wait_die && lock->first_waiter != &waiter)
 			__ww_mutex_check_waiters(lock, ww_ctx, &wake_q);
 	}
 
@@ -764,11 +775,11 @@ skip_wait:
 	return 0;
 
 err:
-	current->blocked_on = NULL;
+	clear_task_blocked_on(current, lock);
 	__set_current_state(TASK_RUNNING);
 	__mutex_remove_waiter(lock, &waiter);
 err_early_kill:
-	WARN_ON(current->blocked_on);
+	WARN_ON(get_task_blocked_on(current));
 	trace_contention_end(lock, ret);
 	raw_spin_unlock_irqrestore_wake(&lock->wait_lock, flags, &wake_q);
 	debug_mutex_free_waiter(&waiter);
@@ -938,13 +949,21 @@ EXPORT_SYMBOL_GPL(ww_mutex_lock_interruptible);
  */
 static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigned long ip)
 {
-	struct task_struct *next = NULL;
-	DEFINE_WAKE_Q(wake_q);
+	struct task_struct *donor, *next = NULL;
+	struct mutex_waiter *waiter;
 	unsigned long owner;
 	unsigned long flags;
 
 	mutex_release(&lock->dep_map, ip);
 
+	/*
+	 * Ensures the proxy donor stack is stable across unlock and handoff.
+	 * Specifically, it avoids the case where current->blocked_donor is
+	 * NULL when it is inspected while doing the unlock, but a preemption
+	 * before taking the wake_lock would make it set and a hand-off is
+	 * missed.
+	 */
+	guard(preempt)();
 	/*
 	 * Release the lock before (potentially) taking the spinlock such that
 	 * other contenders can get on with things ASAP.
@@ -956,6 +975,12 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 	for (;;) {
 		MUTEX_WARN_ON(__owner_task(owner) != current);
 		MUTEX_WARN_ON(owner & MUTEX_FLAG_PICKUP);
+
+		if (sched_proxy_exec() && current->blocked_donor) {
+			/* force handoff if we have a blocked_donor */
+			owner = MUTEX_FLAG_HANDOFF;
+			break;
+		}
 
 		if (owner & MUTEX_FLAG_HANDOFF)
 			break;
@@ -969,31 +994,53 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 	}
 
 	raw_spin_lock_irqsave(&lock->wait_lock, flags);
+	raw_spin_lock(&current->blocked_lock);
 	debug_mutex_unlock(lock);
-	if (!list_empty(&lock->wait_list)) {
-		/* get the first entry from the wait-list: */
-		struct mutex_waiter *waiter =
-			list_first_entry(&lock->wait_list,
-					 struct mutex_waiter, list);
 
-		next = waiter->task;
-
-		debug_mutex_wake_waiter(lock, waiter);
+	if (sched_proxy_exec()) {
 		/*
-		 * Unlock wakeups can be happening in parallel
-		 * (when optimistic spinners steal and release
-		 * the lock), so blocked_on may already be
-		 * cleared here.
+		 * If we have a task boosting current, and that task was boosting
+		 * current through this lock, hand the lock to that task, as that
+		 * is the highest waiter, as selected by the scheduling function.
 		 */
-		WARN_ON(next->blocked_on && next->blocked_on != lock);
-		next->blocked_on = NULL;
-		wake_q_add(&wake_q, next);
+		donor = current->blocked_donor;
+		if (donor) {
+			struct mutex *next_lock;
+
+			raw_spin_lock_nested(&donor->blocked_lock, SINGLE_DEPTH_NESTING);
+			next_lock = __get_task_blocked_on(donor);
+			if (next_lock == lock) {
+				next = get_task_struct(donor);
+				__clear_task_blocked_on(next, lock);
+				current->blocked_donor = NULL;
+			}
+			raw_spin_unlock(&donor->blocked_lock);
+		}
+	}
+
+	/*
+	 * Failing that, pick first on the wait list.
+	 */
+	waiter = lock->first_waiter;
+	if (!next && waiter) {
+		next = get_task_struct(waiter->task);
+
+		raw_spin_lock_nested(&next->blocked_lock, SINGLE_DEPTH_NESTING);
+		debug_mutex_wake_waiter(lock, waiter);
+		__clear_task_blocked_on(next, lock);
+		raw_spin_unlock(&next->blocked_lock);
+
 	}
 
 	if (owner & MUTEX_FLAG_HANDOFF)
 		__mutex_handoff(lock, next);
 
-	raw_spin_unlock_irqrestore_wake(&lock->wait_lock, flags, &wake_q);
+	raw_spin_unlock(&current->blocked_lock);
+	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+	if (next) {
+		wake_up_process(next);
+		put_task_struct(next);
+	}
 }
 
 #ifndef CONFIG_DEBUG_LOCK_ALLOC

@@ -5,57 +5,76 @@
 #define MUTEX		mutex
 #define MUTEX_WAITER	mutex_waiter
 
+/*
+ *           +--------+
+ *           | first  |
+ *           +--------+
+ *                |
+ *                v
+ *  +----+     +----+     +----+
+ *  | W3 | <-> | W1 | <-> | W2 |
+ *  +----+     +----+     +----+
+ *    ^                     ^
+ *    +---------------------+
+ */
+
 static inline struct mutex_waiter *
 __ww_waiter_first(struct mutex *lock)
 {
-	struct mutex_waiter *w;
-
-	w = list_first_entry(&lock->wait_list, struct mutex_waiter, list);
-	if (list_entry_is_head(w, &lock->wait_list, list))
-		return NULL;
-
-	return w;
+	return lock->first_waiter;
 }
 
+/*
+ * for (cur = __ww_waiter_first(); cur; cur = __ww_waiter_next())
+ *
+ * Should iterate like: W1, W2, W3
+ */
 static inline struct mutex_waiter *
 __ww_waiter_next(struct mutex *lock, struct mutex_waiter *w)
 {
 	w = list_next_entry(w, list);
-	if (list_entry_is_head(w, &lock->wait_list, list))
+	/*
+	 * Terminate if the next entry is the first again, that has already
+	 * been observed.
+	 */
+	if (lock->first_waiter == w)
 		return NULL;
 
 	return w;
 }
 
+/*
+ * for (cur = __ww_waiter_last(); cur; cur = __ww_waiter_prev())
+ *
+ * Should iterate like: W3, W2, W1
+ */
 static inline struct mutex_waiter *
 __ww_waiter_prev(struct mutex *lock, struct mutex_waiter *w)
 {
-	w = list_prev_entry(w, list);
-	if (list_entry_is_head(w, &lock->wait_list, list))
+	/*
+	 * Terminate at the first entry, the previous entry of first is the
+	 * last and that has already been observed.
+	 */
+	if (lock->first_waiter == w)
 		return NULL;
 
-	return w;
+	return list_prev_entry(w, list);
 }
 
 static inline struct mutex_waiter *
 __ww_waiter_last(struct mutex *lock)
 {
-	struct mutex_waiter *w;
+	struct mutex_waiter *w = lock->first_waiter;
 
-	w = list_last_entry(&lock->wait_list, struct mutex_waiter, list);
-	if (list_entry_is_head(w, &lock->wait_list, list))
-		return NULL;
-
+	if (w)
+		w = list_prev_entry(w, list);
 	return w;
 }
 
 static inline void
 __ww_waiter_add(struct mutex *lock, struct mutex_waiter *waiter, struct mutex_waiter *pos)
 {
-	struct list_head *p = &lock->wait_list;
-	if (pos)
-		p = &pos->list;
-	__mutex_add_waiter(lock, waiter, p);
+	__mutex_add_waiter(lock, waiter, pos);
 }
 
 static inline struct task_struct *
@@ -283,15 +302,13 @@ __ww_mutex_die(struct MUTEX *lock, struct MUTEX_WAITER *waiter,
 	if (waiter->ww_ctx->acquired > 0 && __ww_ctx_less(waiter->ww_ctx, ww_ctx)) {
 #ifndef WW_RT
 		debug_mutex_wake_waiter(lock, waiter);
-		/*
-		 * When waking up the task to die, be sure to clear the
-		 * blocked_on pointer. Otherwise we can see circular
-		 * blocked_on relationships that can't resolve.
-		 */
-		WARN_ON(waiter->task->blocked_on &&
-			waiter->task->blocked_on != lock);
 #endif
-		waiter->task->blocked_on = NULL;
+		/*
+		 * When waking up the task to die, be sure to set the
+		 * blocked_on to PROXY_WAKING. Otherwise we can see
+		 * circular blocked_on relationships that can't resolve.
+		 */
+		clear_task_blocked_on(waiter->task, lock);
 		wake_q_add(wake_q, waiter->task);
 	}
 
@@ -341,11 +358,15 @@ static bool __ww_mutex_wound(struct MUTEX *lock,
 		 */
 		if (owner != current) {
 			/*
-			 * When waking up the task to wound, be sure to clear the
-			 * blocked_on pointer. Otherwise we can see circular
-			 * blocked_on relationships that can't resolve.
+			 * When waking up the task to wound, be sure to set the
+			 * blocked_on to PROXY_WAKING. Otherwise we can see
+			 * circular blocked_on relationships that can't resolve.
+			 *
+			 * NOTE: We pass NULL here instead of lock, because we
+			 * are waking the mutex owner, who may be currently
+			 * blocked on a different mutex.
 			 */
-			owner->blocked_on = NULL;
+			clear_task_blocked_on(owner, NULL);
 			wake_q_add(wake_q, owner);
 		}
 		return true;

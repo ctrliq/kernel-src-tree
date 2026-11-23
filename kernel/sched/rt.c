@@ -19,9 +19,9 @@ int sysctl_sched_rt_period = 1000000;
 
 /*
  * part of the period that we allow rt tasks to run in us.
- * default: 0.95s
+ * default: 1s
  */
-int sysctl_sched_rt_runtime = 950000;
+int sysctl_sched_rt_runtime = 1000000;
 
 #ifdef CONFIG_SYSCTL
 static int sysctl_sched_rr_timeslice = (MSEC_PER_SEC * RR_TIMESLICE) / HZ;
@@ -1302,12 +1302,17 @@ update_stats_dequeue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 			int flags)
 {
 	struct task_struct *p = NULL;
+	struct rq *rq = rq_of_rt_rq(rt_rq);
 
 	if (!schedstat_enabled())
 		return;
 
-	if (rt_entity_is_task(rt_se))
+	if (rt_entity_is_task(rt_se)) {
 		p = rt_task_of(rt_se);
+
+		if (p != rq->curr)
+			update_stats_wait_end_rt(rt_rq, rt_se);
+	}
 
 	if ((flags & DEQUEUE_SLEEP) && p) {
 		unsigned int state;
@@ -1591,8 +1596,14 @@ static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
 	resched_curr(rq);
 }
 
-static int balance_rt(struct rq *rq, struct task_struct *p, struct rq_flags *rf)
+static int balance_rt(struct rq *rq, struct rq_flags *rf)
 {
+	/*
+	 * Note, rq->donor may change during rq lock drops,
+	 * so don't re-use p across lock drops
+	 */
+	struct task_struct *p = rq->donor;
+
 	if (!on_rt_rq(&p->rt) && need_pull_rt_task(rq, p)) {
 		/*
 		 * This is OK, because current is on_cpu, which avoids it being
@@ -1860,8 +1871,8 @@ static struct task_struct *pick_next_pushable_task(struct rq *rq)
 		return NULL;
 
 	plist_for_each_entry(i, head, pushable_tasks) {
-		/* make sure task isn't on_cpu (possible with proxy-exec) */
-		if (!task_on_cpu(rq, i)) {
+		/* skip tasks that cannot be migrated */
+		if (!task_on_cpu(rq, i) && !is_migration_disabled(i)) {
 			p = i;
 			break;
 		}
@@ -2661,7 +2672,7 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 {
 	struct rt_schedulable_data *d = data;
 	struct task_group *child;
-	unsigned long total, sum = 0;
+	u64 total, sum = 0;
 	u64 period, runtime;
 
 	period = ktime_to_ns(tg->rt_bandwidth.rt_period);
@@ -2683,9 +2694,6 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 	 */
 	if (rt_bandwidth_enabled() && !runtime &&
 	    tg->rt_bandwidth.rt_runtime && tg_has_rt_tasks(tg))
-		return -EBUSY;
-
-	if (WARN_ON(!rt_group_sched_enabled() && tg != &root_task_group))
 		return -EBUSY;
 
 	total = to_ratio(period, runtime);
@@ -2827,19 +2835,6 @@ long sched_group_rt_period(struct task_group *tg)
 	return rt_period_us;
 }
 
-#ifdef CONFIG_SYSCTL
-static int sched_rt_global_constraints(void)
-{
-	int ret = 0;
-
-	mutex_lock(&rt_constraints_mutex);
-	ret = __rt_schedulable(NULL, 0, 0);
-	mutex_unlock(&rt_constraints_mutex);
-
-	return ret;
-}
-#endif /* CONFIG_SYSCTL */
-
 int sched_rt_can_attach(struct task_group *tg, struct task_struct *tsk)
 {
 	/* Don't accept real-time tasks when there is no way for them to run */
@@ -2849,14 +2844,6 @@ int sched_rt_can_attach(struct task_group *tg, struct task_struct *tsk)
 	return 1;
 }
 
-#else /* !CONFIG_RT_GROUP_SCHED: */
-
-#ifdef CONFIG_SYSCTL
-static int sched_rt_global_constraints(void)
-{
-	return 0;
-}
-#endif /* CONFIG_SYSCTL */
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
 #ifdef CONFIG_SYSCTL
@@ -2868,11 +2855,14 @@ static int sched_rt_global_validate(void)
 			NSEC_PER_USEC > max_rt_runtime)))
 		return -EINVAL;
 
-	return 0;
-}
+#ifdef CONFIG_RT_GROUP_SCHED
+	if (!rt_group_sched_enabled())
+		return 0;
 
-static void sched_rt_do_global(void)
-{
+	scoped_guard(mutex, &rt_constraints_mutex)
+		return __rt_schedulable(NULL, 0, 0);
+#endif
+	return 0;
 }
 
 static int sched_rt_handler(const struct ctl_table *table, int write, void *buffer,
@@ -2898,11 +2888,6 @@ static int sched_rt_handler(const struct ctl_table *table, int write, void *buff
 		if (ret)
 			goto undo;
 
-		ret = sched_rt_global_constraints();
-		if (ret)
-			goto undo;
-
-		sched_rt_do_global();
 		sched_dl_do_global();
 	}
 	if (0) {

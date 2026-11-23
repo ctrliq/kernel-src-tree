@@ -36,6 +36,7 @@
 #include <linux/sched/prio.h>
 #include <linux/sched/types.h>
 #include <linux/signal_types.h>
+#include <linux/spinlock.h>
 #include <linux/syscall_user_dispatch_types.h>
 #include <linux/mm_types_task.h>
 #include <linux/netdevice_xmit.h>
@@ -157,7 +158,7 @@ struct user_event_mm;
  */
 #define is_special_task_state(state)					\
 	((state) & (__TASK_STOPPED | __TASK_TRACED | TASK_PARKED |	\
-		    TASK_DEAD | TASK_FROZEN))
+		    TASK_DEAD | TASK_WAKING | TASK_FROZEN))
 
 #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 # define debug_normal_state_change(state_value)				\
@@ -847,7 +848,11 @@ struct task_struct {
 	struct alloc_tag		*alloc_tag;
 #endif
 
-	int				on_cpu;
+	u8				on_cpu;
+	u8				on_rq;
+	u8				is_blocked;
+	u8				__pad;
+
 	struct __call_single_node	wake_entry;
 	unsigned int			wakee_flips;
 	unsigned long			wakee_flip_decay_ts;
@@ -862,7 +867,6 @@ struct task_struct {
 	 */
 	int				recent_used_cpu;
 	int				wake_cpu;
-	int				on_rq;
 
 	int				prio;
 	int				static_prio;
@@ -1246,6 +1250,14 @@ struct task_struct {
 #endif
 
 	struct mutex			*blocked_on;	/* lock we're blocked on */
+	raw_spinlock_t			blocked_lock;
+
+	/*
+	 * The task that is boosting this task; a back link for the current
+	 * donor stack. Set in schedule() -> find_proxy_task() and only stable
+	 * under preempt_disable().
+	 */
+	struct task_struct		*blocked_donor;
 
 #ifdef CONFIG_DETECT_HUNG_TASK_BLOCKER
 	/*
@@ -2140,6 +2152,58 @@ extern int __cond_resched_rwlock_write(rwlock_t *lock);
 	__cond_resched_rwlock_write(lock);					\
 })
 
+#ifndef CONFIG_PREEMPT_RT
+
+static inline struct mutex *__get_task_blocked_on(struct task_struct *p)
+{
+	lockdep_assert_held_once(&p->blocked_lock);
+	return p->blocked_on;
+}
+
+static inline void __set_task_blocked_on(struct task_struct *p, struct mutex *m)
+{
+	WARN_ON_ONCE(!m);
+	/* The task should only be setting itself as blocked */
+	WARN_ON_ONCE(p != current);
+	/* Currently we serialize blocked_on under the task::blocked_lock */
+	lockdep_assert_held_once(&p->blocked_lock);
+	/*
+	 * Check ensure we don't overwrite existing mutex value
+	 * with a different mutex. Note, setting it to the same
+	 * lock repeatedly is ok.
+	 */
+	WARN_ON_ONCE(p->blocked_on && p->blocked_on != m);
+	p->blocked_on = m;
+}
+
+static inline void __clear_task_blocked_on(struct task_struct *p, struct mutex *m)
+{
+	/* Currently we serialize blocked_on under the task::blocked_lock */
+	lockdep_assert_held_once(&p->blocked_lock);
+	/*
+	 * There may be cases where we re-clear already cleared
+	 * blocked_on relationships, but make sure we are not
+	 * clearing the relationship with a different lock.
+	 */
+	WARN_ON_ONCE(m && p->blocked_on && p->blocked_on != m);
+	p->blocked_on = NULL;
+}
+
+static inline void clear_task_blocked_on(struct task_struct *p, struct mutex *m)
+{
+	guard(raw_spinlock_irqsave)(&p->blocked_lock);
+	__clear_task_blocked_on(p, m);
+}
+#else
+static inline void __clear_task_blocked_on(struct task_struct *p, struct rt_mutex *m)
+{
+}
+
+static inline void clear_task_blocked_on(struct task_struct *p, struct rt_mutex *m)
+{
+}
+#endif /* !CONFIG_PREEMPT_RT */
+
 static __always_inline bool need_resched(void)
 {
 	return unlikely(tif_need_resched());
@@ -2178,8 +2242,6 @@ static inline bool task_is_runnable(struct task_struct *p)
 extern bool sched_task_on_rq(struct task_struct *p);
 extern unsigned long get_wchan(struct task_struct *p);
 extern struct task_struct *cpu_curr_snapshot(int cpu);
-
-#include <linux/spinlock.h>
 
 /*
  * In order to reduce various lock holder preemption latencies provide an
