@@ -1,0 +1,167 @@
+futex/pi: Plug private futex exec() race
+
+jira KERNEL-1952
+cve CVE-2026-80777
+Rebuild_History Non-Buildable kernel-5.14.0-741.26.1.el9_9
+commit-author Thomas Gleixner <tglx@kernel.org>
+commit c5f0bc9fd1cec4a00400cc727fcde03e0fde17cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.26.1.el9_9/c5f0bc9f.failed
+
+The check for private futexes whether the waiter's mm, which is stored in
+the futex_key and copied into the pi_state, is the same as the owner's mm
+is not sufficient for exec(). exec() has a gap where the mm check fails to
+give the correct answer:
+
+  exec()
+  ...
+    exec_release_mm()
+      futex_exec_release()
+        tsk::futex::exit_state = EXITING;
+        cleanup_robust_list();
+1)      tsk::futex::exit_state = OK;
+    ...
+    old_mm = tsk::mm;
+2)  tsk::mm = ->mm;
+
+Between #1 and #2 the check for the mm is wrong as that mm is about to be
+swapped out and eventually freed.
+
+Plug this gap by:
+
+  1) Setting tsk::futex::exit_state to FUTEX_STATE_DEAD in
+     futex_exec_release()
+
+  2) Setting tsk::futex::exit_state to FUTEX_STATE_OK after
+     the mm has been switched.
+
+From a futex point of view the task is dead after it finished the robust
+list cleanup up to the point where it sets the state to OK again.
+
+Fixes: 80367ad01d93 ("futex: Add basic infrastructure for local task local hash")
+	Signed-off-by: Thomas Gleixner <tglx@kernel.org>
+	Reviewed-by: Kyle Zeng <kylebot@openai.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit c5f0bc9fd1cec4a00400cc727fcde03e0fde17cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+#	kernel/futex/core.c
+diff --cc fs/exec.c
+index 6b71be9135c3,d01523d0d8b4..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -1001,9 -851,12 +1002,10 @@@ static int exec_mmap(struct mm_struct *
+  	/* Notify parent that we're no longer interested in the old VM */
+  	tsk = current;
+  	old_mm = current->mm;
++ 	/* Clean up futexes and release the mm */
+  	exec_mm_release(tsk, old_mm);
+ +	if (old_mm)
+ +		sync_mm_rss(old_mm);
+  
+  	ret = down_write_killable(&tsk->signal->exec_update_lock);
+  	if (ret)
+@@@ -1046,12 -902,12 +1048,19 @@@
+  	if (old_mm) {
+  		mmap_read_unlock(old_mm);
+  		BUG_ON(active_mm != old_mm);
+++<<<<<<< HEAD
+ +		setmax_mm_hiwater_rss(&tsk->signal->maxrss, old_mm);
+ +		mm_update_next_owner(old_mm);
+ +		mmput(old_mm);
+ +		return 0;
+++=======
++ 		/* Defer teardown to setup_new_exec(), outside the exec locks. */
++ 		bprm->old_mm = old_mm;
++ 	} else {
++ 		mmdrop_lazy_tlb(active_mm);
+++>>>>>>> c5f0bc9fd1ce (futex/pi: Plug private futex exec() race)
+  	}
+- 	mmdrop_lazy_tlb(active_mm);
++ 	futex_exec_done(tsk);
+  	return 0;
+  }
+  
+diff --cc kernel/futex/core.c
+index 367cca6e236c,3c1562df0370..000000000000
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@@ -1463,10 -1524,11 +1463,15 @@@ static void futex_cleanup_begin(struct 
+  	raw_spin_unlock_irq(&tsk->pi_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static void futex_cleanup_end(struct task_struct *tsk, int state)
+++=======
++ static void futex_cleanup_end(struct task_struct *tsk)
++ 	__releases(&tsk->futex.exit_mutex)
+++>>>>>>> c5f0bc9fd1ce (futex/pi: Plug private futex exec() race)
+  {
+  	scoped_guard(raw_spinlock_irq, &tsk->pi_lock)
+- 		tsk->futex.state = state;
++ 		tsk->futex.state = FUTEX_STATE_DEAD;
+  
+  	/*
+  	 * Drop the exit protection. This unblocks waiters which observed
+* Unmerged path fs/exec.c
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index 9e6218c2be66..1651b4f4fd87 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -73,6 +73,7 @@ static inline void futex_init_task(struct task_struct *tsk)
+ void futex_exit_recursive(struct task_struct *tsk);
+ void futex_exit_release(struct task_struct *tsk);
+ void futex_exec_release(struct task_struct *tsk);
++void futex_exec_done(struct task_struct *tsk);
+ 
+ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+ 	      u32 __user *uaddr2, u32 val2, u32 val3);
+@@ -93,6 +94,7 @@ static inline void futex_init_task(struct task_struct *tsk) { }
+ static inline void futex_exit_recursive(struct task_struct *tsk) { }
+ static inline void futex_exit_release(struct task_struct *tsk) { }
+ static inline void futex_exec_release(struct task_struct *tsk) { }
++static inline void futex_exec_done(struct task_struct *tsk) { }
+ static inline long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+ 			    u32 __user *uaddr2, u32 val2, u32 val3)
+ {
+* Unmerged path kernel/futex/core.c
+diff --git a/kernel/futex/pi.c b/kernel/futex/pi.c
+index ca5a0e0d5966..fd8da0f27189 100644
+--- a/kernel/futex/pi.c
++++ b/kernel/futex/pi.c
+@@ -200,15 +200,25 @@ void put_pi_state(struct futex_pi_state *pi_state)
+  *
+  * - FUTEX_STATE_OK when the task is alive and waiters can be attached
+  *
+- * - FUTEX_STATE_EXITING when the task cleans up the robust list and pi
++ * - FUTEX_STATE_EXITING when the task cleans up the robust list and PI
+  *   state. Concurrent waiters cannot attach anymore and have to wait until the
+- *   cleanup is finished to re-evaluate the potential changes of robust list and
+- *   pi state cleanups.
++ *   cleanup is finished to re-evaluate the potential changes caused by the
++ *   robust list and PI state cleanups.
+  *
+- * - FUTEX_STATE_DEAD when the task has cleaned up the robust list and
+- *   is about to fully exit.
++ * - FUTEX_STATE_DEAD when the task has cleaned up the robust list. This state
++ *   is set independent of exit() or exec(). In the exit() case the task is
++ *   gone. In the exec() case this ensures that nothing can attach to the task
++ *   after cleaning up the robust list and PI state before it has switched to
++ *   the new mm. From a futex point of view the task is dead until it sets the
++ *   state to FUTEX_STATE_OK again after switching to the new mm.
+  *
+- * exec() switches back to FUTEX_STATE_OK after the cleanup.
++ * The valid state transitions for exit():
++ *
++ *   FUTEX_STATE_OK -> FUTEX_STATE_EXITING -> FUTEX_STATE_DEAD
++ *
++ * The valid state transitions for exec():
++ *
++ *   FUTEX_STATE_OK -> FUTEX_STATE_EXITING -> FUTEX_STATE_DEAD -> FUTEX_STATE_OK
+  *
+  * The state has two related locks:
+  *
