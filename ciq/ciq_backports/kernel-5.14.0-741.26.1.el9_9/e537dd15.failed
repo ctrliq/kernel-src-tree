@@ -1,0 +1,459 @@
+udp: Fix wildcard bind conflict check when using hash2
+
+jira KERNEL-1952
+cve CVE-2026-31503
+Rebuild_History Non-Buildable kernel-5.14.0-741.26.1.el9_9
+commit-author Martin KaFai Lau <martin.lau@kernel.org>
+commit e537dd15d0d4ad989d56a1021290f0c674dd8b28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.26.1.el9_9/e537dd15.failed
+
+When binding a udp_sock to a local address and port, UDP uses
+two hashes (udptable->hash and udptable->hash2) for collision
+detection. The current code switches to "hash2" when
+hslot->count > 10.
+
+"hash2" is keyed by local address and local port.
+"hash" is keyed by local port only.
+
+The issue can be shown in the following bind sequence (pseudo code):
+
+bind(fd1,  "[fd00::1]:8888")
+bind(fd2,  "[fd00::2]:8888")
+bind(fd3,  "[fd00::3]:8888")
+bind(fd4,  "[fd00::4]:8888")
+bind(fd5,  "[fd00::5]:8888")
+bind(fd6,  "[fd00::6]:8888")
+bind(fd7,  "[fd00::7]:8888")
+bind(fd8,  "[fd00::8]:8888")
+bind(fd9,  "[fd00::9]:8888")
+bind(fd10, "[fd00::10]:8888")
+
+/* Correctly return -EADDRINUSE because "hash" is used
+ * instead of "hash2". udp_lib_lport_inuse() detects the
+ * conflict.
+ */
+bind(fail_fd, "[::]:8888")
+
+/* After one more socket is bound to "[fd00::11]:8888",
+ * hslot->count exceeds 10 and "hash2" is used instead.
+ */
+bind(fd11, "[fd00::11]:8888")
+bind(fail_fd, "[::]:8888")      /* succeeds unexpectedly */
+
+The same issue applies to the IPv4 wildcard address "0.0.0.0"
+and the IPv4-mapped wildcard address "::ffff:0.0.0.0". For
+example, if there are existing sockets bound to
+"192.168.1.[1-11]:8888", then binding "0.0.0.0:8888" or
+"[::ffff:0.0.0.0]:8888" can also miss the conflict when
+hslot->count > 10.
+
+TCP inet_csk_get_port() already has the correct check in
+inet_use_bhash2_on_bind(). Rename it to
+inet_use_hash2_on_bind() and move it to inet_hashtables.h
+so udp.c can reuse it in this fix.
+
+Fixes: 30fff9231fad ("udp: bind() optimisation")
+	Reported-by: Andrew Onyshchuk <oandrew@meta.com>
+	Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+	Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20260319181817.1901357-1-martin.lau@linux.dev
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit e537dd15d0d4ad989d56a1021290f0c674dd8b28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_hashtables.h
+#	net/ipv4/inet_connection_sock.c
+diff --cc include/net/inet_hashtables.h
+index 8ae2332ad858,6d936e9f2fd3..000000000000
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@@ -199,8 -249,47 +199,50 @@@ static inline u32 inet_bhashfn(const st
+  	return (lport + net_hash_mix(net)) & (bhash_size - 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct inet_bind_hashbucket *
++ inet_bhashfn_portaddr(const struct inet_hashinfo *hinfo, const struct sock *sk,
++ 		      const struct net *net, unsigned short port)
++ {
++ 	u32 hash;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if (sk->sk_family == AF_INET6)
++ 		hash = ipv6_portaddr_hash(net, &sk->sk_v6_rcv_saddr, port);
++ 	else
++ #endif
++ 		hash = ipv4_portaddr_hash(net, sk->sk_rcv_saddr, port);
++ 	return &hinfo->bhash2[hash & (hinfo->bhash_size - 1)];
++ }
++ 
++ static inline bool inet_use_hash2_on_bind(const struct sock *sk)
++ {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if (sk->sk_family == AF_INET6) {
++ 		if (ipv6_addr_any(&sk->sk_v6_rcv_saddr))
++ 			return false;
++ 
++ 		if (!ipv6_addr_v4mapped(&sk->sk_v6_rcv_saddr))
++ 			return true;
++ 	}
++ #endif
++ 	return sk->sk_rcv_saddr != htonl(INADDR_ANY);
++ }
++ 
++ struct inet_bind_hashbucket *
++ inet_bhash2_addr_any_hashbucket(const struct sock *sk, const struct net *net, int port);
++ 
++ /* This should be called whenever a socket's sk_rcv_saddr (ipv4) or
++  * sk_v6_rcv_saddr (ipv6) changes after it has been binded. The socket's
++  * rcv_saddr field should already have been updated when this is called.
++  */
++ int inet_bhash2_update_saddr(struct sock *sk, void *saddr, int family);
++ void inet_bhash2_reset_saddr(struct sock *sk);
++ 
+++>>>>>>> e537dd15d0d4 (udp: Fix wildcard bind conflict check when using hash2)
+  void inet_bind_hash(struct sock *sk, struct inet_bind_bucket *tb,
+ -		    struct inet_bind2_bucket *tb2, unsigned short port);
+ +		    const unsigned short snum);
+  
+  /* Caller must disable local BH processing. */
+  int __inet_inherit_port(const struct sock *sk, struct sock *child);
+diff --cc net/ipv4/inet_connection_sock.c
+index a51b7ee5f196,e961936b6be7..000000000000
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@@ -117,29 -118,169 +117,152 @@@ bool inet_rcv_saddr_any(const struct so
+  	return !sk->sk_rcv_saddr;
+  }
+  
+ -/**
+ - *	inet_sk_get_local_port_range - fetch ephemeral ports range
+ - *	@sk: socket
+ - *	@low: pointer to low port
+ - *	@high: pointer to high port
+ - *
+ - *	Fetch netns port range (/proc/sys/net/ipv4/ip_local_port_range)
+ - *	Range can be overridden if socket got IP_LOCAL_PORT_RANGE option.
+ - *	Returns true if IP_LOCAL_PORT_RANGE was set on this socket.
+ - */
+ -bool inet_sk_get_local_port_range(const struct sock *sk, int *low, int *high)
+ +void inet_get_local_port_range(struct net *net, int *low, int *high)
+  {
+ -	int lo, hi, sk_lo, sk_hi;
+ -	bool local_range = false;
+ -	u32 sk_range;
+ -
+ -	inet_get_local_port_range(sock_net(sk), &lo, &hi);
+ -
+ -	sk_range = READ_ONCE(inet_sk(sk)->local_port_range);
+ -	if (unlikely(sk_range)) {
+ -		sk_lo = sk_range & 0xffff;
+ -		sk_hi = sk_range >> 16;
+ -
+ -		if (lo <= sk_lo && sk_lo <= hi)
+ -			lo = sk_lo;
+ -		if (lo <= sk_hi && sk_hi <= hi)
+ -			hi = sk_hi;
+ -		local_range = true;
+ -	}
+ +	unsigned int seq;
+  
+ -	*low = lo;
+ -	*high = hi;
+ -	return local_range;
+ +	do {
+ +		seq = read_seqbegin(&net->ipv4.ip_local_ports.lock);
+ +
+ +		*low = net->ipv4.ip_local_ports.range[0];
+ +		*high = net->ipv4.ip_local_ports.range[1];
+ +	} while (read_seqretry(&net->ipv4.ip_local_ports.lock, seq));
+  }
+ -EXPORT_SYMBOL(inet_sk_get_local_port_range);
+ +EXPORT_SYMBOL(inet_get_local_port_range);
+  
+++<<<<<<< HEAD
+++=======
++ static bool inet_bind_conflict(const struct sock *sk, struct sock *sk2,
++ 			       kuid_t uid, bool relax,
++ 			       bool reuseport_cb_ok, bool reuseport_ok)
++ {
++ 	int bound_dev_if2;
++ 
++ 	if (sk == sk2)
++ 		return false;
++ 
++ 	bound_dev_if2 = READ_ONCE(sk2->sk_bound_dev_if);
++ 
++ 	if (!sk->sk_bound_dev_if || !bound_dev_if2 ||
++ 	    sk->sk_bound_dev_if == bound_dev_if2) {
++ 		if (sk->sk_reuse && sk2->sk_reuse &&
++ 		    sk2->sk_state != TCP_LISTEN) {
++ 			if (!relax || (!reuseport_ok && sk->sk_reuseport &&
++ 				       sk2->sk_reuseport && reuseport_cb_ok &&
++ 				       (sk2->sk_state == TCP_TIME_WAIT ||
++ 					uid_eq(uid, sk_uid(sk2)))))
++ 				return true;
++ 		} else if (!reuseport_ok || !sk->sk_reuseport ||
++ 			   !sk2->sk_reuseport || !reuseport_cb_ok ||
++ 			   (sk2->sk_state != TCP_TIME_WAIT &&
++ 			    !uid_eq(uid, sk_uid(sk2)))) {
++ 			return true;
++ 		}
++ 	}
++ 	return false;
++ }
++ 
++ static bool __inet_bhash2_conflict(const struct sock *sk, struct sock *sk2,
++ 				   kuid_t uid, bool relax,
++ 				   bool reuseport_cb_ok, bool reuseport_ok)
++ {
++ 	if (ipv6_only_sock(sk2)) {
++ 		if (sk->sk_family == AF_INET)
++ 			return false;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (ipv6_addr_v4mapped(&sk->sk_v6_rcv_saddr))
++ 			return false;
++ #endif
++ 	}
++ 
++ 	return inet_bind_conflict(sk, sk2, uid, relax,
++ 				  reuseport_cb_ok, reuseport_ok);
++ }
++ 
++ static bool inet_bhash2_conflict(const struct sock *sk,
++ 				 const struct inet_bind2_bucket *tb2,
++ 				 kuid_t uid,
++ 				 bool relax, bool reuseport_cb_ok,
++ 				 bool reuseport_ok)
++ {
++ 	struct sock *sk2;
++ 
++ 	sk_for_each_bound(sk2, &tb2->owners) {
++ 		if (__inet_bhash2_conflict(sk, sk2, uid, relax,
++ 					   reuseport_cb_ok, reuseport_ok))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ #define sk_for_each_bound_bhash(__sk, __tb2, __tb)			\
++ 	hlist_for_each_entry(__tb2, &(__tb)->bhash2, bhash_node)	\
++ 		sk_for_each_bound((__sk), &(__tb2)->owners)
++ 
++ /* This should be called only when the tb and tb2 hashbuckets' locks are held */
+++>>>>>>> e537dd15d0d4 (udp: Fix wildcard bind conflict check when using hash2)
+  static int inet_csk_bind_conflict(const struct sock *sk,
+  				  const struct inet_bind_bucket *tb,
+ -				  const struct inet_bind2_bucket *tb2, /* may be null */
+  				  bool relax, bool reuseport_ok)
+  {
+ -	struct sock_reuseport *reuseport_cb;
+ -	kuid_t uid = sk_uid(sk);
+ -	bool reuseport_cb_ok;
+  	struct sock *sk2;
+++<<<<<<< HEAD
+++=======
++ 
++ 	rcu_read_lock();
++ 	reuseport_cb = rcu_dereference(sk->sk_reuseport_cb);
++ 	/* paired with WRITE_ONCE() in __reuseport_(add|detach)_closed_sock */
++ 	reuseport_cb_ok = !reuseport_cb || READ_ONCE(reuseport_cb->num_closed_socks);
++ 	rcu_read_unlock();
++ 
++ 	/* Conflicts with an existing IPV6_ADDR_ANY (if ipv6) or INADDR_ANY (if
++ 	 * ipv4) should have been checked already. We need to do these two
++ 	 * checks separately because their spinlocks have to be acquired/released
++ 	 * independently of each other, to prevent possible deadlocks
++ 	 */
++ 	if (inet_use_hash2_on_bind(sk))
++ 		return tb2 && inet_bhash2_conflict(sk, tb2, uid, relax,
++ 						   reuseport_cb_ok, reuseport_ok);
++ 
++ 	/* Unlike other sk lookup places we do not check
++ 	 * for sk_net here, since _all_ the socks listed
++ 	 * in tb->owners and tb2->owners list belong
++ 	 * to the same net - the one this bucket belongs to.
++ 	 */
++ 	sk_for_each_bound_bhash(sk2, tb2, tb) {
++ 		if (!inet_bind_conflict(sk, sk2, uid, relax, reuseport_cb_ok, reuseport_ok))
++ 			continue;
++ 
++ 		if (inet_rcv_saddr_equal(sk, sk2, true))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /* Determine if there is a bind conflict with an existing IPV6_ADDR_ANY (if ipv6) or
++  * INADDR_ANY (if ipv4) socket.
++  *
++  * Caller must hold bhash hashbucket lock with local bh disabled, to protect
++  * against concurrent binds on the port for addr any
++  */
++ static bool inet_bhash2_addr_any_conflict(const struct sock *sk, int port, int l3mdev,
++ 					  bool relax, bool reuseport_ok)
++ {
++ 	const struct net *net = sock_net(sk);
++ 	struct sock_reuseport *reuseport_cb;
++ 	struct inet_bind_hashbucket *head2;
++ 	struct inet_bind2_bucket *tb2;
++ 	kuid_t uid = sk_uid(sk);
++ 	bool conflict = false;
+++>>>>>>> e537dd15d0d4 (udp: Fix wildcard bind conflict check when using hash2)
+  	bool reuseport_cb_ok;
+ +	bool reuse = sk->sk_reuse;
+ +	bool reuseport = !!sk->sk_reuseport;
+ +	struct sock_reuseport *reuseport_cb;
+ +	kuid_t uid = sock_i_uid((struct sock *)sk);
+  
+  	rcu_read_lock();
+  	reuseport_cb = rcu_dereference(sk->sk_reuseport_cb);
+@@@ -239,11 -362,20 +362,22 @@@ other_parity_scan
+  		head = &hinfo->bhash[inet_bhashfn(net, port,
+  						  hinfo->bhash_size)];
+  		spin_lock_bh(&head->lock);
+++<<<<<<< HEAD
+++=======
++ 		if (inet_use_hash2_on_bind(sk)) {
++ 			if (inet_bhash2_addr_any_conflict(sk, port, l3mdev, relax, false))
++ 				goto next_port;
++ 		}
++ 
++ 		head2 = inet_bhashfn_portaddr(hinfo, sk, net, port);
++ 		spin_lock(&head2->lock);
++ 		tb2 = inet_bind2_bucket_find(head2, net, port, l3mdev, sk);
+++>>>>>>> e537dd15d0d4 (udp: Fix wildcard bind conflict check when using hash2)
+  		inet_bind_bucket_for_each(tb, &head->chain)
+ -			if (inet_bind_bucket_match(tb, net, port, l3mdev)) {
+ -				if (!inet_csk_bind_conflict(sk, tb, tb2,
+ -							    relax, false))
+ +			if (net_eq(ib_net(tb), net) && tb->l3mdev == l3mdev &&
+ +			    tb->port == port) {
+ +				if (!inet_csk_bind_conflict(sk, tb, relax, false))
+  					goto success;
+ -				spin_unlock(&head2->lock);
+  				goto next_port;
+  			}
+  		tb = NULL;
+@@@ -376,42 -514,71 +510,74 @@@ int inet_csk_get_port(struct sock *sk, 
+  	l3mdev = inet_sk_bound_l3mdev(sk);
+  
+  	if (!port) {
+ -		head = inet_csk_find_open_port(sk, &tb, &tb2, &head2, &port);
+ +		head = inet_csk_find_open_port(sk, &tb, &port);
+  		if (!head)
+  			return ret;
+ -
+ -		head2_lock_acquired = true;
+ -
+ -		if (tb && tb2)
+ -			goto success;
+ -		found_port = true;
+ -	} else {
+ -		head = &hinfo->bhash[inet_bhashfn(net, port,
+ -						  hinfo->bhash_size)];
+ -		spin_lock_bh(&head->lock);
+ -		inet_bind_bucket_for_each(tb, &head->chain)
+ -			if (inet_bind_bucket_match(tb, net, port, l3mdev))
+ -				break;
+ -	}
+ -
+ -	if (!tb) {
+ -		tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep, net,
+ -					     head, port, l3mdev);
+  		if (!tb)
+ -			goto fail_unlock;
+ -		bhash_created = true;
+ +			goto tb_not_found;
+ +		goto success;
+  	}
+ +	head = &hinfo->bhash[inet_bhashfn(net, port,
+ +					  hinfo->bhash_size)];
+ +	spin_lock_bh(&head->lock);
+ +	inet_bind_bucket_for_each(tb, &head->chain)
+ +		if (net_eq(ib_net(tb), net) && tb->l3mdev == l3mdev &&
+ +		    tb->port == port)
+ +			goto tb_found;
+ +tb_not_found:
+ +	tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep,
+ +				     net, head, port, l3mdev);
+ +	if (!tb)
+ +		goto fail_unlock;
+ +tb_found:
+ +	if (!hlist_empty(&tb->owners)) {
+ +		if (sk->sk_reuse == SK_FORCE_REUSE)
+ +			goto success;
+  
+++<<<<<<< HEAD
+ +		if ((tb->fastreuse > 0 && reuse) ||
+ +		    sk_reuseport_match(tb, sk))
+ +			goto success;
+ +		if (inet_csk_bind_conflict(sk, tb, true, true))
+++=======
++ 	if (!found_port) {
++ 		if (!hlist_empty(&tb->bhash2)) {
++ 			if (sk->sk_reuse == SK_FORCE_REUSE ||
++ 			    (tb->fastreuse > 0 && reuse) ||
++ 			    sk_reuseport_match(tb, sk))
++ 				check_bind_conflict = false;
++ 		}
++ 
++ 		if (check_bind_conflict && inet_use_hash2_on_bind(sk)) {
++ 			if (inet_bhash2_addr_any_conflict(sk, port, l3mdev, true, true))
++ 				goto fail_unlock;
++ 		}
++ 
++ 		head2 = inet_bhashfn_portaddr(hinfo, sk, net, port);
++ 		spin_lock(&head2->lock);
++ 		head2_lock_acquired = true;
++ 		tb2 = inet_bind2_bucket_find(head2, net, port, l3mdev, sk);
++ 	}
++ 
++ 	if (!tb2) {
++ 		tb2 = inet_bind2_bucket_create(hinfo->bind2_bucket_cachep,
++ 					       net, head2, tb, sk);
++ 		if (!tb2)
++ 			goto fail_unlock;
++ 		bhash2_created = true;
++ 	}
++ 
++ 	if (!found_port && check_bind_conflict) {
++ 		if (inet_csk_bind_conflict(sk, tb, tb2, true, true))
+++>>>>>>> e537dd15d0d4 (udp: Fix wildcard bind conflict check when using hash2)
+  			goto fail_unlock;
+  	}
+ -
+  success:
+ -	inet_csk_update_fastreuse(sk, tb, tb2);
+ +	inet_csk_update_fastreuse(tb, sk);
+  
+  	if (!inet_csk(sk)->icsk_bind_hash)
+ -		inet_bind_hash(sk, tb, tb2, port);
+ +		inet_bind_hash(sk, tb, port);
+  	WARN_ON(inet_csk(sk)->icsk_bind_hash != tb);
+ -	WARN_ON(inet_csk(sk)->icsk_bind2_hash != tb2);
+  	ret = 0;
+  
+  fail_unlock:
+* Unmerged path include/net/inet_hashtables.h
+* Unmerged path net/ipv4/inet_connection_sock.c
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index b11d4e62bd8b..da9dcbb929d2 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -286,7 +286,7 @@ int udp_lib_get_port(struct sock *sk, unsigned short snum,
+ 	} else {
+ 		hslot = udp_hashslot(udptable, net, snum);
+ 		spin_lock_bh(&hslot->lock);
+-		if (hslot->count > 10) {
++		if (inet_use_hash2_on_bind(sk) && hslot->count > 10) {
+ 			int exist;
+ 			unsigned int slot2 = udp_sk(sk)->udp_portaddr_hash ^ snum;
+ 
