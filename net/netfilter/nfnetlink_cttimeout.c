@@ -169,7 +169,7 @@ static int cttimeout_new_timeout(struct sk_buff *skb,
 	if (ret < 0)
 		goto err_free_timeout_policy;
 
-	strcpy(timeout->name, nla_data(cda[CTA_TIMEOUT_NAME]));
+	nla_strscpy(timeout->name, cda[CTA_TIMEOUT_NAME], sizeof(timeout->name));
 	timeout->timeout->l3num = l3num;
 	timeout->timeout->l4proto = l4proto;
 	refcount_set(&timeout->timeout->refcnt, 1);
@@ -653,9 +653,9 @@ static void __exit cttimeout_exit(void)
 {
 	nfnetlink_subsys_unregister(&cttimeout_subsys);
 
-	unregister_pernet_subsys(&cttimeout_ops);
 	RCU_INIT_POINTER(nf_ct_timeout_hook, NULL);
 	synchronize_net();
+	unregister_pernet_subsys(&cttimeout_ops);
 }
 
 module_init(cttimeout_init);

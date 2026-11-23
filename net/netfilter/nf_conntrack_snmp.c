@@ -14,8 +14,6 @@
 #include <net/netfilter/nf_conntrack_expect.h>
 #include <linux/netfilter/nf_conntrack_snmp.h>
 
-#define SNMP_PORT	161
-
 MODULE_AUTHOR("Jiri Olsa <jolsa@redhat.com>");
 MODULE_DESCRIPTION("SNMP service broadcast connection tracking helper");
 MODULE_LICENSE("GPL");
@@ -25,17 +23,14 @@ static unsigned int timeout __read_mostly = 30;
 module_param(timeout, uint, 0400);
 MODULE_PARM_DESC(timeout, "timeout for master connection/replies in seconds");
 
-int (*nf_nat_snmp_hook)(struct sk_buff *skb,
-			unsigned int protoff,
-			struct nf_conn *ct,
-			enum ip_conntrack_info ctinfo);
+nf_nat_snmp_hook_fn __rcu *nf_nat_snmp_hook;
 EXPORT_SYMBOL_GPL(nf_nat_snmp_hook);
 
 static int snmp_conntrack_help(struct sk_buff *skb, unsigned int protoff,
 			       struct nf_conn *ct,
 			       enum ip_conntrack_info ctinfo)
 {
-	typeof(nf_nat_snmp_hook) nf_nat_snmp;
+	nf_nat_snmp_hook_fn *nf_nat_snmp;
 
 	nf_conntrack_broadcast_help(skb, ct, ctinfo, timeout);
 
@@ -58,7 +53,7 @@ static int __init nf_conntrack_snmp_init(void)
 	exp_policy.timeout = timeout;
 
 	nf_ct_helper_init(&helper, AF_INET, IPPROTO_UDP,
-			  "snmp", SNMP_PORT, SNMP_PORT, SNMP_PORT,
+			  "snmp",
 			  &exp_policy, 0, snmp_conntrack_help, NULL,
 			  THIS_MODULE);
 
