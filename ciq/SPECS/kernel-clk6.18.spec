@@ -167,7 +167,7 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define kernel_major_minor 6.18
-%define kernel_patch 64
+%define kernel_patch 65
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4572,8 +4572,9 @@ fi\
 #
 #
 %changelog
-* Wed Nov 18 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.64-1.1
--- Rebased changes for Linux 6.18.64 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.64-1)
+* Mon Nov 23 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.65-1.1
+-- Rebased changes for Linux 6.18.65 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.65-1)
+-- [CIQ] v6.18.64 - updated spec (github-actions[bot])
 -- configs: CONFIG_CRYPTO_FIPS_VERSION="ciq.6.18.20260531" to  "ciq.6.18.20261112" (Jonathan Maple)
 -- [CIQ] v6.18.63 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.62 - updated spec (github-actions[bot])
@@ -4721,7 +4722,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.64 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.64)
+-- Linux 6.18.65 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.65)
 
 
 ###
