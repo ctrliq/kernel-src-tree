@@ -59,6 +59,7 @@
 #define NFQNL_QMAX_DEFAULT 1024
 #define NFQNL_HASH_MIN     8
 #define NFQNL_HASH_MAX     32768
+#define IP6_MAX_EXT_HDRS_CNT 12
 
 /* We're using struct nlattr which has 16bit nla_len. Note that nla_len
  * includes the header length. Thus, the maximum packet length that we
