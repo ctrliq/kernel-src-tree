@@ -1,0 +1,197 @@
+drm/amdgpu: Add a new NPA Address space
+
+jira KERNEL-1957
+Rebuild_History Non-Buildable kernel-6.12.0-264.19.1.el10_3
+commit-author Mukul Joshi <mukul.joshi@amd.com>
+commit 09152b002ffde5bc769656aaa42728a2046c8bb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.19.1.el10_3/09152b00.failed
+
+Add a new address space for NPA address management.
+This is needed for sharing buffer objects across GPUs
+with each running their own OS. The NPA address space
+size can change across different HW generations so the
+size is initialized during early init of the driver boot
+up process.
+
+	Signed-off-by: Mukul Joshi <mukul.joshi@amd.com>
+	Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 09152b002ffde5bc769656aaa42728a2046c8bb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_ualink.h
+#	drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c
+diff --cc drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c
+index 557d15b90ad2,c8a0ca2c3de0..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c
+@@@ -2882,6 -3193,13 +2882,16 @@@ static int gfx_v12_1_early_init(struct 
+  
+  	gfx_v12_1_init_rlcg_reg_access_ctrl(adev);
+  
+++<<<<<<< HEAD
+++=======
++ 	amdgpu_init_rlc_reg_funcs(adev);
++ 
++ 	/* Set NPA address size here as its needed in amdgpu_ttm_init().
++ 	 * NPA address space is 52 bits or 2^40 pages long.
++ 	 */
++ 	adev->ualink.npa_size = 1ULL << 40;
++ 
+++>>>>>>> 09152b002ffd (drm/amdgpu: Add a new NPA Address space)
+  	return gfx_v12_1_init_microcode(adev);
+  }
+  
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ualink.h
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 1fb956400696..810ff24e16f3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -202,6 +202,14 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
+ 		c++;
+ 	}
+ 
++	if (domain & AMDGPU_GEM_DOMAIN_NPA) {
++		places[c].fpfn = 0;
++		places[c].lpfn = 0;
++		places[c].mem_type = AMDGPU_PL_NPA;
++		places[c].flags = 0;
++		c++;
++	}
++
+ 	if (!c) {
+ 		places[c].fpfn = 0;
+ 		places[c].lpfn = 0;
+@@ -1653,6 +1661,9 @@ u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
+ 			case AMDGPU_PL_MMIO_REMAP:
+ 				placement = "MMIO REMAP";
+ 				break;
++			case AMDGPU_PL_NPA:
++				placement = "NPA";
++				break;
+ 			case TTM_PL_SYSTEM:
+ 			default:
+ 				placement = "CPU";
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 912c9afaf9e1..8dfd04eb7d22 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -168,6 +168,8 @@ static inline unsigned amdgpu_mem_type_to_domain(u32 mem_type)
+ 		return AMDGPU_GEM_DOMAIN_OA;
+ 	case AMDGPU_PL_DOORBELL:
+ 		return AMDGPU_GEM_DOMAIN_DOORBELL;
++	case AMDGPU_PL_NPA:
++		return AMDGPU_GEM_DOMAIN_NPA;
+ 	default:
+ 		break;
+ 	}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index de07a46cdb52..3d76bd22bbfc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -127,6 +127,7 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
+ 	case AMDGPU_PL_OA:
+ 	case AMDGPU_PL_DOORBELL:
+ 	case AMDGPU_PL_MMIO_REMAP:
++	case AMDGPU_PL_NPA:
+ 		placement->num_placement = 0;
+ 		return;
+ 
+@@ -550,11 +551,13 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	    old_mem->mem_type == AMDGPU_PL_OA ||
+ 	    old_mem->mem_type == AMDGPU_PL_DOORBELL ||
+ 	    old_mem->mem_type == AMDGPU_PL_MMIO_REMAP ||
++	    old_mem->mem_type == AMDGPU_PL_NPA ||
+ 	    new_mem->mem_type == AMDGPU_PL_GDS ||
+ 	    new_mem->mem_type == AMDGPU_PL_GWS ||
+ 	    new_mem->mem_type == AMDGPU_PL_OA ||
+ 	    new_mem->mem_type == AMDGPU_PL_DOORBELL ||
+-	    new_mem->mem_type == AMDGPU_PL_MMIO_REMAP) {
++	    new_mem->mem_type == AMDGPU_PL_MMIO_REMAP ||
++	    new_mem->mem_type == AMDGPU_PL_NPA) {
+ 		/* Nothing to save here */
+ 		amdgpu_bo_move_notify(bo, evict, new_mem);
+ 		ttm_bo_move_null(bo, new_mem);
+@@ -2215,6 +2218,16 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 		dev_err(adev->dev, "Failed initializing oa heap.\n");
+ 		return r;
+ 	}
++
++	if (adev->ualink.npa_size) {
++		r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_NPA,
++					    adev->ualink.npa_size);
++		if (r) {
++			dev_err(adev->dev, "Failed initializing NPA heap.\n");
++			return r;
++		}
++	}
++
+ 	if (amdgpu_bo_create_kernel(adev, PAGE_SIZE, PAGE_SIZE,
+ 				AMDGPU_GEM_DOMAIN_GTT,
+ 				&adev->mman.sdma_access_bo, NULL,
+@@ -2278,6 +2291,7 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_OA);
+ 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_DOORBELL);
+ 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_MMIO_REMAP);
++	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_NPA);
+ 	ttm_device_fini(&adev->mman.bdev);
+ 	adev->mman.initialized = false;
+ 	dev_info(adev->dev, " ttm finalized\n");
+@@ -2618,6 +2632,7 @@ int amdgpu_ttm_evict_resources(struct amdgpu_device *adev, int mem_type)
+ 	case AMDGPU_PL_GWS:
+ 	case AMDGPU_PL_GDS:
+ 	case AMDGPU_PL_OA:
++	case AMDGPU_PL_NPA:
+ 		man = ttm_manager_type(&adev->mman.bdev, mem_type);
+ 		break;
+ 	default:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 143201ecea3f..988e989dc8f8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -36,7 +36,9 @@
+ #define AMDGPU_PL_PREEMPT	(TTM_PL_PRIV + 3)
+ #define AMDGPU_PL_DOORBELL	(TTM_PL_PRIV + 4)
+ #define AMDGPU_PL_MMIO_REMAP	(TTM_PL_PRIV + 5)
+-#define __AMDGPU_PL_NUM	(TTM_PL_PRIV + 6)
++#define AMDGPU_PL_NPA		(TTM_PL_PRIV + 6)
++#define __AMDGPU_PL_NUM		(TTM_PL_PRIV + 7)
++
+ 
+ #define AMDGPU_GTT_MAX_TRANSFER_SIZE	512
+ #define AMDGPU_GTT_NUM_TRANSFER_WINDOWS	2
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ualink.h
+* Unmerged path drivers/gpu/drm/amd/amdgpu/gfx_v12_1.c
+diff --git a/include/drm/ttm/ttm_resource.h b/include/drm/ttm/ttm_resource.h
+index a5d386583fb6..f5d1ad7a4efc 100644
+--- a/include/drm/ttm/ttm_resource.h
++++ b/include/drm/ttm/ttm_resource.h
+@@ -35,7 +35,7 @@
+ #include <drm/ttm/ttm_kmap_iter.h>
+ 
+ #define TTM_MAX_BO_PRIORITY	4U
+-#define TTM_NUM_MEM_TYPES 9
++#define TTM_NUM_MEM_TYPES 10
+ 
+ struct dentry;
+ struct dmem_cgroup_device;
+diff --git a/include/uapi/drm/amdgpu_drm.h b/include/uapi/drm/amdgpu_drm.h
+index ebbd861ef0bc..5eebf2c0ba61 100644
+--- a/include/uapi/drm/amdgpu_drm.h
++++ b/include/uapi/drm/amdgpu_drm.h
+@@ -113,6 +113,12 @@ extern "C" {
+ #define AMDGPU_GEM_DOMAIN_GWS		0x10
+ #define AMDGPU_GEM_DOMAIN_OA		0x20
+ #define AMDGPU_GEM_DOMAIN_DOORBELL	0x40
++#define AMDGPU_GEM_DOMAIN_MMIO_REMAP	0x80
++#define AMDGPU_GEM_DOMAIN_NPA		0x100
++
++/* User-mode is not allowed to allocate NPA space. As a result,
++ * we don't add AMDGPU_GEM_DOMAIN_NPA in the DOMAIN_MASK below.
++ */
+ #define AMDGPU_GEM_DOMAIN_MASK		(AMDGPU_GEM_DOMAIN_CPU | \
+ 					 AMDGPU_GEM_DOMAIN_GTT | \
+ 					 AMDGPU_GEM_DOMAIN_VRAM | \
