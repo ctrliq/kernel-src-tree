@@ -954,10 +954,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #endif
 
 #ifdef CONFIG_SCHED_MM_CID
-	tsk->mm_cid = -1;
-	tsk->last_mm_cid = -1;
-	tsk->mm_cid_active = 0;
-	tsk->migrate_from_cpu = -1;
+	tsk->mm_cid.cid = MM_CID_UNSET;
+	tsk->mm_cid.active = 0;
+	INIT_HLIST_NODE(&tsk->mm_cid.node);
 #endif
 
 #ifdef CONFIG_BPF_SYSCALL
@@ -1537,7 +1536,6 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 
 	tsk->mm = mm;
 	tsk->active_mm = mm;
-	sched_mm_cid_fork(tsk);
 	sched_cache_fork(tsk);
 	return 0;
 }

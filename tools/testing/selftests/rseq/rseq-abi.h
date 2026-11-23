@@ -165,9 +165,14 @@ struct rseq_abi {
 	__u32 mm_cid;
 
 	/*
+	 * Place holder to push the size above 32 bytes.
+	 */
+	__u8 __reserved;
+
+	/*
 	 * Flexible array member at end of structure, after last feature field.
 	 */
 	char end[];
-} __attribute__((aligned(4 * sizeof(__u64))));
+} __attribute__((aligned(256)));
 
 #endif /* _RSEQ_ABI_H */
