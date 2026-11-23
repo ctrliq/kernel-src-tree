@@ -201,8 +201,7 @@ err_bind:
 	port_counter->num_counters--;
 	if (!port_counter->num_counters &&
 	    port_counter->mode.mode == RDMA_COUNTER_MODE_MANUAL)
-		__counter_set_mode(port_counter, RDMA_COUNTER_MODE_NONE, 0,
-				   false);
+		__counter_set_mode(port_counter, RDMA_COUNTER_MODE_NONE, 0);
 	mutex_unlock(&port_counter->lock);
 err_mode:
 	rdma_free_hw_stats_struct(counter->stats);
