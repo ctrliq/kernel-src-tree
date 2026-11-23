@@ -1,0 +1,170 @@
+lockd: fix vfs_test_lock() calls
+
+jira KERNEL-1946
+Rebuild_History Non-Buildable kernel-4.18.0-553.189.1.el8_10
+commit-author NeilBrown <neil@brown.name>
+commit a49a2a1baa0c553c3548a1c414b6a3c005a8deba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.189.1.el8_10/a49a2a1b.failed
+
+Usage of vfs_test_lock() is somewhat confused.  Documentation suggests
+it is given a "lock" but this is not the case.  It is given a struct
+file_lock which contains some details of the sort of lock it should be
+looking for.
+
+In particular passing a "file_lock" containing fl_lmops or fl_ops is
+meaningless and possibly confusing.
+
+This is particularly problematic in lockd.  nlmsvc_testlock() receives
+an initialised "file_lock" from xdr-decode, including manager ops and an
+owner.  It then mistakenly passes this to vfs_test_lock() which might
+replace the owner and the ops.  This can lead to confusion when freeing
+the lock.
+
+The primary role of the 'struct file_lock' passed to vfs_test_lock() is
+to report a conflicting lock that was found, so it makes more sense for
+nlmsvc_testlock() to pass "conflock", which it uses for returning the
+conflicting lock.
+
+With this change, freeing of the lock is not confused and code in
+__nlm4svc_proc_test() and __nlmsvc_proc_test() can be simplified.
+
+Documentation for vfs_test_lock() is improved to reflect its real
+purpose, and a WARN_ON_ONCE() is added to avoid a similar problem in the
+future.
+
+	Reported-by: Olga Kornievskaia <okorniev@redhat.com>
+Closes: https://lore.kernel.org/all/20251021130506.45065-1-okorniev@redhat.com
+	Signed-off-by: NeilBrown <neil@brown.name>
+Fixes: 20fa19027286 ("nfs: add export operations")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit a49a2a1baa0c553c3548a1c414b6a3c005a8deba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/lockd/svc4proc.c
+#	fs/lockd/svclock.c
+#	fs/lockd/svcproc.c
+#	fs/locks.c
+diff --cc fs/lockd/svc4proc.c
+index 5586069ee082,4b6f18d97734..000000000000
+--- a/fs/lockd/svc4proc.c
++++ b/fs/lockd/svc4proc.c
+@@@ -94,9 -106,9 +93,12 @@@ __nlm4svc_proc_test(struct svc_rqst *rq
+  	if ((resp->status = nlm4svc_retrieve_args(rqstp, argp, &host, &file)))
+  		return resp->status == nlm_drop_reply ? rpc_drop_reply :rpc_success;
+  
+++<<<<<<< HEAD
+ +	test_owner = argp->lock.fl.fl_owner;
+++=======
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  	/* Now check for conflicting locks */
+ -	resp->status = nlmsvc_testlock(rqstp, file, host, &argp->lock,
+ -				       &resp->lock);
+ +	resp->status = nlmsvc_testlock(rqstp, file, host, &argp->lock, &resp->lock, &resp->cookie);
+  	if (resp->status == nlm_drop_reply)
+  		rc = rpc_drop_reply;
+  	else
+diff --cc fs/lockd/svclock.c
+index 890cdd47eaa5,6bce19fd024c..000000000000
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@@ -591,7 -632,14 +591,18 @@@ nlmsvc_testlock(struct svc_rqst *rqstp
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	error = vfs_test_lock(file->f_file, &lock->fl);
+++=======
++ 	mode = lock_to_openmode(&lock->fl);
++ 	locks_init_lock(&conflock->fl);
++ 	/* vfs_test_lock only uses start, end, and owner, but tests flc_file */
++ 	conflock->fl.c.flc_file = lock->fl.c.flc_file;
++ 	conflock->fl.fl_start = lock->fl.fl_start;
++ 	conflock->fl.fl_end = lock->fl.fl_end;
++ 	conflock->fl.c.flc_owner = lock->fl.c.flc_owner;
++ 	error = vfs_test_lock(file->f_file[mode], &conflock->fl);
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  	if (error) {
+  		/* We can't currently deal with deferred test requests */
+  		if (error == FILE_LOCK_DEFERRED)
+@@@ -601,22 -649,19 +612,36 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (lock->fl.fl_type == F_UNLCK) {
+++=======
++ 	if (conflock->fl.c.flc_type == F_UNLCK) {
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  		ret = nlm_granted;
+  		goto out;
+  	}
+  
+  	dprintk("lockd: conflicting lock(ty=%d, %Ld-%Ld)\n",
+++<<<<<<< HEAD
+ +		lock->fl.fl_type, (long long)lock->fl.fl_start,
+ +		(long long)lock->fl.fl_end);
+ +	conflock->caller = "somehost";	/* FIXME */
+ +	conflock->len = strlen(conflock->caller);
+ +	conflock->oh.len = 0;		/* don't return OH info */
+ +	conflock->svid = lock->fl.fl_pid;
+ +	conflock->fl.fl_type = lock->fl.fl_type;
+ +	conflock->fl.fl_start = lock->fl.fl_start;
+ +	conflock->fl.fl_end = lock->fl.fl_end;
+ +	locks_release_private(&lock->fl);
+++=======
++ 		conflock->fl.c.flc_type, (long long)conflock->fl.fl_start,
++ 		(long long)conflock->fl.fl_end);
++ 	conflock->caller = "somehost";	/* FIXME */
++ 	conflock->len = strlen(conflock->caller);
++ 	conflock->oh.len = 0;		/* don't return OH info */
++ 	conflock->svid = conflock->fl.c.flc_pid;
++ 	locks_release_private(&conflock->fl);
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  
+  	ret = nlm_lck_denied;
+  out:
+diff --cc fs/lockd/svcproc.c
+index f5451481018f,5817ef272332..000000000000
+--- a/fs/lockd/svcproc.c
++++ b/fs/lockd/svcproc.c
+@@@ -124,10 -126,9 +123,13 @@@ __nlmsvc_proc_test(struct svc_rqst *rqs
+  	if ((resp->status = nlmsvc_retrieve_args(rqstp, argp, &host, &file)))
+  		return resp->status == nlm_drop_reply ? rpc_drop_reply :rpc_success;
+  
+++<<<<<<< HEAD
+ +	test_owner = argp->lock.fl.fl_owner;
+ +
+++=======
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  	/* Now check for conflicting locks */
+ -	resp->status = cast_status(nlmsvc_testlock(rqstp, file, host,
+ -						   &argp->lock, &resp->lock));
+ +	resp->status = cast_status(nlmsvc_testlock(rqstp, file, host, &argp->lock, &resp->lock, &resp->cookie));
+  	if (resp->status == nlm_drop_reply)
+  		rc = rpc_drop_reply;
+  	else
+diff --cc fs/locks.c
+index 607ee3dc301f,bf5e0d05a026..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -2066,6 -2199,8 +2073,11 @@@ SYSCALL_DEFINE2(flock, unsigned int, fd
+   */
+  int vfs_test_lock(struct file *filp, struct file_lock *fl)
+  {
+++<<<<<<< HEAD
+++=======
++ 	WARN_ON_ONCE(fl->fl_ops || fl->fl_lmops);
++ 	WARN_ON_ONCE(filp != fl->c.flc_file);
+++>>>>>>> a49a2a1baa0c (lockd: fix vfs_test_lock() calls)
+  	if (filp->f_op->lock)
+  		return filp->f_op->lock(filp, F_GETLK, fl);
+  	posix_test_lock(filp, fl);
+* Unmerged path fs/lockd/svc4proc.c
+* Unmerged path fs/lockd/svclock.c
+* Unmerged path fs/lockd/svcproc.c
+* Unmerged path fs/locks.c
