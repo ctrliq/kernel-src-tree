@@ -2932,7 +2932,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 
 	err = security_bpf_prog_load(prog, attr, token);
 	if (err)
-		goto free_prog_sec;
+		goto free_prog;
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
@@ -2978,8 +2978,6 @@ free_used_maps:
 	__bpf_prog_put_noref(prog, prog->aux->real_func_cnt);
 	return err;
 
-free_prog_sec:
-	security_bpf_prog_free(prog);
 free_prog:
 	free_uid(prog->aux->user);
 	if (prog->aux->attach_btf)
@@ -4654,10 +4652,11 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	u32 info_len = attr->info.info_len;
 	struct bpf_prog_kstats stats;
 	char __user *uinsns;
-	u32 ulen;
+	u32 ulen, len;
 	int err;
 
-	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
+	len = offsetofend(struct bpf_prog_info, attach_btf_id);
+	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), len, info_len);
 	if (err)
 		return err;
 	info_len = min_t(u32, sizeof(info), info_len);
