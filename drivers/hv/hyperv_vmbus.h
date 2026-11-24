@@ -332,6 +332,8 @@ extern const struct vmbus_channel_message_table_entry
 
 /* General vmbus interface */
 
+bool vmbus_is_confidential(void);
+
 struct hv_device *vmbus_device_create(const guid_t *type,
 				      const guid_t *instance,
 				      struct vmbus_channel *channel);
@@ -379,7 +381,6 @@ void hv_fcopy_deinit(void);
 int hv_fcopy_pre_suspend(void);
 int hv_fcopy_pre_resume(void);
 void hv_fcopy_onchannelcallback(void *context);
-void vmbus_initiate_unload(bool crash);
 
 static inline void hv_poll_channel(struct vmbus_channel *channel,
 				   void (*cb)(void *))
