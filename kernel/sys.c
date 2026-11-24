@@ -2346,6 +2346,22 @@ int __weak arch_lock_shadow_stack_status(struct task_struct *t, unsigned long st
 	return -EINVAL;
 }
 
+int __weak arch_prctl_get_branch_landing_pad_state(struct task_struct *t,
+						   unsigned long __user *state)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_set_branch_landing_pad_state(struct task_struct *t, unsigned long state)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_lock_branch_landing_pad_state(struct task_struct *t)
+{
+	return -EINVAL;
+}
+
 #define PR_IO_FLUSHER (PF_MEMALLOC_NOIO | PF_LOCAL_THROTTLE)
 
 static int prctl_set_vma(unsigned long opt, unsigned long addr,
@@ -2815,6 +2831,24 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		break;
 	case PR_FUTEX_HASH:
 		error = futex_hash_prctl(arg2, arg3, arg4);
+		break;
+	case PR_GET_CFI:
+		if (arg2 != PR_CFI_BRANCH_LANDING_PADS)
+			return -EINVAL;
+		if (arg4 || arg5)
+			return -EINVAL;
+		error = arch_prctl_get_branch_landing_pad_state(me, (unsigned long __user *)arg3);
+		break;
+	case PR_SET_CFI:
+		if (arg2 != PR_CFI_BRANCH_LANDING_PADS)
+			return -EINVAL;
+		if (arg4 || arg5)
+			return -EINVAL;
+		error = arch_prctl_set_branch_landing_pad_state(me, arg3);
+		if (error)
+			break;
+		if (arg3 & PR_CFI_LOCK && !(arg3 & PR_CFI_DISABLE))
+			error = arch_prctl_lock_branch_landing_pad_state(me);
 		break;
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
