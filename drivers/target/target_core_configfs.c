@@ -108,8 +108,8 @@ static ssize_t target_core_item_dbroot_store(struct config_item *item,
 					const char *page, size_t count)
 {
 	ssize_t read_bytes;
-	struct file *fp;
 	ssize_t r = -EINVAL;
+	struct path path = {};
 
 	mutex_lock(&target_devices_lock);
 	if (target_devices) {
@@ -131,17 +131,14 @@ static ssize_t target_core_item_dbroot_store(struct config_item *item,
 		db_root_stage[read_bytes - 1] = '\0';
 
 	/* validate new db root before accepting it */
-	fp = filp_open(db_root_stage, O_RDONLY, 0);
-	if (IS_ERR(fp)) {
+	r = kern_path(db_root_stage, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+	if (r) {
 		pr_err("db_root: cannot open: %s\n", db_root_stage);
+		if (r == -ENOTDIR)
+			pr_err("db_root: not a directory: %s\n", db_root_stage);
 		goto unlock;
 	}
-	if (!S_ISDIR(file_inode(fp)->i_mode)) {
-		filp_close(fp, NULL);
-		pr_err("db_root: not a directory: %s\n", db_root_stage);
-		goto unlock;
-	}
-	filp_close(fp, NULL);
+	path_put(&path);
 
 	strscpy(db_root, db_root_stage);
 	pr_debug("Target_Core_ConfigFS: db_root set to %s\n", db_root);
@@ -2758,33 +2755,24 @@ static ssize_t target_lu_gp_lu_gp_id_store(struct config_item *item,
 static ssize_t target_lu_gp_members_show(struct config_item *item, char *page)
 {
 	struct t10_alua_lu_gp *lu_gp = to_lu_gp(item);
-	struct se_device *dev;
-	struct se_hba *hba;
 	struct t10_alua_lu_gp_member *lu_gp_mem;
-	ssize_t len = 0, cur_len;
-	unsigned char buf[LU_GROUP_NAME_BUF] = { };
+	const char *const end = page + PAGE_SIZE;
+	char *cur = page;
 
 	spin_lock(&lu_gp->lu_gp_lock);
 	list_for_each_entry(lu_gp_mem, &lu_gp->lu_gp_mem_list, lu_gp_mem_list) {
-		dev = lu_gp_mem->lu_gp_mem_dev;
-		hba = dev->se_hba;
+		struct se_device *dev = lu_gp_mem->lu_gp_mem_dev;
+		struct se_hba *hba = dev->se_hba;
 
-		cur_len = snprintf(buf, LU_GROUP_NAME_BUF, "%s/%s\n",
+		cur += scnprintf(cur, end - cur, "%s/%s\n",
 			config_item_name(&hba->hba_group.cg_item),
 			config_item_name(&dev->dev_group.cg_item));
-		cur_len++; /* Extra byte for NULL terminator */
-
-		if ((cur_len + len) > PAGE_SIZE) {
-			pr_warn("Ran out of lu_gp_show_attr"
-				"_members buffer\n");
+		if (WARN_ON_ONCE(cur >= end))
 			break;
-		}
-		memcpy(page+len, buf, cur_len);
-		len += cur_len;
 	}
 	spin_unlock(&lu_gp->lu_gp_lock);
 
-	return len;
+	return cur - page;
 }
 
 CONFIGFS_ATTR(target_lu_gp_, lu_gp_id);
