@@ -1660,9 +1660,13 @@ update_stats_dequeue_dl(struct dl_rq *dl_rq, struct sched_dl_entity *dl_se,
 			int flags)
 {
 	struct task_struct *p = dl_task_of(dl_se);
+	struct rq *rq = rq_of_dl_rq(dl_rq);
 
 	if (!schedstat_enabled())
 		return;
+
+	if (p != rq->curr)
+		update_stats_wait_end_dl(dl_rq, dl_se);
 
 	if ((flags & DEQUEUE_SLEEP)) {
 		unsigned int state;
@@ -1790,7 +1794,10 @@ static void dequeue_dl_entity(struct sched_dl_entity *dl_se, int flags)
 
 static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
-	if (is_dl_boosted(&p->dl)) {
+	struct sched_dl_entity *dl_se = &p->dl;
+	struct dl_rq *dl_rq = &rq->dl;
+
+	if (is_dl_boosted(dl_se)) {
 		/*
 		 * Because of delays in the detection of the overrun of a
 		 * thread's runtime, it might be the case that a thread
@@ -1803,14 +1810,14 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 		 *
 		 * In this case, the boost overrides the throttle.
 		 */
-		if (p->dl.dl_throttled) {
+		if (dl_se->dl_throttled) {
 			/*
 			 * The replenish timer needs to be canceled. No
 			 * problem if it fires concurrently: boosted threads
 			 * are ignored in dl_task_timer().
 			 */
-			cancel_replenish_timer(&p->dl);
-			p->dl.dl_throttled = 0;
+			cancel_replenish_timer(dl_se);
+			dl_se->dl_throttled = 0;
 		}
 	} else if (!dl_prio(p->normal_prio)) {
 		/*
@@ -1822,7 +1829,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 		 * being boosted again with no means to replenish the runtime and clear
 		 * the throttle.
 		 */
-		p->dl.dl_throttled = 0;
+		dl_se->dl_throttled = 0;
 		if (!(flags & ENQUEUE_REPLENISH))
 			printk_deferred_once("sched: DL de-boosted task PID %d: REPLENISH flag missing\n",
 					     task_pid_nr(p));
@@ -1831,17 +1838,17 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	check_schedstat_required();
-	update_stats_wait_start_dl(dl_rq_of_se(&p->dl), &p->dl);
+	update_stats_wait_start_dl(dl_rq, dl_se);
 
-	if (p->on_rq == TASK_ON_RQ_MIGRATING)
+	if (task_on_rq_migrating(p))
 		flags |= ENQUEUE_MIGRATING;
 
-	enqueue_dl_entity(&p->dl, flags);
+	enqueue_dl_entity(dl_se, flags);
 
-	if (dl_server(&p->dl))
+	if (dl_server(dl_se))
 		return;
 
-	if (!task_current(rq, p) && !p->dl.dl_throttled && p->nr_cpus_allowed > 1)
+	if (!task_current(rq, p) && !dl_se->dl_throttled && p->nr_cpus_allowed > 1)
 		enqueue_pushable_dl_task(rq, p);
 }
 
@@ -1849,7 +1856,7 @@ static void dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	update_curr_dl(rq);
 
-	if (p->on_rq == TASK_ON_RQ_MIGRATING)
+	if (task_on_rq_migrating(p))
 		flags |= DEQUEUE_MIGRATING;
 
 	dequeue_dl_entity(&p->dl, flags);
@@ -2134,13 +2141,13 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
 	struct sched_dl_entity *dl_se = &p->dl;
 	struct dl_rq *dl_rq = &rq->dl;
 
-	if (on_dl_rq(&p->dl))
+	if (on_dl_rq(dl_se))
 		update_stats_wait_start_dl(dl_rq, dl_se);
 
 	update_curr_dl(rq);
 
 	update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 1);
-	if (on_dl_rq(&p->dl) && p->nr_cpus_allowed > 1)
+	if (on_dl_rq(dl_se) && p->nr_cpus_allowed > 1)
 		enqueue_pushable_dl_task(rq, p);
 }
 
@@ -3044,13 +3051,26 @@ void __setparam_dl(struct task_struct *p, const struct sched_attr *attr)
 	dl_se->dl_density = to_ratio(dl_se->dl_deadline, dl_se->dl_runtime);
 }
 
-void __getparam_dl(struct task_struct *p, struct sched_attr *attr)
+void __getparam_dl(struct task_struct *p, struct sched_attr *attr, unsigned int flags)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
+	struct rq *rq = task_rq(p);
+	u64 adj_deadline;
 
 	attr->sched_priority = p->rt_priority;
-	attr->sched_runtime = dl_se->dl_runtime;
-	attr->sched_deadline = dl_se->dl_deadline;
+	if (flags & SCHED_GETATTR_FLAG_DL_DYNAMIC) {
+		guard(raw_spinlock_irq)(&rq->__lock);
+		update_rq_clock(rq);
+		if (task_current(rq, p))
+			update_curr_dl(rq);
+
+		attr->sched_runtime = dl_se->runtime;
+		adj_deadline = dl_se->deadline - rq_clock(rq) + ktime_get_ns();
+		attr->sched_deadline = adj_deadline;
+	} else {
+		attr->sched_runtime = dl_se->dl_runtime;
+		attr->sched_deadline = dl_se->dl_deadline;
+	}
 	attr->sched_period = dl_se->dl_period;
 	attr->sched_flags &= ~SCHED_DL_FLAGS;
 	attr->sched_flags |= dl_se->flags;

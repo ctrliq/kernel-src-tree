@@ -161,8 +161,26 @@
 	| MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE_BITMASK		\
 	| MEMBARRIER_PRIVATE_EXPEDITED_RSEQ_BITMASK)
 
+/*
+ * Scoped guard for memory barriers on entry and exit.
+ * Matches memory barriers before & after rq->curr modification in scheduler.
+ */
+DEFINE_LOCK_GUARD_0(mb, smp_mb(), smp_mb())
 static DEFINE_MUTEX(membarrier_ipi_mutex);
+static DEFINE_PER_CPU(struct mutex, membarrier_cpu_mutexes);
+
 #define SERIALIZE_IPI() guard(mutex)(&membarrier_ipi_mutex)
+#define SERIALIZE_IPI_CPU(cpu_id) guard(mutex)(&per_cpu(membarrier_cpu_mutexes, cpu_id))
+
+static int __init membarrier_init(void)
+{
+	int i;
+
+	for_each_possible_cpu(i)
+		mutex_init(&per_cpu(membarrier_cpu_mutexes, i));
+	return 0;
+}
+core_initcall(membarrier_init);
 
 static void ipi_mb(void *info)
 {
@@ -246,23 +264,19 @@ void membarrier_update_current_mm(struct mm_struct *next_mm)
 
 static int membarrier_global_expedited(void)
 {
+	cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
 	int cpu;
-	cpumask_var_t tmpmask;
 
 	if (num_online_cpus() == 1)
 		return 0;
 
-	/*
-	 * Matches memory barriers around rq->curr modification in
-	 * scheduler.
-	 */
-	smp_mb();	/* system call entry is not a mb. */
-
 	if (!zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
 		return -ENOMEM;
 
+	guard(mb)();
 	SERIALIZE_IPI();
-	cpus_read_lock();
+	guard(cpus_read_lock)();
+
 	rcu_read_lock();
 	for_each_online_cpu(cpu) {
 		struct task_struct *p;
@@ -298,21 +312,11 @@ static int membarrier_global_expedited(void)
 	smp_call_function_many(tmpmask, ipi_mb, NULL, 1);
 	preempt_enable();
 
-	free_cpumask_var(tmpmask);
-	cpus_read_unlock();
-
-	/*
-	 * Memory barrier on the caller thread _after_ we finished
-	 * waiting for the last IPI. Matches memory barriers around
-	 * rq->curr modification in scheduler.
-	 */
-	smp_mb();	/* exit from system call is not a mb */
 	return 0;
 }
 
 static int membarrier_private_expedited(int flags, int cpu_id)
 {
-	cpumask_var_t tmpmask;
 	struct mm_struct *mm = current->mm;
 	smp_call_func_t ipi_func = ipi_mb;
 
@@ -342,31 +346,46 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 		return 0;
 
 	/*
-	 * Matches memory barriers around rq->curr modification in
+	 * Matches memory barriers after rq->curr modification in
 	 * scheduler.
+	 *
+	 * Memory barrier on the caller thread _after_ we finished
+	 * waiting for the last IPI. Matches memory barriers before
+	 * rq->curr modification in scheduler.
 	 */
-	smp_mb();	/* system call entry is not a mb. */
-
-	if (cpu_id < 0 && !zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
-		return -ENOMEM;
-
-	SERIALIZE_IPI();
-	cpus_read_lock();
-
+	guard(mb)();
 	if (cpu_id >= 0) {
+		if (cpu_id >= nr_cpu_ids || !cpu_possible(cpu_id))
+			return 0;
+
+		SERIALIZE_IPI_CPU(cpu_id);
+		guard(cpus_read_lock)();
 		struct task_struct *p;
 
-		if (cpu_id >= nr_cpu_ids || !cpu_online(cpu_id))
-			goto out;
+		if (!cpu_online(cpu_id))
+			return 0;
+
 		rcu_read_lock();
 		p = rcu_dereference(cpu_rq(cpu_id)->curr);
 		if (!p || p->mm != mm) {
 			rcu_read_unlock();
-			goto out;
+			return 0;
 		}
 		rcu_read_unlock();
+		/*
+		 * smp_call_function_single() will call ipi_func() if cpu_id
+		 * is the calling CPU.
+		 */
+		smp_call_function_single(cpu_id, ipi_func, NULL, 1);
 	} else {
+		cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
 		int cpu;
+
+		if (!zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
+			return -ENOMEM;
+
+		SERIALIZE_IPI();
+		guard(cpus_read_lock)();
 
 		rcu_read_lock();
 		for_each_online_cpu(cpu) {
@@ -377,15 +396,6 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 				__cpumask_set_cpu(cpu, tmpmask);
 		}
 		rcu_read_unlock();
-	}
-
-	if (cpu_id >= 0) {
-		/*
-		 * smp_call_function_single() will call ipi_func() if cpu_id
-		 * is the calling CPU.
-		 */
-		smp_call_function_single(cpu_id, ipi_func, NULL, 1);
-	} else {
 		/*
 		 * For regular membarrier, we can save a few cycles by
 		 * skipping the current cpu -- we're about to do smp_mb()
@@ -411,18 +421,6 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 			on_each_cpu_mask(tmpmask, ipi_func, NULL, true);
 		}
 	}
-
-out:
-	if (cpu_id < 0)
-		free_cpumask_var(tmpmask);
-	cpus_read_unlock();
-
-	/*
-	 * Memory barrier on the caller thread _after_ we finished
-	 * waiting for the last IPI. Matches memory barriers around
-	 * rq->curr modification in scheduler.
-	 */
-	smp_mb();	/* exit from system call is not a mb */
 
 	return 0;
 }
