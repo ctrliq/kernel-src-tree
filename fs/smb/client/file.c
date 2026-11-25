@@ -672,9 +672,15 @@ static int cifs_do_truncate(const unsigned int xid, struct dentry *dentry)
 	struct cifs_tcon *tcon;
 	int rc;
 
+	inode_lock(inode);
+
+	filemap_invalidate_lock(inode->i_mapping);
+
 	rc = filemap_write_and_wait(inode->i_mapping);
-	if (is_interrupt_error(rc))
+	if (is_interrupt_error(rc)) {
 		return -ERESTARTSYS;
+		goto out;
+	}
 	mapping_set_error(inode->i_mapping, rc);
 
 	cfile = find_writable_file(cinode, FIND_FSUID_ONLY);
@@ -685,13 +691,25 @@ static int cifs_do_truncate(const unsigned int xid, struct dentry *dentry)
 			server = tcon->ses->server;
 			rc = server->ops->set_file_size(xid, tcon,
 							cfile, 0, false);
-		}
-		if (!rc) {
-			netfs_resize_file(&cinode->netfs, 0);
-			cifs_setsize(inode, 0);
+			if (!rc) {
+				netfs_resize_file(&cinode->netfs, 0);
+				cifs_setsize(inode, 0);
+				cifs_invalidate_cache(inode, 0);
+			}
+		} else {
+			/*
+			 * No cached handle; evict stale pages so they can't
+			 * be served after the file is later extended; let
+			 * the server's O_TRUNC open response set the i_size
+			 */
+			truncate_inode_pages(inode->i_mapping, 0);
 			cifs_invalidate_cache(inode, 0);
 		}
 	}
+
+out:
+	filemap_invalidate_unlock(inode->i_mapping);
+	inode_unlock(inode);
 	if (cfile)
 		cifsFileInfo_put(cfile);
 	return rc;
@@ -2431,7 +2449,7 @@ int __cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
 	}
 
 	if (test_bit(CIFS_INO_TMPFILE, &cifs_inode->flags))
-		find_flags = FIND_ANY;
+		find_flags &= FIND_NO_DIRECT;
 
 	cifs_sb = CIFS_SB(cifs_inode);
 
@@ -2460,6 +2478,9 @@ refind_writable:
 		if ((find_flags & FIND_OPEN_FLAGS) &&
 		    !open_flags_match(cifs_inode, open_flags,
 				      open_file->f_flags))
+			continue;
+		if ((find_flags & FIND_NO_DIRECT) &&
+		    (open_file->f_flags & O_DIRECT))
 			continue;
 		if (OPEN_FMODE(open_file->f_flags) & FMODE_WRITE) {
 			if (!open_file->invalidHandle) {
@@ -2661,7 +2682,11 @@ cifs_writev_requeue(struct cifs_writedata *wdata)
 		wdata2->tailsz = tailsz;
 		wdata2->bytes = cur_len;
 
-		rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY, &wdata2->cfile);
+		rc = cifs_get_writable_file(CIFS_I(inode), FIND_NO_DIRECT,
+					    &wdata2->cfile);
+		if (rc)
+			rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY,
+						    &wdata2->cfile);
 		if (!wdata2->cfile) {
 			cifs_dbg(VFS, "No writable handle to retry writepages rc=%d\n",
 				 rc);
@@ -2960,13 +2985,18 @@ static int
 wdata_send_pages(struct cifs_writedata *wdata, unsigned int nr_pages,
 		 struct address_space *mapping, struct writeback_control *wbc)
 {
+	loff_t i_size = i_size_read(mapping->host);
 	int rc;
 
 	wdata->sync_mode = wbc->sync_mode;
 	wdata->nr_pages = nr_pages;
 	wdata->offset = page_offset(wdata->pages[0]);
 	wdata->pagesz = PAGE_SIZE;
-	wdata->tailsz = min(i_size_read(mapping->host) -
+
+	if (unlikely(i_size <= page_offset(wdata->pages[nr_pages - 1])))
+		return -EAGAIN;
+
+	wdata->tailsz = min(i_size -
 			page_offset(wdata->pages[nr_pages - 1]),
 			(loff_t)PAGE_SIZE);
 	wdata->bytes = ((nr_pages - 1) * PAGE_SIZE) + wdata->tailsz;
@@ -3046,7 +3076,11 @@ retry:
 		if (cfile)
 			cifsFileInfo_put(cfile);
 
-		rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY, &cfile);
+		rc = cifs_get_writable_file(CIFS_I(inode), FIND_NO_DIRECT,
+					    &cfile);
+		if (rc)
+			rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY,
+						    &cfile);
 
 		/* in case of an error store it to return later */
 		if (rc)
@@ -3356,13 +3390,44 @@ fsync_exit:
  * As file closes, flush all cached write data for this inode checking
  * for write behind errors.
  */
+struct cifs_flush_work {
+	struct work_struct	work;
+	struct inode		*inode;
+	int			rc;
+};
+
+static void cifs_flush_worker(struct work_struct *work)
+{
+	struct cifs_flush_work *fw = container_of(work, struct cifs_flush_work,
+						  work);
+
+	fw->rc = filemap_write_and_wait(fw->inode->i_mapping);
+}
+
+static int cifs_flush_inode(struct inode *inode)
+{
+	struct cifs_flush_work fw = { .inode = inode };
+	int rc = 0;
+
+	if (!fatal_signal_pending(current))
+		rc = filemap_write_and_wait(inode->i_mapping);
+	if (!fatal_signal_pending(current))
+		return rc;
+
+	INIT_WORK_ONSTACK(&fw.work, cifs_flush_worker);
+	queue_work(cifs_writeback_wq, &fw.work);
+	flush_work(&fw.work);
+	destroy_work_on_stack(&fw.work);
+	return fw.rc;
+}
+
 int cifs_flush(struct file *file, fl_owner_t id)
 {
 	struct inode *inode = file_inode(file);
 	int rc = 0;
 
 	if (file->f_mode & FMODE_WRITE)
-		rc = filemap_write_and_wait(inode->i_mapping);
+		rc = cifs_flush_inode(inode);
 
 	cifs_dbg(FYI, "Flush inode %p file %p rc %d\n", inode, file, rc);
 	if (rc) {

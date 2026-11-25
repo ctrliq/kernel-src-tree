@@ -3061,6 +3061,23 @@ void cifs_setsize(struct inode *inode, loff_t offset)
 	truncate_pagecache(inode, offset);
 }
 
+void cifs_resize_file_locked(struct inode *inode, loff_t offset)
+{
+	struct fscache_cookie *cookie = cifs_inode_cookie(inode);
+
+	lockdep_assert_held_write(&inode->i_rwsem);
+
+	netfs_resize_file(netfs_inode(inode), offset);
+	cifs_setsize(inode, offset);
+
+	if (!cookie)
+		return;
+
+	fscache_use_cookie(cookie, true);
+	fscache_resize_cookie(cookie, offset);
+	cifs_fscache_unuse_inode_cookie(inode, true);
+ }
+
 int cifs_file_set_size(const unsigned int xid, struct dentry *dentry,
 		       const char *full_path, struct cifsFileInfo *open_file,
 		       loff_t size)
@@ -3125,10 +3142,8 @@ int cifs_file_set_size(const unsigned int xid, struct dentry *dentry,
 	cifs_put_tlink(tlink);
 
 set_size_out:
-	if (rc == 0) {
-		netfs_resize_file(&cifsInode->netfs, size);
-		cifs_setsize(inode, size);
-	}
+	if (rc == 0)
+		cifs_resize_file_locked(inode, size);
 
 	return rc;
 }
@@ -3292,13 +3307,6 @@ cifs_setattr_unix(struct dentry *direntry, struct iattr *attrs)
 
 	if (rc)
 		goto out;
-
-	if ((attrs->ia_valid & ATTR_SIZE) &&
-	    attrs->ia_size != i_size_read(inode)) {
-		truncate_setsize(inode, attrs->ia_size);
-		netfs_resize_file(&cifsInode->netfs, attrs->ia_size);
-		fscache_resize_cookie(cifs_inode_cookie(inode), attrs->ia_size);
-	}
 
 	setattr_copy(&nop_mnt_idmap, inode, attrs);
 	mark_inode_dirty(inode);
@@ -3519,13 +3527,6 @@ cifs_setattr_nounix(struct dentry *direntry, struct iattr *attrs)
 	   that */
 	if (rc)
 		goto cifs_setattr_exit;
-
-	if ((attrs->ia_valid & ATTR_SIZE) &&
-	    attrs->ia_size != i_size_read(inode)) {
-		truncate_setsize(inode, attrs->ia_size);
-		netfs_resize_file(&cifsInode->netfs, attrs->ia_size);
-		fscache_resize_cookie(cifs_inode_cookie(inode), attrs->ia_size);
-	}
 
 	setattr_copy(&nop_mnt_idmap, inode, attrs);
 	mark_inode_dirty(inode);

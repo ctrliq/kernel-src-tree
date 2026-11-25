@@ -9,7 +9,7 @@
 #include <linux/fs.h>
 #include <linux/stat.h>
 #include <linux/uidgid.h>
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 #include "fs_context.h"
 #include "cifsglob.h"
 #include "../common/smbfsctl.h"
