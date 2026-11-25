@@ -1,0 +1,395 @@
+name: Rebuild FF-Only Merge
+
+# Fast-forward-only merge for rockyX_Y history rebuild PRs.
+#
+# GitHub's merge button cannot do --ff-only merges, so approved rebuild PRs
+# (rockyX_Y <- rockyX_Y_rebuild) are normally merged manually:
+#
+#   git checkout rockyX_Y
+#   git merge --ff-only rockyX_Y_rebuild
+#   git push --follow-tags origin rockyX_Y
+#
+# This workflow performs that exact sequence, gated on 2 approvals, and
+# triggered by commenting /rebuild_merge on the PR (or via workflow_dispatch).
+# Modeled on lt-rebase-merge.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to merge'
+        required: true
+        type: number
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebuild-ff-merge:
+    # Only run on PRs when comment starts with /rebuild_merge, or when manually dispatched
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/rebuild_merge'))
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y git jq
+
+          # Install GitHub CLI
+          dnf install 'dnf-command(config-manager)' -y
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install gh -y
+
+      - name: Validate commenter has write access
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+
+          # Check if commenter has write or admin permission on the repository
+          PERMISSION=$(gh api "/repos/$REPOSITORY/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
+
+          echo "User $COMMENTER has permission level: $PERMISSION"
+
+          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "write" ]]; then
+            echo "✅ User $COMMENTER has sufficient permissions"
+          else
+            echo "❌ User $COMMENTER does not have write or admin access to $REPOSITORY"
+            echo "Only users with write or admin access can trigger rebuild_merge"
+            exit 1
+          fi
+
+      - name: Get PR details and verify approvals
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+
+          # Validate PR number is actually a number
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "❌ Security: Invalid PR number format: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate PR number is reasonable (1 to 7 digits)
+          if [ "$PR_NUMBER" -lt 1 ] || [ "$PR_NUMBER" -gt 9999999 ]; then
+            echo "❌ Security: PR number out of range: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate repository format (owner/repo)
+          if ! [[ "$REPOSITORY" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+            echo "❌ Security: Invalid repository format: $REPOSITORY"
+            exit 1
+          fi
+
+          # Validate repository name length
+          if [ ${#REPOSITORY} -gt 100 ]; then
+            echo "❌ Security: Repository name too long"
+            exit 1
+          fi
+
+          echo "✅ All input validation passed"
+
+          # Get PR details
+          PR_DATA=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json state,isDraft,headRefName,baseRefName,headRefOid,isCrossRepository,reviews)
+
+          # Extract branch names and PR head SHA
+          HEAD_BRANCH=$(echo "$PR_DATA" | jq -r '.headRefName')
+          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.baseRefName')
+          PR_HEAD_SHA=$(echo "$PR_DATA" | jq -r '.headRefOid')
+
+          # The PR must be open and not a draft
+          PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
+          if [ "$PR_STATE" != "OPEN" ]; then
+            echo "❌ PR #$PR_NUMBER is not open (state: $PR_STATE)"
+            exit 1
+          fi
+
+          PR_DRAFT=$(echo "$PR_DATA" | jq -r '.isDraft')
+          if [ "$PR_DRAFT" != "false" ]; then
+            echo "❌ PR #$PR_NUMBER is a draft"
+            exit 1
+          fi
+
+          # Both sides of the PR must live in this repository (no forks);
+          # the merge fetches and pushes branches that only exist here
+          if [ "$(echo "$PR_DATA" | jq -r '.isCrossRepository')" != "false" ]; then
+            echo "❌ PR #$PR_NUMBER must use branches of $REPOSITORY (cross-repository PRs are not supported)"
+            exit 1
+          fi
+
+          # Validate SHA format (SHA-1 or SHA-256 hex)
+          if ! [[ "$PR_HEAD_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "❌ Security: Invalid SHA format: $PR_HEAD_SHA"
+            exit 1
+          fi
+
+          # Validate branch names to prevent injection via GITHUB_ENV
+          BRANCH_REGEX='^[a-zA-Z0-9/_.{}-]+$'
+          MAX_BRANCH_LENGTH=255
+
+          for BR_VAR in HEAD_BRANCH BASE_BRANCH; do
+            BR_VALUE=${!BR_VAR}
+
+            if [ -z "$BR_VALUE" ]; then
+              echo "❌ $BR_VAR is empty, aborting."
+              exit 1
+            fi
+
+            if ! [[ "$BR_VALUE" =~ $BRANCH_REGEX ]]; then
+              echo "❌ Security: Invalid branch name in $BR_VAR: $BR_VALUE"
+              exit 1
+            fi
+
+            if [ ${#BR_VALUE} -gt $MAX_BRANCH_LENGTH ]; then
+              echo "❌ Security: Branch name in $BR_VAR too long (${#BR_VALUE} > $MAX_BRANCH_LENGTH)"
+              exit 1
+            fi
+          done
+
+          echo "✅ Branch name validation passed"
+
+          echo "HEAD_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
+          echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
+          echo "PR_HEAD_SHA=$PR_HEAD_SHA" >> $GITHUB_ENV
+
+          # Collect reviewers whose latest review decision is APPROVED.
+          # Comment-only reviews are not decisions: an approval stays valid
+          # if the reviewer later submits a COMMENTED review, matching how
+          # GitHub itself counts required approving reviews.
+          APPROVED_REVIEWERS=$(echo "$PR_DATA" | jq -r '[.reviews
+            | sort_by(.author.login, .submittedAt)
+            | group_by(.author.login)[]
+            | map(select(.state != "COMMENTED"))
+            | last
+            | select(.state == "APPROVED")
+            | .author.login
+          ] | .[]')
+
+          # Count only approvals from reviewers with write-equivalent access
+          # (admin/maintain/write), like GitHub's required-review policy;
+          # reviews from read-only or outside users do not satisfy the gate
+          APPROVALS=0
+          for reviewer in $APPROVED_REVIEWERS; do
+            PERMISSION=$(gh api "/repos/$REPOSITORY/collaborators/$reviewer/permission" --jq '.permission' 2>/dev/null || echo "none")
+
+            echo "Reviewer $reviewer has permission level: $PERMISSION"
+
+            if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+              APPROVALS=$((APPROVALS + 1))
+            fi
+          done
+
+          echo "PR #$PR_NUMBER has $APPROVALS approvals from reviewers with write access"
+
+          if [ "$APPROVALS" -lt 2 ]; then
+            echo "❌ PR requires at least 2 approvals from reviewers with write access to merge. Current approvals: $APPROVALS"
+            exit 1
+          fi
+
+          echo "✅ PR has sufficient approvals ($APPROVALS)"
+
+      - name: Validate PR branches
+        run: |
+          set -e
+
+          # Verify BASE_BRANCH matches the rockyX_Y convention
+          if ! echo "$BASE_BRANCH" | grep -qE '^rocky[0-9]+_[0-9]+$'; then
+            echo "❌ PR base branch '$BASE_BRANCH' does not match expected pattern 'rockyX_Y'"
+            exit 1
+          fi
+
+          # Verify HEAD_BRANCH is the rebuild branch of BASE_BRANCH
+          EXPECTED_HEAD="${BASE_BRANCH}_rebuild"
+          if [ "$HEAD_BRANCH" != "$EXPECTED_HEAD" ]; then
+            echo "❌ PR head branch '$HEAD_BRANCH' does not match expected '$EXPECTED_HEAD'"
+            exit 1
+          fi
+
+          echo "✅ PR branches are correct: $HEAD_BRANCH -> $BASE_BRANCH"
+
+      - name: Checkout kernel-src-tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ctrliq/kernel-src-tree
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup branch references and perform the ff-only merge
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+          cd kernel-src-tree
+
+          # Detach HEAD so fetching into a local branch named the same as
+          # the ref this workflow was dispatched from cannot be refused
+          # with "refusing to fetch into branch ... checked out"
+          git checkout --detach
+
+          # Get local references to the required branches
+          echo "Fetching required branches..."
+          for branch in "$BASE_BRANCH" "$HEAD_BRANCH"; do
+            if ! git fetch origin "$branch:$branch"; then
+              echo "❌ Failed to fetch branch: $branch"
+              exit 1
+            fi
+          done
+
+          echo "✅ Branch references set up"
+          echo "Branches:"
+          echo "  - Base: $BASE_BRANCH"
+          echo "  - Rebuild: $HEAD_BRANCH"
+
+          # Perform the same sequence as the manual merge process:
+          #   git checkout rockyX_Y
+          #   git merge --ff-only rockyX_Y_rebuild
+          #   git push --follow-tags origin rockyX_Y
+          echo "Performing fast-forward merge..."
+          git checkout "$BASE_BRANCH"
+          if ! git merge --ff-only "$HEAD_BRANCH"; then
+            echo "❌ Fast-forward merge failed: ${BASE_BRANCH} and ${HEAD_BRANCH} have diverged"
+            echo "The rebuild branch likely needs to be regenerated from the current ${BASE_BRANCH}."
+            exit 1
+          fi
+
+          # Verify we merged exactly the commit GitHub reports as the PR head.
+          # If the rebuild branch moved during this run, abort without pushing.
+          MERGED_SHA=$(git rev-parse "refs/heads/${BASE_BRANCH}")
+          if [ "$MERGED_SHA" != "$PR_HEAD_SHA" ]; then
+            echo "❌ Merged SHA $MERGED_SHA does not match PR head $PR_HEAD_SHA"
+            echo "The rebuild branch likely moved during this run. Nothing was pushed."
+            exit 1
+          fi
+
+          echo "✅ Fast-forward merge completed: $BASE_BRANCH is now at $MERGED_SHA"
+
+          # Re-validate the PR immediately before pushing. The initial
+          # validation ran before the checkout/fetch, which takes ~10 minutes
+          # on kernel branches; the PR must still be open, non-draft, have
+          # 2 approvals, and point at the same head we just merged.
+          echo "Re-validating PR #$PR_NUMBER before push..."
+          PR_RECHECK=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+            --json state,isDraft,headRefName,baseRefName,headRefOid,reviews)
+
+          if [ "$(echo "$PR_RECHECK" | jq -r '.state')" != "OPEN" ]; then
+            echo "❌ PR #$PR_NUMBER is no longer open (state: $(echo "$PR_RECHECK" | jq -r '.state'))"
+            echo "Nothing was pushed."
+            exit 1
+          fi
+
+          if [ "$(echo "$PR_RECHECK" | jq -r '.isDraft')" != "false" ]; then
+            echo "❌ PR #$PR_NUMBER was converted to a draft. Nothing was pushed."
+            exit 1
+          fi
+
+          if [ "$(echo "$PR_RECHECK" | jq -r '.headRefOid')" != "$PR_HEAD_SHA" ]; then
+            echo "❌ PR #$PR_NUMBER head changed during this run. Nothing was pushed."
+            exit 1
+          fi
+
+          if [ "$(echo "$PR_RECHECK" | jq -r '.headRefName')" != "$HEAD_BRANCH" ] || \
+             [ "$(echo "$PR_RECHECK" | jq -r '.baseRefName')" != "$BASE_BRANCH" ]; then
+            echo "❌ PR #$PR_NUMBER branches changed during this run. Nothing was pushed."
+            exit 1
+          fi
+
+          # Collect approved reviewers from the fresh query and re-check
+          # their current permissions, to catch access revocations that
+          # happened while the checkout/fetch was running
+          RECHECK_REVIEWERS=$(echo "$PR_RECHECK" | jq -r '[.reviews
+            | sort_by(.author.login, .submittedAt)
+            | group_by(.author.login)[]
+            | map(select(.state != "COMMENTED"))
+            | last
+            | select(.state == "APPROVED")
+            | .author.login
+          ] | .[]')
+
+          RECHECK_APPROVALS=0
+          for reviewer in $RECHECK_REVIEWERS; do
+            PERMISSION=$(gh api "/repos/$REPOSITORY/collaborators/$reviewer/permission" --jq '.permission' 2>/dev/null || echo "none")
+
+            echo "Reviewer $reviewer has permission level: $PERMISSION"
+
+            if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+              RECHECK_APPROVALS=$((RECHECK_APPROVALS + 1))
+            fi
+          done
+
+          if [ "$RECHECK_APPROVALS" -lt 2 ]; then
+            echo "❌ PR #$PR_NUMBER approvals dropped below 2 (now $RECHECK_APPROVALS). Nothing was pushed."
+            exit 1
+          fi
+
+          echo "✅ PR re-validation passed ($RECHECK_APPROVALS approvals)"
+
+          echo "Pushing ${BASE_BRANCH} to origin..."
+          if ! git push --follow-tags origin "$BASE_BRANCH"; then
+            echo "❌ Failed to push ${BASE_BRANCH} to origin"
+            exit 1
+          fi
+
+          echo "✅ Pushed ${BASE_BRANCH} to origin"
+
+      - name: Comment on PR with result
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ -z "${BASE_BRANCH:-}" ]; then
+            EMOJI="❌"
+            TITLE="Rebuild merge failed"
+            MESSAGE="Could not determine the rebuild branches, merge aborted. Please check the workflow run for details."
+          elif [ "$JOB_STATUS" == "success" ]; then
+            EMOJI="✅"
+            TITLE="Rebuild merge completed successfully"
+            MESSAGE="Successfully completed $BASE_BRANCH rebuild merge"
+          else
+            EMOJI="❌"
+            TITLE="Rebuild merge failed"
+            MESSAGE="Failed to complete $BASE_BRANCH rebuild merge. Please check the workflow run for details."
+          fi
+
+          if gh pr comment "$PR_NUMBER" \
+            --body "$EMOJI **$TITLE**
+
+          $MESSAGE
+
+          Workflow run: $RUN_URL" \
+            --repo "$REPOSITORY"; then
+            echo "✅ Successfully commented on PR #$PR_NUMBER"
+          else
+            echo "❌ Failed to comment on PR #$PR_NUMBER"
+            echo "Comment posting failure is non-fatal, but PR status may not be visible"
+          fi
