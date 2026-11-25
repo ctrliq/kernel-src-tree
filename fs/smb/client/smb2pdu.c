@@ -3339,6 +3339,7 @@ replay_again:
 #endif /* CIFS_DEBUG2 */
 
 	if (file_info) {
+		buf->contains_posix_file_info = false;
 		file_info->CreationTime = rsp->CreationTime;
 		file_info->LastAccessTime = rsp->LastAccessTime;
 		file_info->LastWriteTime = rsp->LastWriteTime;
