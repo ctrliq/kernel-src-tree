@@ -1,0 +1,252 @@
+smb: client: reject out-of-bounds DataOffset in CIFSSMBRead()
+
+jira KERNEL-1962
+cve CVE-2026-97563
+Rebuild_History Non-Buildable kernel-5.14.0-741.27.1.el9_9
+commit-author Diego Oliva <diego@bynar.io>
+commit 5be5bdda5863eacc964b609ba927764f253431b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.27.1.el9_9/5be5bdda.failed
+
+The SMB1 synchronous read helper CIFSSMBRead() validates the server's
+DataLength against CIFSMaxBufSize and the caller's count, but never
+validates DataOffset. The copy source is formed as
+
+	&pSMBr->hdr.Protocol + le16_to_cpu(pSMBr->DataOffset)
+
+and memcpy()'d for DataLength bytes with no check that the
+[DataOffset, DataOffset + DataLength) range lies within the response
+actually received from the server.
+
+A malicious or compromised SMB1 server can return a response carrying
+an in-range DataLength and a large DataOffset, driving the source
+pointer past the end of the response buffer. The memcpy() then copies
+adjacent kernel heap into the caller's read buffer (information
+disclosure), or reads unmapped memory and oopses (denial of service).
+SMB1 is not negotiated by default; reaching this code requires an
+explicit vers=1.0 mount.
+
+Both DataOffset and the received response length recorded in
+rsp_iov.iov_len are relative to the start of the SMB header, so reject
+the response unless DataOffset + DataLength fits within that length,
+using overflow-safe arithmetic, before forming the source pointer.
+The response length has been validated by the previous patch, so the
+DataOffset and DataLength fields can be read safely here.
+
+While here, make data_length unsigned. It holds a length derived from
+unsigned on-the-wire fields and is only ever compared against unsigned
+quantities; print it with %u accordingly, and add __func__ to the
+cifs_dbg() calls in this function.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Cc: stable@vger.kernel.org # 6.19.x
+Assisted-by: Bynario AI
+	Signed-off-by: Diego Oliva <diego@bynar.io>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit 5be5bdda5863eacc964b609ba927764f253431b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/cifssmb.c
+#	fs/smb/client/trace.h
+diff --cc fs/smb/client/cifssmb.c
+index 08859b5c61ea,f9aff0712794..000000000000
+--- a/fs/smb/client/cifssmb.c
++++ b/fs/smb/client/cifssmb.c
+@@@ -1667,13 -1737,21 +1668,27 @@@ CIFSSMBRead(const unsigned int xid, str
+  		/*check that DataLength would not go beyond end of SMB */
+  		if ((data_length > CIFSMaxBufSize)
+  				|| (data_length > count)) {
+++<<<<<<< HEAD
+ +			cifs_dbg(FYI, "bad length %d for count %d\n",
+ +				 data_length, count);
+ +			rc = -EIO;
+++=======
++ 			cifs_dbg(FYI, "%s: bad length %u for count %u\n",
++ 				 __func__, data_length, count);
++ 			rc = smb_EIO2(smb_eio_trace_read_overlarge,
++ 				      data_length, count);
+++>>>>>>> 5be5bdda5863 (smb: client: reject out-of-bounds DataOffset in CIFSSMBRead())
++ 			*nbytes = 0;
++ 		} else if (data_offset < sizeof(*pSMBr) ||
++ 			   (size_t)data_offset + data_length > rsp_iov.iov_len) {
++ 			/* check that the data lies within the received response */
++ 			cifs_dbg(FYI, "%s: bad data offset %u length %u for response of %zu\n",
++ 				 __func__, data_offset, data_length, rsp_iov.iov_len);
++ 			rc = smb_EIO2(smb_eio_trace_read_bad_offset,
++ 				      data_offset, data_length);
+  			*nbytes = 0;
+  		} else {
+- 			pReadData = (char *) (&pSMBr->hdr.Protocol) +
+- 					le16_to_cpu(pSMBr->DataOffset);
++ 			pReadData = (char *) (&pSMBr->hdr.Protocol) + data_offset;
+  /*			if (rc = copy_to_user(buf, pReadData, data_length)) {
+  				cifs_dbg(VFS, "Faulting on read rc = %d\n",rc);
+  				rc = -EFAULT;
+diff --cc fs/smb/client/trace.h
+index 67ae656e0390,b442cccd1530..000000000000
+--- a/fs/smb/client/trace.h
++++ b/fs/smb/client/trace.h
+@@@ -20,6 -20,155 +20,158 @@@
+  /*
+   * Specify enums for tracing information.
+   */
+++<<<<<<< HEAD
+++=======
++ #define smb_eio_traces \
++ 	EM(smb_eio_trace_compress_copy,			"compress_copy") \
++ 	EM(smb_eio_trace_copychunk_inv_rsp,		"copychunk_inv_rsp") \
++ 	EM(smb_eio_trace_copychunk_overcopy_b,		"copychunk_overcopy_b") \
++ 	EM(smb_eio_trace_copychunk_overcopy_c,		"copychunk_overcopy_c") \
++ 	EM(smb_eio_trace_create_rsp_too_small,		"create_rsp_too_small") \
++ 	EM(smb_eio_trace_dfsref_no_rsp,			"dfsref_no_rsp") \
++ 	EM(smb_eio_trace_ea_overrun,			"ea_overrun") \
++ 	EM(smb_eio_trace_extract_will_pin,		"extract_will_pin") \
++ 	EM(smb_eio_trace_forced_shutdown,		"forced_shutdown") \
++ 	EM(smb_eio_trace_getacl_bcc_too_small,		"getacl_bcc_too_small") \
++ 	EM(smb_eio_trace_getcifsacl_param_count,	"getcifsacl_param_count") \
++ 	EM(smb_eio_trace_getdfsrefer_bcc_too_small,	"getdfsrefer_bcc_too_small") \
++ 	EM(smb_eio_trace_getextattr_bcc_too_small,	"getextattr_bcc_too_small") \
++ 	EM(smb_eio_trace_getextattr_inv_size,		"getextattr_inv_size") \
++ 	EM(smb_eio_trace_getsrvinonum_bcc_too_small,	"getsrvinonum_bcc_too_small") \
++ 	EM(smb_eio_trace_getsrvinonum_size,		"getsrvinonum_size") \
++ 	EM(smb_eio_trace_ioctl_data_len,		"ioctl_data_len") \
++ 	EM(smb_eio_trace_ioctl_no_rsp,			"ioctl_no_rsp") \
++ 	EM(smb_eio_trace_ioctl_out_off,			"ioctl_out_off") \
++ 	EM(smb_eio_trace_lock_bcc_too_small,		"lock_bcc_too_small") \
++ 	EM(smb_eio_trace_lock_data_too_small,		"lock_data_too_small") \
++ 	EM(smb_eio_trace_malformed_ksid_key,		"malformed_ksid_key") \
++ 	EM(smb_eio_trace_malformed_sid_key,		"malformed_sid_key") \
++ 	EM(smb_eio_trace_mkdir_no_rsp,			"mkdir_no_rsp") \
++ 	EM(smb_eio_trace_neg_bad_rsplen,		"neg_bad_rsplen") \
++ 	EM(smb_eio_trace_neg_decode_token,		"neg_decode_token") \
++ 	EM(smb_eio_trace_neg_info_caps,			"neg_info_caps") \
++ 	EM(smb_eio_trace_neg_info_dialect,		"neg_info_dialect") \
++ 	EM(smb_eio_trace_neg_info_fail,			"neg_info_fail") \
++ 	EM(smb_eio_trace_neg_info_sec_mode,		"neg_info_sec_mode") \
++ 	EM(smb_eio_trace_neg_inval_dialect,		"neg_inval_dialect") \
++ 	EM(smb_eio_trace_neg_no_crypt_key,		"neg_no_crypt_key") \
++ 	EM(smb_eio_trace_neg_sec_blob_too_small,	"neg_sec_blob_too_small") \
++ 	EM(smb_eio_trace_neg_unreq_dialect,		"neg_unreq_dialect") \
++ 	EM(smb_eio_trace_no_auth_key,			"no_auth_key") \
++ 	EM(smb_eio_trace_no_lease_key,			"no_lease_key") \
++ 	EM(smb_eio_trace_not_netfs_writeback,		"not_netfs_writeback") \
++ 	EM(smb_eio_trace_null_pointers,			"null_pointers") \
++ 	EM(smb_eio_trace_oldqfsinfo_bcc_too_small,	"oldqfsinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_pend_del_fail,			"pend_del_fail") \
++ 	EM(smb_eio_trace_qalleas_bcc_too_small,		"qalleas_bcc_too_small") \
++ 	EM(smb_eio_trace_qalleas_ea_overlong,		"qalleas_ea_overlong") \
++ 	EM(smb_eio_trace_qalleas_overlong,		"qalleas_overlong") \
++ 	EM(smb_eio_trace_qfileinfo_bcc_too_small,	"qfileinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qfileinfo_invalid,		"qfileinfo_invalid") \
++ 	EM(smb_eio_trace_qfsattrinfo_bcc_too_small,	"qfsattrinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qfsdevinfo_bcc_too_small,	"qfsdevinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qfsinfo_bcc_too_small,		"qfsinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qfsposixinfo_bcc_too_small,	"qfsposixinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qfsunixinfo_bcc_too_small,	"qfsunixinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qpathinfo_bcc_too_small,	"qpathinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_qpathinfo_invalid,		"qpathinfo_invalid") \
++ 	EM(smb_eio_trace_qreparse_data_area,		"qreparse_data_area") \
++ 	EM(smb_eio_trace_qreparse_rep_datalen,		"qreparse_rep_datalen") \
++ 	EM(smb_eio_trace_qreparse_ret_datalen,		"qreparse_ret_datalen") \
++ 	EM(smb_eio_trace_qreparse_setup_count,		"qreparse_setup_count") \
++ 	EM(smb_eio_trace_qreparse_sizes_wrong,		"qreparse_sizes_wrong") \
++ 	EM(smb_eio_trace_qsym_bcc_too_small,		"qsym_bcc_too_small") \
++ 	EM(smb_eio_trace_read_bad_offset,		"read_bad_offset") \
++ 	EM(smb_eio_trace_read_mid_state_unknown,	"read_mid_state_unknown") \
++ 	EM(smb_eio_trace_read_overlarge,		"read_overlarge") \
++ 	EM(smb_eio_trace_read_rsp_malformed,		"read_rsp_malformed") \
++ 	EM(smb_eio_trace_read_rsp_short,		"read_rsp_short") \
++ 	EM(smb_eio_trace_read_too_far,			"read_too_far") \
++ 	EM(smb_eio_trace_reparse_data_len,		"reparse_data_len") \
++ 	EM(smb_eio_trace_reparse_native_len,		"reparse_native_len") \
++ 	EM(smb_eio_trace_reparse_native_nul,		"reparse_native_nul") \
++ 	EM(smb_eio_trace_reparse_native_sym_len,	"reparse_native_sym_len") \
++ 	EM(smb_eio_trace_reparse_nfs_dev,		"reparse_nfs_dev") \
++ 	EM(smb_eio_trace_reparse_nfs_nul,		"reparse_nfs_nul") \
++ 	EM(smb_eio_trace_reparse_nfs_sockfifo,		"reparse_nfs_sockfifo") \
++ 	EM(smb_eio_trace_reparse_nfs_symbuf,		"reparse_nfs_symbuf") \
++ 	EM(smb_eio_trace_reparse_nfs_too_short,		"reparse_nfs_too_short") \
++ 	EM(smb_eio_trace_reparse_overlong,		"reparse_overlong") \
++ 	EM(smb_eio_trace_reparse_rdlen,			"reparse_rdlen") \
++ 	EM(smb_eio_trace_reparse_wsl_nul,		"reparse_wsl_nul") \
++ 	EM(smb_eio_trace_reparse_wsl_symbuf,		"reparse_wsl_symbuf") \
++ 	EM(smb_eio_trace_reparse_wsl_ver,		"reparse_wsl_ver") \
++ 	EM(smb_eio_trace_rx_b_read_short,		"rx_b_read_short") \
++ 	EM(smb_eio_trace_rx_bad_datalen,		"rx_bad_datalen") \
++ 	EM(smb_eio_trace_rx_both_buf,			"rx_both_buf") \
++ 	EM(smb_eio_trace_rx_calc_len_too_big,		"rx_calc_len_too_big") \
++ 	EM(smb_eio_trace_rx_check_rsp,			"rx_check_rsp") \
++ 	EM(smb_eio_trace_rx_copy_to_iter,		"rx_copy_to_iter") \
++ 	EM(smb_eio_trace_rx_insuff_res,			"rx_insuff_res") \
++ 	EM(smb_eio_trace_rx_inv_bcc,			"rx_inv_bcc") \
++ 	EM(smb_eio_trace_rx_mid_unready,		"rx_mid_unready") \
++ 	EM(smb_eio_trace_rx_neg_sess_resp,		"rx_neg_sess_resp") \
++ 	EM(smb_eio_trace_rx_overlong,			"rx_overlong") \
++ 	EM(smb_eio_trace_rx_overpage,			"rx_overpage") \
++ 	EM(smb_eio_trace_rx_pos_sess_resp,		"rx_pos_sess_resp") \
++ 	EM(smb_eio_trace_rx_rfc1002_magic,		"rx_rfc1002_magic") \
++ 	EM(smb_eio_trace_rx_sync_mid_invalid,		"rx_sync_mid_invalid") \
++ 	EM(smb_eio_trace_rx_sync_mid_malformed,		"rx_sync_mid_malformed") \
++ 	EM(smb_eio_trace_rx_too_short,			"rx_too_short") \
++ 	EM(smb_eio_trace_rx_trans2_extract,		"rx_trans2_extract") \
++ 	EM(smb_eio_trace_rx_unknown_resp,		"rx_unknown_resp") \
++ 	EM(smb_eio_trace_rx_unspec_error,		"rx_unspec_error") \
++ 	EM(smb_eio_trace_sess_buf_off,			"sess_buf_off") \
++ 	EM(smb_eio_trace_sess_exiting,			"sess_exiting") \
++ 	EM(smb_eio_trace_sess_krb_wcc,			"sess_krb_wcc") \
++ 	EM(smb_eio_trace_sess_nl2_wcc,			"sess_nl2_wcc") \
++ 	EM(smb_eio_trace_sess_rawnl_auth_wcc,		"sess_rawnl_auth_wcc") \
++ 	EM(smb_eio_trace_sess_rawnl_neg_wcc,		"sess_rawnl_neg_wcc") \
++ 	EM(smb_eio_trace_short_symlink_write,		"short_symlink_write") \
++ 	EM(smb_eio_trace_sid_too_many_auth,		"sid_too_many_auth") \
++ 	EM(smb_eio_trace_sig_data_too_small,		"sig_data_too_small") \
++ 	EM(smb_eio_trace_sig_iter,			"sig_iter") \
++ 	EM(smb_eio_trace_smb1_received_error,		"smb1_received_error") \
++ 	EM(smb_eio_trace_smb2_received_error,		"smb2_received_error") \
++ 	EM(smb_eio_trace_sym_slash,			"sym_slash") \
++ 	EM(smb_eio_trace_sym_target_len,		"sym_target_len") \
++ 	EM(smb_eio_trace_symlink_file_size,		"symlink_file_size") \
++ 	EM(smb_eio_trace_tcon_bcc_too_small,		"tcon_bcc_too_small") \
++ 	EM(smb_eio_trace_tdis_in_reconnect,		"tdis_in_reconnect") \
++ 	EM(smb_eio_trace_tx_chained_async,		"tx_chained_async") \
++ 	EM(smb_eio_trace_tx_compress_failed,		"tx_compress_failed") \
++ 	EM(smb_eio_trace_tx_copy_iter_to_buf,		"tx_copy_iter_to_buf") \
++ 	EM(smb_eio_trace_tx_copy_to_buf,		"tx_copy_to_buf") \
++ 	EM(smb_eio_trace_tx_max_compound,		"tx_max_compound") \
++ 	EM(smb_eio_trace_tx_miscopy_to_buf,		"tx_miscopy_to_buf") \
++ 	EM(smb_eio_trace_tx_need_transform,		"tx_need_transform") \
++ 	EM(smb_eio_trace_tx_too_long,			"sr_too_long") \
++ 	EM(smb_eio_trace_unixqfileinfo_bcc_too_small,	"unixqfileinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_unixqpathinfo_bcc_too_small,	"unixqpathinfo_bcc_too_small") \
++ 	EM(smb_eio_trace_user_iter,			"user_iter") \
++ 	EM(smb_eio_trace_write_bad_buf_type,		"write_bad_buf_type") \
++ 	EM(smb_eio_trace_write_mid_state_unknown,	"write_mid_state_unknown") \
++ 	EM(smb_eio_trace_write_rsp_malformed,		"write_rsp_malformed") \
++ 	E_(smb_eio_trace_write_too_far,			"write_too_far")
++ 
++ #define smb3_rw_credits_traces \
++ 	EM(cifs_trace_rw_credits_call_readv_adjust,	"rd-call-adj") \
++ 	EM(cifs_trace_rw_credits_call_writev_adjust,	"wr-call-adj") \
++ 	EM(cifs_trace_rw_credits_free_subreq,		"free-subreq") \
++ 	EM(cifs_trace_rw_credits_issue_read_adjust,	"rd-issu-adj") \
++ 	EM(cifs_trace_rw_credits_issue_write_adjust,	"wr-issu-adj") \
++ 	EM(cifs_trace_rw_credits_no_adjust_up,		"no-adj-up  ") \
++ 	EM(cifs_trace_rw_credits_old_session,		"old-session") \
++ 	EM(cifs_trace_rw_credits_read_response_add,	"rd-resp-add") \
++ 	EM(cifs_trace_rw_credits_read_response_clear,	"rd-resp-clr") \
++ 	EM(cifs_trace_rw_credits_read_resubmit,		"rd-resubmit") \
++ 	EM(cifs_trace_rw_credits_read_submit,		"rd-submit  ") \
++ 	EM(cifs_trace_rw_credits_write_prepare,		"wr-prepare ") \
++ 	EM(cifs_trace_rw_credits_write_response_add,	"wr-resp-add") \
++ 	EM(cifs_trace_rw_credits_write_response_clear,	"wr-resp-clr") \
++ 	E_(cifs_trace_rw_credits_zero_in_flight,	"ZERO-IN-FLT")
++ 
+++>>>>>>> 5be5bdda5863 (smb: client: reject out-of-bounds DataOffset in CIFSSMBRead())
+  #define smb3_tcon_ref_traces					      \
+  	EM(netfs_trace_tcon_ref_free,			"FRE       ") \
+  	EM(netfs_trace_tcon_ref_free_fail,		"FRE Fail  ") \
+* Unmerged path fs/smb/client/cifssmb.c
+* Unmerged path fs/smb/client/trace.h
