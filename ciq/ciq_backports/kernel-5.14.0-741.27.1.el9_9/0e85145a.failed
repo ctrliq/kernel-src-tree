@@ -1,0 +1,402 @@
+smb: client: don't write back through O_DIRECT handles
+
+jira KERNEL-1962
+Rebuild_History Non-Buildable kernel-5.14.0-741.27.1.el9_9
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 0e85145af984f7cae2aadaa694cb8612009027ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.27.1.el9_9/0e85145a.failed
+
+Writeback uses the first writable handle of the inode, which may have
+been opened with O_DIRECT.  Such handles are opened with
+FILE_NO_INTERMEDIATE_BUFFERING, for which Windows rejects any unaligned
+I/O with STATUS_INVALID_PARAMETER.  Writeback of partly dirty pages and
+of the unaligned tail of a file through one of them fails, so netfs ends
+it with the folios clean and the data never reaches the server.
+
+xfstests generic/051, where fsstress mixes both kinds of opens, loses
+about 1% of its writes this way:
+
+  smb3_write_err: ... offset=0xde90d7 len=0xbd0b rc=-22
+
+All the rejected writes in a network capture were unaligned writes on a
+no-buffering handle; none of the aligned ones, and none of the unaligned
+ones on regular handles, were.
+
+Prefer a handle that was not opened with O_DIRECT, and use one that was
+only if there is no other.
+
+Fixes: 1013e760d10e ("SMB3: Don't ignore O_SYNC/O_DSYNC and O_DIRECT flags")
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 0e85145af984f7cae2aadaa694cb8612009027ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/file.c
+diff --cc fs/smb/client/file.c
+index 12d1621e265e,aa2d09dac44c..000000000000
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@@ -35,6 -35,343 +35,346 @@@
+  #include "fs_context.h"
+  #include "cifs_ioctl.h"
+  #include "cached_dir.h"
+++<<<<<<< HEAD
+++=======
++ #include <trace/events/netfs.h>
++ 
++ static int cifs_reopen_file(struct cifsFileInfo *cfile, bool can_flush);
++ 
++ /*
++  * Prepare a subrequest to upload to the server.  We need to allocate credits
++  * so that we know the maximum amount of data that we can include in it.
++  */
++ static void cifs_prepare_write(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *wdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = wdata->req;
++ 	struct netfs_io_stream *stream = &req->rreq.io_streams[subreq->stream_nr];
++ 	struct TCP_Server_Info *server;
++ 	struct cifsFileInfo *open_file = req->cfile;
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(wdata->rreq->inode->i_sb);
++ 	size_t wsize = req->rreq.wsize;
++ 	int rc;
++ 
++ 	if (!wdata->have_xid) {
++ 		wdata->xid = get_xid();
++ 		wdata->have_xid = true;
++ 	}
++ 
++ 	server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
++ 	wdata->server = server;
++ 
++ 	if (cifs_sb->ctx->wsize == 0)
++ 		cifs_negotiate_wsize(server, cifs_sb->ctx,
++ 				     tlink_tcon(req->cfile->tlink));
++ 
++ retry:
++ 	if (open_file->invalidHandle) {
++ 		rc = cifs_reopen_file(open_file, false);
++ 		if (rc < 0) {
++ 			if (rc == -EAGAIN)
++ 				goto retry;
++ 			subreq->error = rc;
++ 			return netfs_prepare_write_failed(subreq);
++ 		}
++ 	}
++ 
++ 	rc = server->ops->wait_mtu_credits(server, wsize, &stream->sreq_max_len,
++ 					   &wdata->credits);
++ 	if (rc < 0) {
++ 		subreq->error = rc;
++ 		return netfs_prepare_write_failed(subreq);
++ 	}
++ 
++ 	wdata->credits.rreq_debug_id = subreq->rreq->debug_id;
++ 	wdata->credits.rreq_debug_index = subreq->debug_index;
++ 	wdata->credits.in_flight_check = 1;
++ 	trace_smb3_rw_credits(wdata->rreq->debug_id,
++ 			      wdata->subreq.debug_index,
++ 			      wdata->credits.value,
++ 			      server->credits, server->in_flight,
++ 			      wdata->credits.value,
++ 			      cifs_trace_rw_credits_write_prepare);
++ 
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 	if (server->smbd_conn) {
++ 		const struct smbdirect_socket_parameters *sp =
++ 			smbd_get_parameters(server->smbd_conn);
++ 
++ 		stream->sreq_max_segs = sp->max_frmr_depth;
++ 	}
++ #endif
++ }
++ 
++ /*
++  * Issue a subrequest to upload to the server.
++  */
++ static void cifs_issue_write(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *wdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_sb_info *sbi = CIFS_SB(subreq->rreq->inode->i_sb);
++ 	int rc;
++ 
++ 	if (cifs_forced_shutdown(sbi)) {
++ 		rc = smb_EIO(smb_eio_trace_forced_shutdown);
++ 		goto fail;
++ 	}
++ 
++ 	rc = adjust_credits(wdata->server, wdata, cifs_trace_rw_credits_issue_write_adjust);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	rc = -EAGAIN;
++ 	if (wdata->req->cfile->invalidHandle)
++ 		goto fail;
++ 
++ 	wdata->server->ops->async_writev(wdata);
++ out:
++ 	return;
++ 
++ fail:
++ 	if (rc == -EAGAIN)
++ 		trace_netfs_sreq(subreq, netfs_sreq_trace_retry);
++ 	else
++ 		trace_netfs_sreq(subreq, netfs_sreq_trace_fail);
++ 	add_credits_and_wake_if(wdata->server, &wdata->credits, 0);
++ 	cifs_write_subrequest_terminated(wdata, rc);
++ 	goto out;
++ }
++ 
++ static void cifs_netfs_invalidate_cache(struct netfs_io_request *wreq)
++ {
++ 	cifs_invalidate_cache(wreq->inode, 0);
++ }
++ 
++ /*
++  * Negotiate the size of a read operation on behalf of the netfs library.
++  */
++ static int cifs_prepare_read(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct cifs_io_subrequest *rdata = container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = container_of(subreq->rreq, struct cifs_io_request, rreq);
++ 	struct TCP_Server_Info *server;
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(rreq->inode->i_sb);
++ 	size_t size;
++ 	int rc = 0;
++ 
++ 	if (!rdata->have_xid) {
++ 		rdata->xid = get_xid();
++ 		rdata->have_xid = true;
++ 	}
++ 
++ 	server = cifs_pick_channel(tlink_tcon(req->cfile->tlink)->ses);
++ 	rdata->server = server;
++ 
++ 	if (cifs_sb->ctx->rsize == 0)
++ 		cifs_negotiate_rsize(server, cifs_sb->ctx,
++ 				     tlink_tcon(req->cfile->tlink));
++ 
++ 	rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->rsize,
++ 					   &size, &rdata->credits);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rreq->io_streams[0].sreq_max_len = size;
++ 
++ 	rdata->credits.in_flight_check = 1;
++ 	rdata->credits.rreq_debug_id = rreq->debug_id;
++ 	rdata->credits.rreq_debug_index = subreq->debug_index;
++ 
++ 	trace_smb3_rw_credits(rdata->rreq->debug_id,
++ 			      rdata->subreq.debug_index,
++ 			      rdata->credits.value,
++ 			      server->credits, server->in_flight, 0,
++ 			      cifs_trace_rw_credits_read_submit);
++ 
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 	if (server->smbd_conn) {
++ 		const struct smbdirect_socket_parameters *sp =
++ 			smbd_get_parameters(server->smbd_conn);
++ 
++ 		rreq->io_streams[0].sreq_max_segs = sp->max_frmr_depth;
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ /*
++  * Issue a read operation on behalf of the netfs helper functions.  We're asked
++  * to make a read of a certain size at a point in the file.  We are permitted
++  * to only read a portion of that, but as long as we read something, the netfs
++  * helper will call us again so that we can issue another read.
++  */
++ static void cifs_issue_read(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct cifs_io_subrequest *rdata = container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = container_of(subreq->rreq, struct cifs_io_request, rreq);
++ 	struct TCP_Server_Info *server = rdata->server;
++ 	int rc = 0;
++ 
++ 	cifs_dbg(FYI, "%s: op=%08x[%x] mapping=%p len=%zu/%zu\n",
++ 		 __func__, rreq->debug_id, subreq->debug_index, rreq->mapping,
++ 		 subreq->transferred, subreq->len);
++ 
++ 	rc = adjust_credits(server, rdata, cifs_trace_rw_credits_issue_read_adjust);
++ 	if (rc)
++ 		goto failed;
++ 
++ 	if (req->cfile->invalidHandle) {
++ 		do {
++ 			rc = cifs_reopen_file(req->cfile, true);
++ 		} while (rc == -EAGAIN);
++ 		if (rc)
++ 			goto failed;
++ 	}
++ 
++ 	if (subreq->rreq->origin != NETFS_UNBUFFERED_READ &&
++ 	    subreq->rreq->origin != NETFS_DIO_READ)
++ 		__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
++ 
++ 	trace_netfs_sreq(subreq, netfs_sreq_trace_submit);
++ 	rc = rdata->server->ops->async_readv(rdata);
++ 	if (rc)
++ 		goto failed;
++ 	return;
++ 
++ failed:
++ 	add_credits_and_wake_if(rdata->server, &rdata->credits, 0);
++ 	subreq->error = rc;
++ 	netfs_read_subreq_terminated(subreq);
++ }
++ 
++ /*
++  * Writeback calls this when it finds a folio that needs uploading.  This isn't
++  * called if writeback only has copy-to-cache to deal with.
++  */
++ static void cifs_begin_writeback(struct netfs_io_request *wreq)
++ {
++ 	struct cifs_io_request *req = container_of(wreq, struct cifs_io_request, rreq);
++ 	int ret;
++ 
++ 	ret = cifs_get_writable_file(CIFS_I(wreq->inode), FIND_NO_DIRECT,
++ 				     &req->cfile);
++ 	if (ret) {
++ 		ret = cifs_get_writable_file(CIFS_I(wreq->inode), FIND_ANY,
++ 					     &req->cfile);
++ 	}
++ 	if (ret) {
++ 		cifs_dbg(VFS, "%s: couldn't find writable handle: %d\n",
++ 			 __func__, ret);
++ 		return;
++ 	}
++ 
++ 	wreq->io_streams[0].avail = true;
++ }
++ 
++ /*
++  * Initialise a request.
++  */
++ static int cifs_init_request(struct netfs_io_request *rreq, struct file *file)
++ {
++ 	struct cifs_io_request *req = container_of(rreq, struct cifs_io_request, rreq);
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(rreq->inode);
++ 	struct cifsFileInfo *open_file = NULL;
++ 
++ 	rreq->rsize = cifs_sb->ctx->rsize;
++ 	rreq->wsize = cifs_sb->ctx->wsize;
++ 	req->pid = current->tgid; // Ummm...  This may be a workqueue
++ 
++ 	if (file) {
++ 		open_file = file->private_data;
++ 		rreq->netfs_priv = file->private_data;
++ 		req->cfile = cifsFileInfo_get(open_file);
++ 		if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
++ 			req->pid = req->cfile->pid;
++ 	} else if (rreq->origin != NETFS_WRITEBACK) {
++ 		WARN_ON_ONCE(1);
++ 		return smb_EIO1(smb_eio_trace_not_netfs_writeback, rreq->origin);
++ 	}
++ 
++ 	atomic_inc(&cifs_sb->outstanding_rreq);
++ 	return 0;
++ }
++ 
++ /*
++  * Completion of a request operation.
++  */
++ static void cifs_rreq_done(struct netfs_io_request *rreq)
++ {
++ 	struct timespec64 atime, mtime;
++ 	struct inode *inode = rreq->inode;
++ 
++ 	/* we do not want atime to be less than mtime, it broke some apps */
++ 	atime = inode_set_atime_to_ts(inode, current_time(inode));
++ 	mtime = inode_get_mtime(inode);
++ 	if (timespec64_compare(&atime, &mtime) < 0)
++ 		inode_set_atime_to_ts(inode, inode_get_mtime(inode));
++ }
++ 
++ static void cifs_free_request(struct netfs_io_request *rreq)
++ {
++ 	struct cifs_io_request *req = container_of(rreq, struct cifs_io_request, rreq);
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(rreq->inode->i_sb);
++ 
++ 	if (req->cfile)
++ 		cifsFileInfo_put(req->cfile);
++ 
++ 	if (atomic_dec_and_test(&cifs_sb->outstanding_rreq))
++ 		wake_up_var(&cifs_sb->outstanding_rreq);
++ }
++ 
++ static void cifs_free_subrequest(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *rdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	int rc = subreq->error;
++ 
++ 	if (rdata->subreq.source == NETFS_DOWNLOAD_FROM_SERVER) {
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 		if (rdata->mr) {
++ 			smbd_deregister_mr(rdata->mr);
++ 			rdata->mr = NULL;
++ 		}
++ #endif
++ 	}
++ 
++ 	if (rdata->credits.value != 0) {
++ 		trace_smb3_rw_credits(rdata->rreq->debug_id,
++ 				      rdata->subreq.debug_index,
++ 				      rdata->credits.value,
++ 				      rdata->server ? rdata->server->credits : 0,
++ 				      rdata->server ? rdata->server->in_flight : 0,
++ 				      -rdata->credits.value,
++ 				      cifs_trace_rw_credits_free_subreq);
++ 		if (rdata->server)
++ 			add_credits_and_wake_if(rdata->server, &rdata->credits, 0);
++ 		else
++ 			rdata->credits.value = 0;
++ 	}
++ 
++ 	if (rdata->have_xid)
++ 		free_xid(rdata->xid);
++ }
++ 
++ const struct netfs_request_ops cifs_req_ops = {
++ 	.request_pool		= &cifs_io_request_pool,
++ 	.subrequest_pool	= &cifs_io_subrequest_pool,
++ 	.init_request		= cifs_init_request,
++ 	.free_request		= cifs_free_request,
++ 	.free_subrequest	= cifs_free_subrequest,
++ 	.prepare_read		= cifs_prepare_read,
++ 	.issue_read		= cifs_issue_read,
++ 	.done			= cifs_rreq_done,
++ 	.begin_writeback	= cifs_begin_writeback,
++ 	.prepare_write		= cifs_prepare_write,
++ 	.issue_write		= cifs_issue_write,
++ 	.invalidate_cache	= cifs_netfs_invalidate_cache,
++ };
+++>>>>>>> 0e85145af984 (smb: client: don't write back through O_DIRECT handles)
+  
+  /*
+   * Mark as invalid, all open files on tree connections since they
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 960dc2c33acf..2a4b675727f5 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -1952,6 +1952,7 @@ enum cifs_find_flags {
+ 	FIND_WITH_DELETE	= (1U << 1),
+ 	FIND_NO_PENDING_DELETE	= (1U << 2),
+ 	FIND_OPEN_FLAGS		= (1U << 3),
++	FIND_NO_DIRECT		= (1U << 4),
+ };
+ 
+ #define   MID_FREE 0
+* Unmerged path fs/smb/client/file.c
