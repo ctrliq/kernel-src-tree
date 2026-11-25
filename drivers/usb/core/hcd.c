@@ -328,9 +328,7 @@ static const u8 ss_rh_config_descriptor[] = {
 	USB_DT_ENDPOINT, /* __u8 ep_bDescriptorType; Endpoint */
 	0x81,       /*  __u8  ep_bEndpointAddress; IN Endpoint 1 */
 	0x03,       /*  __u8  ep_bmAttributes; Interrupt */
-		    /* __le16 ep_wMaxPacketSize; 1 + (MAX_ROOT_PORTS / 8)
-		     * see hub.c:hub_configure() for details. */
-	(USB_MAXCHILDREN + 1 + 7) / 8, 0x00,
+	0x02, 0x00, /* __le16 ep_wMaxPacketSize; 2 bytes per USB3 10.15.1 */
 	0x0c,       /*  __u8  ep_bInterval; (256ms -- usb 2.0 spec) */
 
 	/* one SuperSpeed endpoint companion descriptor */
@@ -2193,7 +2191,7 @@ int ehset_single_step_set_feature(struct usb_hcd *hcd, int port)
 	if (!buf)
 		return -ENOMEM;
 
-	dr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL);
+	dr = kmalloc_obj(struct usb_ctrlrequest);
 	if (!dr) {
 		kfree(buf);
 		return -ENOMEM;
@@ -2567,16 +2565,14 @@ struct usb_hcd *__usb_create_hcd(const struct hc_driver *driver,
 	if (!hcd)
 		return NULL;
 	if (primary_hcd == NULL) {
-		hcd->address0_mutex = kmalloc(sizeof(*hcd->address0_mutex),
-				GFP_KERNEL);
+		hcd->address0_mutex = kmalloc_obj(*hcd->address0_mutex);
 		if (!hcd->address0_mutex) {
 			kfree(hcd);
 			dev_dbg(dev, "hcd address0 mutex alloc failed\n");
 			return NULL;
 		}
 		mutex_init(hcd->address0_mutex);
-		hcd->bandwidth_mutex = kmalloc(sizeof(*hcd->bandwidth_mutex),
-				GFP_KERNEL);
+		hcd->bandwidth_mutex = kmalloc_obj(*hcd->bandwidth_mutex);
 		if (!hcd->bandwidth_mutex) {
 			kfree(hcd->address0_mutex);
 			kfree(hcd);

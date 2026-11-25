@@ -114,7 +114,7 @@ static int belkin_sa_port_probe(struct usb_serial_port *port)
 	struct usb_device *dev = port->serial->dev;
 	struct belkin_sa_private *priv;
 
-	priv = kmalloc(sizeof(struct belkin_sa_private), GFP_KERNEL);
+	priv = kmalloc_obj(struct belkin_sa_private);
 	if (!priv)
 		return -ENOMEM;
 
@@ -193,6 +193,9 @@ static void belkin_sa_read_int_callback(struct urb *urb)
 	}
 
 	usb_serial_debug_data(&port->dev, __func__, urb->actual_length, data);
+
+	if (urb->actual_length < BELKIN_SA_MSR_INDEX + 1)
+		goto exit;
 
 	/* Handle known interrupt data */
 	/* ignore data[0] and data[1] */
