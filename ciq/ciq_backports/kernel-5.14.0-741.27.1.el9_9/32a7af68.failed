@@ -1,0 +1,153 @@
+cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem
+
+jira KERNEL-1962
+Rebuild_History Non-Buildable kernel-5.14.0-741.27.1.el9_9
+commit-author Frank Sorenson <sorenson@redhat.com>
+commit 32a7af68df7361fe7cf153cf36124d04b94aec00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.27.1.el9_9/32a7af68.failed
+
+cifs_setsize() calls fscache_resize_cookie() without holding i_rwsem.
+When the fscache cookie is active (FSCACHE_COOKIE_IS_CACHING is set),
+fscache_resize_cookie() performs a real resize that requires i_rwsem
+held exclusively.  If another file descriptor has the same inode open,
+fscache_use_cookie() was already called from that cifs_open(), making
+the cookie active.  In that case, calling cifs_setsize() from
+cifs_do_truncate() (invoked from cifs_open() without i_rwsem) races
+against concurrent fscache I/O.
+
+Strip fscache_resize_cookie() from cifs_setsize(), making it a pure
+size/page-cache helper.  Add cifs_resize_file_locked() for callers
+that already hold i_rwsem: it calls netfs_resize_file() and
+cifs_setsize(), then temporarily activates the cookie with
+fscache_use_cookie() to perform the resize under the lock, then
+deactivates it with cifs_fscache_unuse_inode_cookie().  Using
+fscache_use_cookie() before the resize ensures correctness whether or
+not another fd already holds the cookie active.
+
+Switch cifs_file_set_size(), smb2_duplicate_extents(), and both size-
+extension branches of smb3_simple_falloc() to the new wrapper; those
+paths already hold i_rwsem via VFS setattr, lock_two_nondirectories(),
+or cifs_fallocate() respectively.  cifs_do_truncate() continues to
+call cifs_setsize() followed by cifs_invalidate_cache(), since it runs
+without i_rwsem.
+
+Fixes: fa724e235cfd ("cifs: add fscache_resize_cookie() to cifs_setsize()")
+	Cc: stable@vger.kernel.org
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Paulo Alcantara <pc@manguebit.com>
+	Signed-off-by: Frank Sorenson <sorenson@redhat.com>
+	Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit 32a7af68df7361fe7cf153cf36124d04b94aec00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/inode.c
+#	fs/smb/client/smb2ops.c
+diff --cc fs/smb/client/inode.c
+index 9d6a943fbd12,098d5496e779..000000000000
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@@ -3050,6 -3058,24 +3050,27 @@@ void cifs_setsize(struct inode *inode, 
+  	spin_unlock(&inode->i_lock);
+  	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+  	truncate_pagecache(inode, offset);
+++<<<<<<< HEAD
+++=======
++ 	netfs_wait_for_outstanding_io(inode);
++ }
++ 
++ void cifs_resize_file_locked(struct inode *inode, loff_t offset)
++ {
++ 	struct fscache_cookie *cookie = cifs_inode_cookie(inode);
++ 
++ 	lockdep_assert_held_write(&inode->i_rwsem);
++ 
++ 	netfs_resize_file(netfs_inode(inode), offset, true);
++ 	cifs_setsize(inode, offset);
++ 
++ 	if (!cookie)
++ 		return;
++ 
++ 	fscache_use_cookie(cookie, true);
++ 	fscache_resize_cookie(cookie, offset);
++ 	cifs_fscache_unuse_inode_cookie(inode, true);
+++>>>>>>> 32a7af68df73 (cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem)
+  }
+  
+  int cifs_file_set_size(const unsigned int xid, struct dentry *dentry,
+@@@ -3115,10 -3141,8 +3136,15 @@@
+  	cifs_put_tlink(tlink);
+  
+  set_size_out:
+++<<<<<<< HEAD
+ +	if (rc == 0) {
+ +		netfs_resize_file(&cifsInode->netfs, size);
+ +		cifs_setsize(inode, size);
+ +	}
+++=======
++ 	if (rc == 0)
++ 		cifs_resize_file_locked(inode, size);
+++>>>>>>> 32a7af68df73 (cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem)
+  
+  	return rc;
+  }
+diff --cc fs/smb/client/smb2ops.c
+index f466e767dae8,0e872d58fae7..000000000000
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@@ -2177,8 -2222,7 +2177,12 @@@ smb2_duplicate_extents(const unsigned i
+  		rc = smb2_set_file_size(xid, tcon, trgtfile, dest_off + len, false);
+  		if (rc)
+  			goto duplicate_extents_out;
+++<<<<<<< HEAD
+ +		netfs_resize_file(netfs_inode(inode), dest_off + len);
+ +		cifs_setsize(inode, dest_off + len);
+++=======
++ 		cifs_resize_file_locked(inode, dest_off + len);
+++>>>>>>> 32a7af68df73 (cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem)
+  	}
+  	rc = SMB2_ioctl(xid, tcon, trgtfile->fid.persistent_fid,
+  			trgtfile->fid.volatile_fid,
+@@@ -3724,8 -3775,7 +3728,12 @@@ static long smb3_simple_falloc(struct f
+  			}
+  
+  			new_eof = off + len;
+++<<<<<<< HEAD
+ +			netfs_resize_file(&cifsi->netfs, new_eof);
+ +			cifs_setsize(inode, new_eof);
+++=======
++ 			cifs_resize_file_locked(inode, new_eof);
+++>>>>>>> 32a7af68df73 (cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem)
+  
+  			qrc = SMB2_query_info(xid, tcon,
+  					      cfile->fid.persistent_fid,
+@@@ -3773,8 -3823,7 +3781,12 @@@
+  		if (rc)
+  			goto out;
+  
+++<<<<<<< HEAD
+ +		netfs_resize_file(&cifsi->netfs, new_eof);
+ +		cifs_setsize(inode, new_eof);
+++=======
++ 		cifs_resize_file_locked(inode, new_eof);
+++>>>>>>> 32a7af68df73 (cifs: add cifs_resize_file_locked() to guard fscache_resize_cookie() under i_rwsem)
+  
+  		qrc = SMB2_query_info(xid, tcon,
+  				      cfile->fid.persistent_fid,
+diff --git a/fs/smb/client/cifsfs.h b/fs/smb/client/cifsfs.h
+index 5370e571d8b3..b1524c0c2876 100644
+--- a/fs/smb/client/cifsfs.h
++++ b/fs/smb/client/cifsfs.h
+@@ -146,6 +146,7 @@ ssize_t cifs_file_copychunk_range(unsigned int xid, struct file *src_file,
+ 
+ long cifs_ioctl(struct file *filep, unsigned int command, unsigned long arg);
+ void cifs_setsize(struct inode *inode, loff_t offset);
++void cifs_resize_file_locked(struct inode *inode, loff_t offset);
+ 
+ struct fs_context;
+ struct smb3_fs_context;
+* Unmerged path fs/smb/client/inode.c
+* Unmerged path fs/smb/client/smb2ops.c
