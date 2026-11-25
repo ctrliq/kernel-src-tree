@@ -1,0 +1,578 @@
+smb: move LZ77 compression into common code
+
+jira KERNEL-1962
+Rebuild_History Non-Buildable kernel-5.14.0-741.27.1.el9_9
+commit-author Namjae Jeon <linkinjeon@kernel.org>
+commit 0121b154147f5affd1039ca4f8d9a0fc194142f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.27.1.el9_9/0121b154.failed
+
+Move the LZ77 codec in cifs.ko to smb/common/ so both the SMB
+client and ksmbd can use it.
+
+	Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0121b154147f5affd1039ca4f8d9a0fc194142f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/common/compress/lz77.c
+diff --cc fs/smb/common/compress/lz77.c
+index 3010a4dd50d5,9216d973d876..000000000000
+--- a/fs/smb/common/compress/lz77.c
++++ b/fs/smb/common/compress/lz77.c
+@@@ -9,7 -11,9 +11,13 @@@
+  #include <linux/slab.h>
+  #include <linux/sizes.h>
+  #include <linux/count_zeros.h>
+++<<<<<<< HEAD:fs/smb/client/compress/lz77.c
+ +#include <asm/unaligned.h>
+++=======
++ #include <linux/unaligned.h>
++ #include <linux/module.h>
++ #include <linux/overflow.h>
+++>>>>>>> 0121b154147f (smb: move LZ77 compression into common code):fs/smb/common/compress/lz77.c
+  
+  #include "lz77.h"
+  
+diff --git a/fs/smb/client/Makefile b/fs/smb/client/Makefile
+index 6e83b5204699..fc6b9d35c962 100644
+--- a/fs/smb/client/Makefile
++++ b/fs/smb/client/Makefile
+@@ -42,7 +42,7 @@ cifs-$(CONFIG_CIFS_ALLOW_INSECURE_LEGACY) += \
+ 	smb1session.o \
+ 	smb1transport.o
+ 
+-cifs-$(CONFIG_CIFS_COMPRESSION) += compress.o compress/lz77.o
++cifs-$(CONFIG_CIFS_COMPRESSION) += compress.o
+ 
+ ifneq ($(CONFIG_CIFS_ALLOW_INSECURE_LEGACY),)
+ #
+diff --git a/fs/smb/client/compress.c b/fs/smb/client/compress.c
+index 47cd015a1178..66e956579c95 100644
+--- a/fs/smb/client/compress.c
++++ b/fs/smb/client/compress.c
+@@ -22,7 +22,7 @@
+ #include "cifsproto.h"
+ #include "smb2proto.h"
+ 
+-#include "compress/lz77.h"
++#include "../common/compress/lz77.h"
+ #include "compress.h"
+ 
+ /*
+@@ -44,6 +44,11 @@ struct bucket {
+ 	unsigned int count;
+ };
+ 
++static inline size_t pow4(size_t n)
++{
++	return n * n * n * n;
++}
++
+ /*
+  * has_low_entropy() - Compute Shannon entropy of the sampled data.
+  * @bkt:	Bytes counts of the sample.
+@@ -65,7 +70,6 @@ static bool has_low_entropy(struct bucket *bkt, size_t slen)
+ 	const size_t threshold = 65, max_entropy = 8 * ilog2(16);
+ 	size_t i, p, p2, len, sum = 0;
+ 
+-#define pow4(n) (n * n * n * n)
+ 	len = ilog2(pow4(slen));
+ 
+ 	for (i = 0; i < 256 && bkt[i].count > 0; i++) {
+@@ -329,14 +333,14 @@ int smb_compress(struct TCP_Server_Info *server, struct smb_rqst *rq, compress_s
+ 		goto err_free;
+ 	}
+ 
+-	dlen = lz77_compressed_alloc_size(slen);
++	dlen = smb_lz77_compressed_alloc_size(slen);
+ 	dst = kvzalloc(dlen, GFP_KERNEL);
+ 	if (!dst) {
+ 		ret = -ENOMEM;
+ 		goto err_free;
+ 	}
+ 
+-	ret = lz77_compress(src, slen, dst, &dlen);
++	ret = smb_lz77_compress(src, slen, dst, &dlen);
+ 	if (!ret) {
+ 		struct smb2_compression_hdr hdr = { 0 };
+ 		struct smb_rqst comp_rq = { .rq_nvec = 3, };
+diff --git a/fs/smb/client/compress.h b/fs/smb/client/compress.h
+index 2679baca129b..e08e6d339d21 100644
+--- a/fs/smb/client/compress.h
++++ b/fs/smb/client/compress.h
+@@ -18,6 +18,7 @@
+ #include <linux/uio.h>
+ #include <linux/kernel.h>
+ #include "../common/smb2pdu.h"
++#include "../common/compress/compress.h"
+ #include "cifsglob.h"
+ 
+ /* sizeof(smb2_compression_hdr) - sizeof(OriginalPayloadSize) */
+@@ -34,29 +35,6 @@ int smb_compress(struct TCP_Server_Info *server, struct smb_rqst *rq,
+ 		 compress_send_fn send_fn);
+ bool should_compress(const struct cifs_tcon *tcon, const struct smb_rqst *rq);
+ 
+-/*
+- * smb_compress_alg_valid() - Validate a compression algorithm.
+- * @alg: Compression algorithm to check.
+- * @valid_none: Conditional check whether NONE algorithm should be
+- *		considered valid or not.
+- *
+- * If @alg is SMB3_COMPRESS_NONE, this function returns @valid_none.
+- *
+- * Note that 'NONE' (0) compressor type is considered invalid in protocol
+- * negotiation, as it's never requested to/returned from the server.
+- *
+- * Return: true if @alg is valid/supported, false otherwise.
+- */
+-static __always_inline int smb_compress_alg_valid(__le16 alg, bool valid_none)
+-{
+-	if (alg == SMB3_COMPRESS_NONE)
+-		return valid_none;
+-
+-	if (alg == SMB3_COMPRESS_LZ77 || alg == SMB3_COMPRESS_PATTERN)
+-		return true;
+-
+-	return false;
+-}
+ #else /* !CONFIG_CIFS_COMPRESSION */
+ static inline int smb_compress(void *unused1, void *unused2, void *unused3)
+ {
+@@ -68,9 +46,5 @@ static inline bool should_compress(void *unused1, void *unused2)
+ 	return false;
+ }
+ 
+-static inline int smb_compress_alg_valid(__le16 unused1, bool unused2)
+-{
+-	return -EOPNOTSUPP;
+-}
+ #endif /* !CONFIG_CIFS_COMPRESSION */
+ #endif /* _SMB_COMPRESS_H */
+diff --git a/fs/smb/client/compress/lz77.c b/fs/smb/client/compress/lz77.c
+deleted file mode 100644
+index 3010a4dd50d5..000000000000
+--- a/fs/smb/client/compress/lz77.c
++++ /dev/null
+@@ -1,335 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (C) 2024-2026, SUSE LLC
+- *
+- * Authors: Enzo Matsumiya <ematsumiya@suse.de>
+- *
+- * Implementation of the LZ77 "plain" compression algorithm, as per MS-XCA spec.
+- */
+-#include <linux/slab.h>
+-#include <linux/sizes.h>
+-#include <linux/count_zeros.h>
+-#include <asm/unaligned.h>
+-
+-#include "lz77.h"
+-
+-/*
+- * Compression parameters.
+- *
+- * LZ77_MATCH_MAX_DIST:		Farthest back a match can be from current position (can be 1 - 8K).
+- * LZ77_HASH_LOG:
+- * LZ77_HASH_SIZE:		ilog2 hash size (recommended to be 13 - 18, default 15 (hash size
+- *				32k)).
+- * LZ77_RSTEP_SIZE:		Number of bytes to read from input buffer for hashing and initial
+- *				match check (default 4 bytes, this effectivelly makes this the min
+- *				match len).
+- * LZ77_MSTEP_SIZE:		Number of bytes to extend-compare a found match (default 8 bytes).
+- * LZ77_SKIP_TRIGGER:		ilog2 value for adaptive skipping, i.e. to progressively skip input
+- *				bytes when we can't find matches.  Default is 4.
+- *				Higher values (>0) will decrease compression time, but will result
+- *				in worse compression ratio.  Lower values will give better
+- *				compression ratio (more matches found), but will increase time.
+- */
+-#define LZ77_MATCH_MAX_DIST	SZ_8K
+-#define LZ77_HASH_LOG		15
+-#define LZ77_HASH_SIZE		(1 << LZ77_HASH_LOG)
+-#define LZ77_RSTEP_SIZE		sizeof(u32)
+-#define LZ77_MSTEP_SIZE		sizeof(u64)
+-#define LZ77_SKIP_TRIGGER	4
+-
+-#define LZ77_PREFETCH(ptr)	__builtin_prefetch((ptr), 0, 3)
+-#define LZ77_FLAG_MAX		32
+-
+-static __always_inline u8 lz77_read8(const u8 *ptr)
+-{
+-	return get_unaligned(ptr);
+-}
+-
+-static __always_inline u32 lz77_read32(const u32 *ptr)
+-{
+-	return get_unaligned(ptr);
+-}
+-
+-static __always_inline u64 lz77_read64(const u64 *ptr)
+-{
+-	return get_unaligned(ptr);
+-}
+-
+-static __always_inline void lz77_write8(u8 *ptr, u8 v)
+-{
+-	put_unaligned(v, ptr);
+-}
+-
+-static __always_inline void lz77_write16(u16 *ptr, u16 v)
+-{
+-	put_unaligned_le16(v, ptr);
+-}
+-
+-static __always_inline void lz77_write32(u32 *ptr, u32 v)
+-{
+-	put_unaligned_le32(v, ptr);
+-}
+-
+-static __always_inline u32 lz77_match_len(const void *match, const void *cur, const void *end)
+-{
+-	const void *start = cur;
+-
+-	/* Safe for a do/while because otherwise we wouldn't reach here from the main loop. */
+-	do {
+-		const u64 diff = lz77_read64(cur) ^ lz77_read64(match);
+-
+-		if (!diff) {
+-			cur += LZ77_MSTEP_SIZE;
+-			match += LZ77_MSTEP_SIZE;
+-
+-			continue;
+-		}
+-
+-		/* This computes the number of common bytes in @diff. */
+-		cur += count_trailing_zeros(diff) >> 3;
+-
+-		return (cur - start);
+-	} while (likely(cur + LZ77_MSTEP_SIZE <= end));
+-
+-	/* Fallback to byte-by-byte comparison for last <8 bytes. */
+-	while (cur < end && lz77_read8(cur) == lz77_read8(match)) {
+-		cur++;
+-		match++;
+-	}
+-
+-	return (cur - start);
+-}
+-
+-/**
+- * lz77_encode_match() - Match encoding.
+- * @dst:	compressed buffer
+- * @nib:	pointer to an address in @dst
+- * @dist:	match distance
+- * @len:	match length
+- *
+- * Assumes all args were previously checked.
+- *
+- * Return: @dst advanced to new position
+- *
+- * Ref: MS-XCA 2.3.4 "Plain LZ77 Compression Algorithm Details" - "Processing"
+- */
+-static __always_inline void *lz77_encode_match(void *dst, void **nib, u16 dist, u32 len)
+-{
+-	len -= 3;
+-	dist--;
+-	dist <<= 3;
+-
+-	if (len < 7) {
+-		lz77_write16(dst, dist + len);
+-
+-		return dst + sizeof(u16);
+-	}
+-
+-	dist |= 7;
+-	lz77_write16(dst, dist);
+-	dst += sizeof(u16);
+-	len -= 7;
+-
+-	if (!*nib) {
+-		lz77_write8(dst, umin(len, 15));
+-		*nib = dst;
+-		dst++;
+-	} else {
+-		u8 *b = *nib;
+-
+-		lz77_write8(b, *b | umin(len, 15) << 4);
+-		*nib = NULL;
+-	}
+-
+-	if (len < 15)
+-		return dst;
+-
+-	len -= 15;
+-	if (len < 255) {
+-		lz77_write8(dst, len);
+-
+-		return dst + 1;
+-	}
+-
+-	lz77_write8(dst, 0xff);
+-	dst++;
+-	len += 7 + 15;
+-	if (len <= 0xffff) {
+-		lz77_write16(dst, len);
+-
+-		return dst + sizeof(u16);
+-	}
+-
+-	lz77_write16(dst, 0);
+-	dst += sizeof(u16);
+-	lz77_write32(dst, len);
+-
+-	return dst + sizeof(u32);
+-}
+-
+-/**
+- * lz77_encode_literals() - Literals encoding.
+- * @start:	where to start copying literals (uncompressed buffer)
+- * @end:	when to stop copying (uncompressed buffer)
+- * @dst:	compressed buffer
+- * @f:		pointer to current flag value
+- * @fc:		pointer to current flag count
+- * @fp:		pointer to current flag address
+- *
+- * Batch copy literals from @start to @dst, updating flag values accordingly.
+- * Assumes all args were previously checked.
+- *
+- * Return: @dst advanced to new position
+- *
+- * MS-XCA 2.3.4 "Plain LZ77 Compression Algorithm Details" - "Processing"
+- */
+-static __always_inline void *lz77_encode_literals(const void *start, const void *end, void *dst,
+-						  long *f, u32 *fc, void **fp)
+-{
+-	if (start >= end)
+-		return dst;
+-
+-	do {
+-		const u32 len = umin(end - start, LZ77_FLAG_MAX - *fc);
+-
+-		memcpy(dst, start, len);
+-
+-		dst += len;
+-		start += len;
+-
+-		*f <<= len;
+-		*fc += len;
+-		if (*fc == LZ77_FLAG_MAX) {
+-			lz77_write32(*fp, *f);
+-			*fc = 0;
+-			*fp = dst;
+-			dst += sizeof(u32);
+-		}
+-	} while (start < end);
+-
+-	return dst;
+-}
+-
+-static __always_inline u32 lz77_hash(const u32 v)
+-{
+-	return ((v ^ 0x9E3779B9) * 0x85EBCA6B) >> (32 - LZ77_HASH_LOG);
+-}
+-
+-noinline int lz77_compress(const void *src, const u32 slen, void *dst, u32 *dlen)
+-{
+-	const void *srcp, *rlim, *end, *anchor;
+-	u32 *htable, hash, flag_count = 0;
+-	void *dstp, *nib, *flag_pos;
+-	long flag = 0;
+-
+-	/* This is probably a bug, so throw a warning. */
+-	if (WARN_ON_ONCE(*dlen < lz77_compressed_alloc_size(slen)))
+-		return -EINVAL;
+-
+-	srcp = anchor = src;
+-	end = srcp + slen; /* absolute end */
+-	rlim = end - LZ77_MSTEP_SIZE; /* read limit (for lz77_match_len()) */
+-	dstp = dst;
+-	flag_pos = dstp;
+-	dstp += sizeof(u32);
+-	nib = NULL;
+-
+-	htable = kvcalloc(LZ77_HASH_SIZE, sizeof(*htable), GFP_KERNEL);
+-	if (!htable)
+-		return -ENOMEM;
+-
+-	LZ77_PREFETCH(srcp + LZ77_RSTEP_SIZE);
+-
+-	/*
+-	 * Adjust @srcp so we don't get a false positive match on first iteration.
+-	 * Then prepare hash for first loop iteration (don't advance @srcp again).
+-	 */
+-	hash = lz77_hash(lz77_read32(srcp++));
+-	htable[hash] = 0;
+-	hash = lz77_hash(lz77_read32(srcp));
+-
+-	/*
+-	 * Main loop.
+-	 *
+-	 * @dlen is >= lz77_compressed_alloc_size(), so run without bound-checking @dstp.
+-	 *
+-	 * This code was crafted in a way to best utilise fetch-decode-execute CPU flow.
+-	 * Any attempt to optimize it, or even organize it, can lead to huge performance loss.
+-	 */
+-	do {
+-		const void *match, *next = srcp;
+-		u32 len, step = 1, skip = 1U << LZ77_SKIP_TRIGGER;
+-
+-		/* Match finding (hot path -- don't change the read/check/write order). */
+-		do {
+-			const u32 cur_hash = hash;
+-
+-			srcp = next;
+-			next += step;
+-
+-			/*
+-			 * Adaptive skipping.
+-			 *
+-			 * Increment @step every (1 << LZ77_SKIP_TRIGGER, 16 in our case) bytes
+-			 * without a match.
+-			 * Reset to 1 when a match is found.
+-			 */
+-			step = (skip++ >> LZ77_SKIP_TRIGGER);
+-			if (unlikely(next > rlim))
+-				goto out;
+-
+-			hash = lz77_hash(lz77_read32(next));
+-			match = src + htable[cur_hash];
+-			htable[cur_hash] = srcp - src;
+-		} while (likely(match + LZ77_MATCH_MAX_DIST < srcp) ||
+-			 lz77_read32(match) != lz77_read32(srcp));
+-
+-		/*
+-		 * Match found.  Warm/cold path; begin parsing @srcp and writing to @dstp:
+-		 * - flush literals
+-		 * - compute match length (*)
+-		 * - encode match
+-		 *
+-		 * (*) Current minimum match length is defined by the memory read size above, so
+-		 * here we already know that we have 4 matching bytes, but it's just faster to
+-		 * redundantly compute it again in lz77_match_len() than to adjust pointers/len.
+-		 */
+-		dstp = lz77_encode_literals(anchor, srcp, dstp, &flag, &flag_count, &flag_pos);
+-		len = lz77_match_len(match, srcp, end);
+-		dstp = lz77_encode_match(dstp, &nib, srcp - match, len);
+-		srcp += len;
+-		anchor = srcp;
+-
+-		LZ77_PREFETCH(srcp);
+-
+-		flag = (flag << 1) | 1;
+-		flag_count++;
+-		if (flag_count == LZ77_FLAG_MAX) {
+-			lz77_write32(flag_pos, flag);
+-			flag_count = 0;
+-			flag_pos = dstp;
+-			dstp += sizeof(u32);
+-		}
+-
+-		if (unlikely(srcp > rlim))
+-			break;
+-
+-		/* Prepare for next loop. */
+-		hash = lz77_hash(lz77_read32(srcp));
+-	} while (srcp < end);
+-out:
+-	dstp = lz77_encode_literals(anchor, end, dstp, &flag, &flag_count, &flag_pos);
+-
+-	flag_count = LZ77_FLAG_MAX - flag_count;
+-	flag <<= flag_count;
+-	flag |= (1UL << flag_count) - 1;
+-	lz77_write32(flag_pos, flag);
+-
+-	*dlen = dstp - dst;
+-	kvfree(htable);
+-
+-	if (*dlen < slen)
+-		return 0;
+-
+-	return -EMSGSIZE;
+-}
+diff --git a/fs/smb/common/Makefile b/fs/smb/common/Makefile
+index c66dbbc1469c..216705fec028 100644
+--- a/fs/smb/common/Makefile
++++ b/fs/smb/common/Makefile
+@@ -5,3 +5,6 @@
+ 
+ obj-$(CONFIG_SMBFS) += cifs_arc4.o
+ obj-$(CONFIG_SMBFS) += cifs_md4.o
++obj-$(CONFIG_SMBFS) += smb_compress.o
++
++smb_compress-y := compress/lz77.o
+diff --git a/fs/smb/common/compress/compress.h b/fs/smb/common/compress/compress.h
+new file mode 100644
+index 000000000000..b504cd38b128
+--- /dev/null
++++ b/fs/smb/common/compress/compress.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2026 Namjae Jeon <linkinjeon@kernel.org>
++ */
++#ifndef _COMMON_SMB_COMPRESS_H
++#define _COMMON_SMB_COMPRESS_H
++
++#include "../smb2pdu.h"
++
++/*
++ * SMB3_COMPRESS_NONE is valid only in chained payload headers. It is never
++ * negotiated as a compression algorithm.
++ */
++static __always_inline bool smb_compress_alg_valid(__le16 alg, bool valid_none)
++{
++	if (alg == SMB3_COMPRESS_NONE)
++		return valid_none;
++
++	return alg == SMB3_COMPRESS_LZ77 || alg == SMB3_COMPRESS_PATTERN;
++}
++
++#endif /* _COMMON_SMB_COMPRESS_H */
+* Unmerged path fs/smb/common/compress/lz77.c
+diff --git a/fs/smb/client/compress/lz77.h b/fs/smb/common/compress/lz77.h
+similarity index 65%
+rename from fs/smb/client/compress/lz77.h
+rename to fs/smb/common/compress/lz77.h
+index 4e570846aefa..e032c0f1b48d 100644
+--- a/fs/smb/client/compress/lz77.h
++++ b/fs/smb/common/compress/lz77.h
+@@ -12,7 +12,7 @@
+ #include <linux/kernel.h>
+ 
+ /**
+- * lz77_compressed_alloc_size() - Compute compressed buffer size.
++ * smb_lz77_compressed_alloc_size() - Compute compressed buffer size.
+  * @size:	uncompressed (src) size
+  *
+  * Compute allocation size for the compressed buffer based on uncompressed size.
+@@ -26,18 +26,21 @@
+  * Worst case scenario is an all-literal compression, which means:
+  * metadata bytes = 4 + ((@size / 32) * 4) + 4, or, simplified, (@size >> 3) + 8
+  *
+- * The worst case scenario rarely happens, but such overprovisioning also allows lz77_compress()
+- * main loop to run without ever bound checking dst, which is a huge perf improvement, while also
+- * being safe when compression goes bad.
++ * The worst case scenario rarely happens, but such overprovisioning also
++ * allows smb_lz77_compress() main loop to run without ever bound checking dst,
++ * which is a huge perf improvement, while also being safe when compression goes
++ * bad.
+  *
+  * Return: required (*) allocation size for compressed buffer.
+  *
+- * (*) checked once in the beginning of lz77_compress()
++ * (*) checked once in the beginning of smb_lz77_compress()
+  */
+-static __always_inline u32 lz77_compressed_alloc_size(const u32 size)
++static __always_inline u32 smb_lz77_compressed_alloc_size(const u32 size)
+ {
+ 	return size + (size >> 3) + 8;
+ }
+ 
+-int lz77_compress(const void *src, const u32 slen, void *dst, u32 *dlen);
++int smb_lz77_compress(const void *src, const u32 slen, void *dst, u32 *dlen);
++int smb_lz77_decompress(const void *src, const u32 slen, void *dst,
++			const u32 dlen);
+ #endif /* _SMB_COMPRESS_LZ77_H */
