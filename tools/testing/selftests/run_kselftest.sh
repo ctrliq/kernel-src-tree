@@ -26,6 +26,7 @@ Usage: $0 [OPTIONS]
   -l | --list			List the available collection:test entries
   -d | --dry-run		Don't actually run any tests
   -h | --help			Show this usage info
+  -T | --timed			Print the time spent on each test
 EOF
 	exit $1
 }
@@ -53,6 +54,13 @@ while true; do
 			shift ;;
 		-h | --help)
 			usage 0 ;;
+		-T | --timed)
+			if [ ! -r /proc/uptime ]; then
+				echo "Timing tests requires /proc/uptime" >&2
+				exit 1
+			fi
+			per_test_timing=1
+			shift ;;
 		"")
 			break ;;
 		*)

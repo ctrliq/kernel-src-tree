@@ -4,8 +4,10 @@
 # Runs a set of tests in a given subdirectory.
 export skip_rc=4
 export timeout_rc=124
+export pass_rc=0
 export logfile=/dev/stdout
 export per_test_logging=
+export per_test_timing=
 
 # Defaults for "settings" file fields:
 # "timeout" how many seconds to let each test run before failing.
@@ -37,6 +39,16 @@ tap_timeout()
 	else
 		"$1"
 	fi
+}
+
+# Print the system uptime in hundredths of a second.
+uptime_cs()
+{
+	local up idle
+
+	read up idle < /proc/uptime
+	# Prefix the fraction with 1 so that a leading 0 isn't parsed as octal.
+	echo $((${up%.*} * 100 + 1${up#*.} - 100))
 }
 
 run_one()
@@ -82,19 +94,29 @@ run_one()
 		echo "not ok $test_num $TEST_HDR_MSG"
 	else
 		cd `dirname $TEST` > /dev/null
-		((((( tap_timeout ./$BASENAME_TEST 2>&1; echo $? >&3) |
+		if [ -n "$per_test_timing" ]; then
+			start=$(uptime_cs)
+		fi
+		(((( tap_timeout ./$BASENAME_TEST 2>&1; echo $? >&3) |
 			tap_prefix >&4) 3>&1) |
-			(read xs; exit $xs)) 4>>"$logfile" &&
-		echo "ok $test_num $TEST_HDR_MSG") ||
-		(rc=$?;	\
-		if [ $rc -eq $skip_rc ]; then	\
-			echo "ok $test_num $TEST_HDR_MSG # SKIP"
-		elif [ $rc -eq $timeout_rc ]; then \
+			(read xs; exit $xs)) 4>>"$logfile"
+		rc=$?
+		if [ -n "$per_test_timing" ]; then
+			elapsed=$(($(uptime_cs) - start))
+			printf '# time: %d.%02ds\n' \
+				$((elapsed / 100)) $((elapsed % 100))
+		fi
+		case "$rc" in
+		"$pass_rc")
+			echo "ok $test_num $TEST_HDR_MSG";;
+		"$skip_rc")
+			echo "ok $test_num $TEST_HDR_MSG # SKIP";;
+		"$timeout_rc")
 			echo "#"
-			echo "not ok $test_num $TEST_HDR_MSG # TIMEOUT $kselftest_timeout seconds"
-		else
-			echo "not ok $test_num $TEST_HDR_MSG # exit=$rc"
-		fi)
+			echo "not ok $test_num $TEST_HDR_MSG # TIMEOUT $kselftest_timeout seconds";;
+		*)
+			echo "not ok $test_num $TEST_HDR_MSG # exit=$rc";;
+		esac
 		cd - >/dev/null
 	fi
 }
