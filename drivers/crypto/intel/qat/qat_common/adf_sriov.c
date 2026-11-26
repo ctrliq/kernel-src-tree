@@ -48,7 +48,7 @@ void adf_schedule_vf2pf_handler(struct adf_accel_vf_info *vf_info)
 	if (READ_ONCE(accel_dev->pf.vf2pf_disabled))
 		return;
 
-	pf2vf_resp = kzalloc(sizeof(*pf2vf_resp), GFP_ATOMIC);
+	pf2vf_resp = kzalloc_obj(*pf2vf_resp, GFP_ATOMIC);
 	if (!pf2vf_resp)
 		return;
 
@@ -191,8 +191,7 @@ static int adf_do_enable_sriov(struct adf_accel_dev *accel_dev)
 		goto err_del_cfg;
 
 	/* Allocate memory for VF info structs */
-	accel_dev->pf.vf_info = kcalloc(totalvfs, sizeof(struct adf_accel_vf_info),
-					GFP_KERNEL);
+	accel_dev->pf.vf_info = kzalloc_objs(struct adf_accel_vf_info, totalvfs);
 	ret = -ENOMEM;
 	if (!accel_dev->pf.vf_info)
 		goto err_del_cfg;
