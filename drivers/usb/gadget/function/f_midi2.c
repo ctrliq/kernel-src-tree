@@ -1187,8 +1187,7 @@ static int f_midi2_init_ep(struct f_midi2 *midi2, struct f_midi2_ep *ep,
 		return -ENODEV;
 	usb_ep->complete = complete;
 
-	usb_ep->reqs = kcalloc(midi2->info.num_reqs, sizeof(*usb_ep->reqs),
-			       GFP_KERNEL);
+	usb_ep->reqs = kzalloc_objs(*usb_ep->reqs, midi2->info.num_reqs);
 	if (!usb_ep->reqs)
 		return -ENOMEM;
 	for (i = 0; i < midi2->info.num_reqs; i++) {
@@ -1544,9 +1543,9 @@ static int f_midi2_create_card(struct f_midi2 *midi2)
 		return err;
 	midi2->card = card;
 
-	strcpy(card->driver, "f_midi2");
-	strcpy(card->shortname, "MIDI 2.0 Gadget");
-	strcpy(card->longname, "MIDI 2.0 Gadget");
+	strscpy(card->driver, "f_midi2");
+	strscpy(card->shortname, "MIDI 2.0 Gadget");
+	strscpy(card->longname, "MIDI 2.0 Gadget");
 
 	id = 0;
 	for (i = 0; i < midi2->num_eps; i++) {
@@ -2331,7 +2330,7 @@ static int f_midi2_block_opts_create(struct f_midi2_ep_opts *ep_opts,
 		goto out;
 	}
 
-	block_opts = kzalloc(sizeof(*block_opts), GFP_KERNEL);
+	block_opts = kzalloc_obj(*block_opts);
 	if (!block_opts) {
 		ret = -ENOMEM;
 		goto out;
@@ -2493,7 +2492,7 @@ static int f_midi2_ep_opts_create(struct f_midi2_opts *opts,
 {
 	struct f_midi2_ep_opts *ep_opts;
 
-	ep_opts = kzalloc(sizeof(*ep_opts), GFP_KERNEL);
+	ep_opts = kzalloc_obj(*ep_opts);
 	if (!ep_opts)
 		return -ENOMEM;
 
@@ -2643,7 +2642,7 @@ static struct usb_function_instance *f_midi2_alloc_inst(void)
 	struct f_midi2_block_opts *block_opts;
 	int ret;
 
-	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
+	opts = kzalloc_obj(*opts);
 	if (!opts)
 		return ERR_PTR(-ENOMEM);
 
@@ -2804,7 +2803,7 @@ static struct usb_function *f_midi2_alloc(struct usb_function_instance *fi)
 	struct f_midi2_block *bp;
 	int i, num_eps, blk;
 
-	midi2 = kzalloc(sizeof(*midi2), GFP_KERNEL);
+	midi2 = kzalloc_obj(*midi2);
 	if (!midi2)
 		return ERR_PTR(-ENOMEM);
 
@@ -2846,8 +2845,8 @@ static struct usb_function *f_midi2_alloc(struct usb_function_instance *fi)
 		}
 	}
 
-	midi2->string_defs = kcalloc(midi2->total_blocks + 1,
-				     sizeof(*midi2->string_defs), GFP_KERNEL);
+	midi2->string_defs = kzalloc_objs(*midi2->string_defs,
+					  midi2->total_blocks + 1, GFP_KERNEL);
 	if (!midi2->string_defs) {
 		do_f_midi2_free(midi2, opts);
 		return ERR_PTR(-ENOMEM);

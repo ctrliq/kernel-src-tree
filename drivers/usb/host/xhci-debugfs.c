@@ -87,7 +87,7 @@ static struct xhci_regset *xhci_debugfs_alloc_regset(struct xhci_hcd *xhci)
 {
 	struct xhci_regset	*regset;
 
-	regset = kzalloc(sizeof(*regset), GFP_KERNEL);
+	regset = kzalloc_obj(*regset);
 	if (!regset)
 		return NULL;
 
@@ -476,7 +476,7 @@ void xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
 	if (spriv->eps[ep_index])
 		return;
 
-	epriv = kzalloc(sizeof(*epriv), GFP_KERNEL);
+	epriv = kzalloc_obj(*epriv);
 	if (!epriv)
 		return;
 
@@ -616,7 +616,7 @@ void xhci_debugfs_create_slot(struct xhci_hcd *xhci, int slot_id)
 	struct xhci_slot_priv	*priv;
 	struct xhci_virt_device	*dev = xhci->devs[slot_id];
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return;
 
@@ -700,6 +700,10 @@ static int xhci_port_bw_show(struct xhci_hcd *xhci, u8 dev_speed,
 		seq_printf(s, "port[%d] available bw: %d%%.\n", i,
 				ctx->bytes[i]);
 err_out:
+	if (ret == -EIO) {
+		seq_puts(s, "Get Port Bandwidth failed\n");
+		ret = 0;
+	}
 	pm_runtime_put_sync(dev);
 	xhci_free_port_bw_ctx(xhci, ctx);
 	return ret;
@@ -710,7 +714,7 @@ static int xhci_ss_bw_show(struct seq_file *s, void *unused)
 	int ret;
 	struct xhci_hcd		*xhci = (struct xhci_hcd *)s->private;
 
-	ret = xhci_port_bw_show(xhci, USB_SPEED_SUPER, s);
+	ret = xhci_port_bw_show(xhci, DEV_PORT_SPEED(XDEV_SS), s);
 	return ret;
 }
 
@@ -719,7 +723,7 @@ static int xhci_hs_bw_show(struct seq_file *s, void *unused)
 	int ret;
 	struct xhci_hcd		*xhci = (struct xhci_hcd *)s->private;
 
-	ret = xhci_port_bw_show(xhci, USB_SPEED_HIGH, s);
+	ret = xhci_port_bw_show(xhci, DEV_PORT_SPEED(XDEV_HS), s);
 	return ret;
 }
 
@@ -728,7 +732,7 @@ static int xhci_fs_bw_show(struct seq_file *s, void *unused)
 	int ret;
 	struct xhci_hcd		*xhci = (struct xhci_hcd *)s->private;
 
-	ret = xhci_port_bw_show(xhci, USB_SPEED_FULL, s);
+	ret = xhci_port_bw_show(xhci, DEV_PORT_SPEED(XDEV_FS), s);
 	return ret;
 }
 

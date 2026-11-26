@@ -189,7 +189,7 @@ static int klsi_105_port_probe(struct usb_serial_port *port)
 {
 	struct klsi_105_private *priv;
 
-	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kmalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
 
@@ -330,8 +330,8 @@ static int klsi_105_prepare_write_buffer(struct usb_serial_port *port,
 	unsigned char *buf = dest;
 	int count;
 
-	count = kfifo_out_locked(&port->write_fifo, buf + KLSI_HDR_LEN, size,
-								&port->lock);
+	count = kfifo_out_locked(&port->write_fifo, buf + KLSI_HDR_LEN,
+				 size - KLSI_HDR_LEN, &port->lock);
 	put_unaligned_le16(count, buf);
 
 	return count + KLSI_HDR_LEN;
@@ -378,7 +378,7 @@ static void klsi_105_set_termios(struct tty_struct *tty,
 	unsigned long flags;
 	speed_t baud;
 
-	cfg = kmalloc(sizeof(*cfg), GFP_KERNEL);
+	cfg = kmalloc_obj(*cfg);
 	if (!cfg)
 		return;
 
