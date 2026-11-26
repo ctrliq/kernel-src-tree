@@ -150,7 +150,16 @@ static const struct file_operations ruleset_fops = {
 	.write = fop_dummy_write,
 };
 
-#define LANDLOCK_ABI_VERSION 6
+/*
+ * The Landlock ABI version should be incremented for each new Landlock-related
+ * user space visible change (e.g. Landlock syscalls).  This version should
+ * only be incremented once per Linux release.  When incrementing, the date in
+ * Documentation/userspace-api/landlock.rst should be updated to reflect the
+ * UAPI change.
+ * If the change involves a fix that requires userspace awareness, also update
+ * the errata documentation in Documentation/userspace-api/landlock.rst .
+ */
+const int landlock_abi_version = 6;
 
 /**
  * sys_landlock_create_ruleset - Create a new ruleset
@@ -193,7 +202,7 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 	if (flags) {
 		if ((flags == LANDLOCK_CREATE_RULESET_VERSION) && !attr &&
 		    !size)
-			return LANDLOCK_ABI_VERSION;
+			return landlock_abi_version;
 		return -EINVAL;
 	}
 
