@@ -196,8 +196,10 @@ static int gtp_rx(struct pdp_ctx *pctx, struct sk_buff *skb,
 
 	/* Get rid of the GTP + UDP headers. */
 	if (iptunnel_pull_header(skb, hdrlen, skb->protocol,
-				 !net_eq(sock_net(pctx->sk), dev_net(pctx->dev))))
-		return -1;
+			 !net_eq(sock_net(pctx->sk), dev_net(pctx->dev)))) {
+		pctx->dev->stats.rx_length_errors++;
+		goto err;
+	}
 
 	netdev_dbg(pctx->dev, "forwarding packet from GGSN to uplink\n");
 
@@ -217,6 +219,10 @@ static int gtp_rx(struct pdp_ctx *pctx, struct sk_buff *skb,
 
 	netif_rx(skb);
 	return 0;
+
+err:
+	pctx->dev->stats.rx_dropped++;
+	return -1;
 }
 
 /* 1 means pass up to the stack, -1 means drop and 0 means decapsulated. */
