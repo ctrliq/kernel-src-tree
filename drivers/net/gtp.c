@@ -189,6 +189,11 @@ static int gtp_rx(struct pdp_ctx *pctx, struct sk_buff *skb,
 {
 	struct pcpu_sw_netstats *stats;
 
+	if (skb_is_gso(skb)) {
+		netdev_dbg(pctx->dev, "GSO is not supported in GTP\n");
+		goto err;
+	}
+
 	if (!gtp_check_ms(skb, pctx, hdrlen, role)) {
 		netdev_dbg(pctx->dev, "No PDP ctx for this MS\n");
 		return 1;
