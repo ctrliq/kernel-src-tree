@@ -530,8 +530,6 @@ extern bool console_suspend_enabled;
 extern void suspend_console(void);
 extern void resume_console(void);
 
-int mda_console_init(void);
-
 void vcs_make_sysfs(int index);
 void vcs_remove_sysfs(int index);
 
