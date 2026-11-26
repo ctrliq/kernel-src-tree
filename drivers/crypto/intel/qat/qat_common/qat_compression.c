@@ -47,12 +47,14 @@ static int qat_compression_free_instances(struct adf_accel_dev *accel_dev)
 	return 0;
 }
 
-struct qat_compression_instance *qat_compression_get_instance_node(int node)
+struct qat_compression_instance *qat_compression_get_instance_node(int node, int alg)
 {
 	struct qat_compression_instance *inst = NULL;
+	struct adf_hw_device_data *hw_data = NULL;
 	struct adf_accel_dev *accel_dev = NULL;
 	unsigned long best = ~0;
 	struct list_head *itr;
+	u32 caps, mask;
 
 	list_for_each(itr, adf_devmgr_get_head()) {
 		struct adf_accel_dev *tmp_dev;
@@ -61,6 +63,15 @@ struct qat_compression_instance *qat_compression_get_instance_node(int node)
 
 		tmp_dev = list_entry(itr, struct adf_accel_dev, list);
 		tmp_dev_node = dev_to_node(&GET_DEV(tmp_dev));
+
+		if (alg == QAT_ZSTD || alg == QAT_LZ4S) {
+			hw_data = tmp_dev->hw_device;
+			caps = hw_data->accel_capabilities_ext_mask;
+			mask = ADF_ACCEL_CAPABILITIES_EXT_ZSTD |
+			       ADF_ACCEL_CAPABILITIES_EXT_ZSTD_LZ4S;
+			if (!(caps & mask))
+				continue;
+		}
 
 		if ((node == tmp_dev_node || tmp_dev_node < 0) &&
 		    adf_dev_started(tmp_dev) && !list_empty(&tmp_dev->compression_list)) {
@@ -79,6 +90,16 @@ struct qat_compression_instance *qat_compression_get_instance_node(int node)
 			struct adf_accel_dev *tmp_dev;
 
 			tmp_dev = list_entry(itr, struct adf_accel_dev, list);
+
+			if (alg == QAT_ZSTD || alg == QAT_LZ4S) {
+				hw_data = tmp_dev->hw_device;
+				caps = hw_data->accel_capabilities_ext_mask;
+				mask = ADF_ACCEL_CAPABILITIES_EXT_ZSTD |
+				       ADF_ACCEL_CAPABILITIES_EXT_ZSTD_LZ4S;
+				if (!(caps & mask))
+					continue;
+			}
+
 			if (adf_dev_started(tmp_dev) &&
 			    !list_empty(&tmp_dev->compression_list)) {
 				accel_dev = tmp_dev;
@@ -220,7 +241,7 @@ static int qat_compression_alloc_dc_data(struct adf_accel_dev *accel_dev)
 err:
 	accel_dev->dc_data = NULL;
 	kfree(obuff);
-	devm_kfree(dev, dc_data);
+	kfree(dc_data);
 	return -ENOMEM;
 }
 

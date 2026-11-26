@@ -412,7 +412,6 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
 	hw_data->enable_error_correction = adf_gen4_enable_error_correction;
 	hw_data->get_accel_mask = adf_gen4_get_accel_mask;
 	hw_data->get_ae_mask = get_ae_mask;
-	hw_data->get_num_accels = adf_gen4_get_num_accels;
 	hw_data->get_num_aes = adf_gen4_get_num_aes;
 	hw_data->get_sram_bar_id = adf_gen4_get_sram_bar_id;
 	hw_data->get_etr_bar_id = adf_gen4_get_etr_bar_id;
@@ -473,6 +472,7 @@ void adf_init_hw_data_4xxx(struct adf_hw_device_data *hw_data, u32 dev_id)
 	hw_data->clock_frequency = ADF_4XXX_AE_FREQ;
 	hw_data->services_supported = adf_gen4_services_supported;
 	hw_data->get_svc_slice_cnt = adf_gen4_get_svc_slice_cnt;
+	hw_data->accel_capabilities_ext_mask = ADF_ACCEL_CAPABILITIES_EXT_ZSTD_LZ4S;
 
 	adf_gen4_set_err_mask(&hw_data->dev_err_mask);
 	adf_gen4_init_hw_csr_ops(&hw_data->csr_ops);
