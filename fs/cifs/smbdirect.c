@@ -1339,6 +1339,9 @@ void smbd_destroy(struct TCP_Server_Info *server)
 			info->transport_status == SMBD_DISCONNECTED);
 	}
 
+	log_rdma_event(INFO, "cancelling post_send_credits_work\n");
+	disable_work_sync(&info->post_send_credits_work);
+
 	log_rdma_event(INFO, "destroying qp\n");
 	ib_drain_qp(info->id->qp);
 	rdma_destroy_qp(info->id);
