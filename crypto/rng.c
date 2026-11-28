@@ -28,6 +28,7 @@
 #include "internal.h"
 
 static DEFINE_PER_CPU(struct crypto_rng *, crypto_rngs);
+static DEFINE_PER_CPU(struct crypto_rng *, crypto_reseed_rngs);
 static ____cacheline_aligned_in_smp DEFINE_MUTEX(crypto_default_rng_lock);
 struct crypto_rng *crypto_default_rng;
 EXPORT_SYMBOL_GPL(crypto_default_rng);
@@ -244,34 +245,33 @@ EXPORT_SYMBOL_GPL(crypto_unregister_rngs);
 
 static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 {
+	u32 flags = reseed ? CRYPTO_TFM_REQ_NEED_RESEED : 0;
 	struct crypto_rng **rngp;
 	struct crypto_rng *rng;
-	u32 flags = 0;
+	ssize_t ret = 0;
 	u8 tmp[256];
-	ssize_t ret;
 
 	if (unlikely(!iov_iter_count(iter)))
 		return 0;
 
-	get_cpu();
-	rngp = this_cpu_ptr(&crypto_rngs);
+	rngp = raw_cpu_ptr(reseed ? &crypto_reseed_rngs : &crypto_rngs);
+	rng = READ_ONCE(*rngp);
 
-	if (reseed && *rngp) {
-		/* If rngp is not set, it will be seeded
-		 * at creation and thus no reseeding is needed.
-		 */
-		flags |= CRYPTO_TFM_REQ_NEED_RESEED;
-	}
+	if (!rng) {
+		struct crypto_rng *nrng;
 
-	ret = crypto_get_rng(rngp);
-	rng = *rngp;
-	put_cpu();
+		ret = crypto_get_rng(&rng);
+		if (ret)
+			return ret;
 
-	if (ret)
-		return ret;
-
-	if (flags)
 		crypto_tfm_set_flags(crypto_rng_tfm(rng), flags);
+
+		nrng = cmpxchg_release(rngp, NULL, rng);
+		if (nrng) {
+			crypto_free_rng(rng);
+			rng = nrng;
+		}
+	}
 
 	for (;;) {
 		size_t i, copied;
@@ -326,6 +326,8 @@ static void __exit crypto_rng_exit(void)
 
 	for_each_possible_cpu(i)
 		crypto_free_rng(*per_cpu_ptr(&crypto_rngs, i));
+	for_each_possible_cpu(i)
+		crypto_free_rng(*per_cpu_ptr(&crypto_reseed_rngs, i));
 }
 
 late_initcall(crypto_rng_init);
